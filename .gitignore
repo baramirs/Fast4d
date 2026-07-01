@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Outputs / temporary analysis
+outputs/
+results/
+figures_temp/
+tmp/
+cache/
+
+# Logs
+*.log
+
+# Screenshots (root only; icons/ assets are kept)
+/screenshot_*.png
+
+# Tooling / editor configs
+.claude/
+.cursor/
+
+# Generated knowledge graph
+graphify-out/
+
+# Internal notes / docs (not shipped)
+*.md
+
+# Raw / heavy microscopy data
+data/
+raw/
+*.mib
+*.h5
+*.hdf5
+*.emd
+*.dm3
+*.dm4
+*.ser
+*.mrc
+*.raw
+*.npy
+*.npz
+*.tif
+*.tiff
