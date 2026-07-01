@@ -40,6 +40,7 @@ graphify-out/
 
 # Internal notes / docs (not shipped)
 *.md
+!README.md
 
 # Raw / heavy microscopy data
 data/
