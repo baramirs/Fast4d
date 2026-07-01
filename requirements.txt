@@ -1,0 +1,31 @@
+# Fast4d runtime dependencies
+# Python 3.10+ recommended
+
+# --- Core scientific stack ---
+numpy
+scipy
+pandas
+matplotlib
+scikit-image
+scikit-learn
+uncertainties
+
+# --- 4D-STEM ---
+py4DSTEM
+h5py
+
+# --- GUI ---
+PySide6
+pyqtgraph
+pillow
+
+# --- Utilities ---
+tqdm
+psutil
+PyYAML
+python-pptx
+
+# --- Optional: GPU acceleration (NVIDIA/CUDA) ---
+# Install manually to match your CUDA version, e.g. cupy-cuda12x
+# cupy
+# pynvml
