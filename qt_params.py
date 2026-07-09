@@ -100,7 +100,8 @@ class _GroupTable(QtWidgets.QTableWidget):
                     fig = (sc.figures or {}).get(fk)
                     spill = E.resolve_figure_path(sc, fk) if not fig else ""
                     self.setCellWidget(row, c, ClickableFigureLabel(
-                        fig, spill_path=spill, title=f"{sc.name} — {fk}"))
+                        fig, spill_path=spill, title=f"{sc.name} — {fk}",
+                        scan=sc, fig_key=fk))
 
     def reload(self) -> None:
         self.build()
