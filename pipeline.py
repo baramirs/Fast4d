@@ -1441,7 +1441,7 @@ def compute_braggpeaks_step(
     state.braggpeaks_path = out_path
     _log(log, f"Full-scan braggpeaks ready: {out_path}")
     # The full datacube and the freshly detected braggpeaks were both alive at once
-    # during the save above (py4DSTEM.save(path, dc, ...) — pipeline.py:1471); this
+    # during the save above (see save_braggpeaks_datacube_notebook_style); this
     # is the one designed-in double-residency point in the pipeline. A single
     # gc.collect() here reclaims any transient copies py4DSTEM's own save path made
     # (e.g. internal serialization buffers) before the next step runs.
