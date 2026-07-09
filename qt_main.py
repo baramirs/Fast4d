@@ -3877,6 +3877,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self.setDockNestingEnabled(True)
         self._scans: list[E.Scan] = []
         self._active = -1
+        self._recent_scan_indices: list[int] = []  # LRU window for release_scans()
         self._busy = False
         self._step = STEPS[0][0]
         self._cancel_event = threading.Event()
@@ -5102,6 +5103,13 @@ class Fast4DWindow(QtWidgets.QMainWindow):
     def _on_file_selected(self, row: int) -> None:
         if 0 <= row < len(self._scans):
             self._active = row
+            # Keep the 2 most-recently-viewed scans' heavy buffers resident (active +
+            # one back-reference for quick A/B comparison); release the rest. This is
+            # a cheap pass (no gc.collect/OS trim) — see engine.release_scans docstring.
+            self._recent_scan_indices = ([row] + [i for i in self._recent_scan_indices if i != row])[:2]
+            to_release = [sc for i, sc in enumerate(self._scans) if i not in self._recent_scan_indices]
+            if to_release:
+                E.release_scans(to_release, log=self._console.log)
             # Selection must stay CHEAP: just show the cached/.h5 ADF preview.
             # braggpeaks.h5 is NOT loaded here — that py4DSTEM read is slow and the
             # user only wants to see the ADF. It loads lazily when a calibration

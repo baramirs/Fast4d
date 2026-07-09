@@ -2900,6 +2900,58 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
 # PERSIST
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _close_memmap_handle(st) -> None:
+    """Close a memmap-backed datacube's file handle before the ref is dropped,
+    else the OS keeps the mapping resident. Shared by ``free_memory`` and the
+    cheaper ``release_scans``."""
+    dc = getattr(st, "datacube", None)
+    try:
+        data = getattr(dc, "data", None)
+        base = getattr(data, "base", None)
+        for obj in (data, base):
+            mm = getattr(obj, "_mmap", None) or (obj if "mmap" in type(obj).__name__.lower() else None)
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def release_scans(scans: list, *, log: Log = None) -> int:
+    """Cheap, synchronous variant of :func:`free_memory` for the scan-switch path.
+
+    Closes memmap handles and nulls the same heavy attributes as ``free_memory``
+    (datacube / visualcube / vacuumcube / BVM histograms / probe), but skips the
+    3x ``gc.collect()``, OS working-set trim, and CuPy pool free — those cost tens
+    to hundreds of ms on a large heap, and the scan-switch handler must stay cheap
+    (``qt_main.py`` ``_on_file_selected``: "Selection must stay CHEAP"). Figures and
+    braggpeaks are intentionally left alone — those are governed by ``FigurePolicy``
+    and the explicit "Free RAM" button respectively.
+
+    Call :func:`free_memory` (already wired to "Free RAM" and to batch completion)
+    to reclaim the actual OS/GPU memory once several scans have accumulated
+    None-ed buffers.
+    """
+    n = 0
+    for sc in (scans or []):
+        st = getattr(sc, "state", None)
+        if st is None:
+            continue
+        _close_memmap_handle(st)
+        for a in ("datacube", "visualcube", "vacuumcube", "bvm_raw", "bvm_centered",
+                  "dp_mean", "dp_max", "strainmap_full", "selected_disks", "probe"):
+            if getattr(st, a, None) is not None:
+                try:
+                    setattr(st, a, None); n += 1
+                except Exception:
+                    pass
+    if n:
+        _log(log, f"Released {n} heavy buffer(s) from {len(scans)} inactive scan(s) (cheap pass).")
+    return n
+
+
 def free_memory(scans: list, *, drop_braggpeaks: bool = False, log: Log = None) -> dict:
     """Release the heavy in-memory buffers after a compute (the .mib datacube can be
     tens of GB). Drops state.datacube / visualcube / vacuumcube / BVM histograms (they
@@ -2915,21 +2967,7 @@ def free_memory(scans: list, *, drop_braggpeaks: bool = False, log: Log = None) 
         st = getattr(sc, "state", None)
         if st is None:
             continue
-        # close a memmap-backed datacube's file handle BEFORE dropping the ref, else
-        # the OS keeps the mapping resident.
-        dc = getattr(st, "datacube", None)
-        try:
-            data = getattr(dc, "data", None)
-            base = getattr(data, "base", None)
-            for obj in (data, base):
-                mm = getattr(obj, "_mmap", None) or (obj if "mmap" in type(obj).__name__.lower() else None)
-                if mm is not None:
-                    try:
-                        mm.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        _close_memmap_handle(st)
         attrs = ["datacube", "visualcube", "vacuumcube", "bvm_raw", "bvm_centered",
                  "dp_mean", "dp_max", "strainmap_full", "selected_disks", "probe"]
         if drop_braggpeaks:
