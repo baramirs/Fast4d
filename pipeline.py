@@ -329,23 +329,33 @@ def _pick_mib_mem_mode(path: Path) -> str | None:
     """
     Choose a safe default for `read_mib.load_mib(mem=...)`.
 
-    Large 4D cubes (e.g. 512x512x256x256) are ~32GB as float32; forcing RAM is often impossible.
+    Large 4D cubes (e.g. 512x512x256x256) are ~32GB as float32; forcing RAM is often
+    impossible. An explicit FAST4D_FORCE_MEMMAP=1 environment variable always wins,
+    for memory-constrained machines or users who know their datasets are large.
     """
+    import os
+
+    if os.environ.get("FAST4D_FORCE_MEMMAP", "").strip() == "1":
+        return "memmap"
+
     try:
         size = int(path.stat().st_size)
     except Exception:
         size = 0
 
-    # Heuristic: if the file is huge, prefer memmap even before we know the final shape.
-    if size >= 6 * 1024**3:  # >= ~6 GiB on disk
+    # Heuristic: if the file is at least moderately large, prefer memmap even before
+    # we know the final shape. Lowered from 6 GiB to 2 GiB (2026-07-09 memory report):
+    # most workstation RAM budgets can't afford more than a couple of RAM-resident
+    # cubes at 2+ GiB anyway, and memmap's cost is amortized I/O, not correctness risk.
+    if size >= 2 * 1024**3:  # >= ~2 GiB on disk
         return "memmap"
 
     try:
         import psutil  # type: ignore
 
         avail = int(psutil.virtual_memory().available)
-        # If the file is > ~40% of available RAM, don't default to RAM.
-        if size > 0 and size > int(0.4 * max(avail, 1)):
+        # If the file is > ~25% of available RAM, don't default to RAM (was 40%).
+        if size > 0 and size > int(0.25 * max(avail, 1)):
             return "memmap"
     except Exception:
         pass
