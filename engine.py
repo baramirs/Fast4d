@@ -1213,10 +1213,9 @@ def enforce_resident_data_limit(scans: list, active_index: int, recent_indices: 
     to call on every scan-switch."""
     limit = get_data_policy().max_scans_in_ram
     new_recent = ([active_index] + [i for i in recent_indices if i != active_index])[:limit]
-    if len(new_recent) == limit:
-        to_release = [sc for i, sc in enumerate(scans) if i not in new_recent]
-        if to_release:
-            release_scans(to_release, log=log)
+    to_release = [sc for i, sc in enumerate(scans) if i not in new_recent]
+    if to_release:
+        release_scans(to_release, log=log)
     return new_recent
 
 
