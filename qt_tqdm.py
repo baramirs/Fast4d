@@ -21,31 +21,57 @@ GUI wires them through Qt queued signals).
 from __future__ import annotations
 
 import time
-from typing import Callable, Optional
+from typing import Callable
 
-_progress_sink: Optional[Callable[[float], None]] = None   # 0..100
-_console_sink: Optional[Callable[[str], None]] = None
+_progress_sinks: list[Callable[[float], None]] = []
+_console_sinks: list[Callable[[str], None]] = []
 _installed = False
 
 
 def register_sinks(*, progress: Callable[[float], None] | None = None,
                    console: Callable[[str], None] | None = None) -> None:
-    """Wire the throttled progress line / percent into the GUI (thread-safe sinks)."""
-    global _progress_sink, _console_sink
+    """Wire a persistent, app-lifetime sink pair (thread-safe callables) — the
+    main window calls this once at startup for its own bar + console."""
+    if progress is not None and progress not in _progress_sinks:
+        _progress_sinks.append(progress)
+    if console is not None and console not in _console_sinks:
+        _console_sinks.append(console)
+
+
+def add_temp_sinks(*, progress: Callable[[float], None] | None = None,
+                   console: Callable[[str], None] | None = None) -> Callable[[], None]:
+    """Register additional sink(s) for as long as one tool window is open (e.g.
+    a dialog's own progress bar), on top of any persistent ones. Returns a
+    ``remove()`` callback — call it when the window closes so events stop
+    reaching a dead widget."""
+    added: list[tuple[list, Callable]] = []
     if progress is not None:
-        _progress_sink = progress
+        _progress_sinks.append(progress)
+        added.append((_progress_sinks, progress))
     if console is not None:
-        _console_sink = console
+        _console_sinks.append(console)
+        added.append((_console_sinks, console))
+
+    def remove() -> None:
+        for lst, cb in added:
+            try:
+                lst.remove(cb)
+            except ValueError:
+                pass
+
+    return remove
 
 
 def _emit_line(text: str) -> None:
-    cb = _console_sink
-    if cb is not None:
+    sent = False
+    for cb in list(_console_sinks):
         try:
             cb(text)
-            return
+            sent = True
         except Exception:
             pass
+    if sent:
+        return
     # Before the GUI console exists (warmup), fall back to a plain newline print —
     # NOT the \r bar, so it never spams the slow console.
     try:
@@ -141,9 +167,9 @@ def install() -> None:
                         self._c_last_pct = 0.0
                     # THROTTLE: line + progress-bar update at most ~1/s or every ≥2 %.
                     if finished or (pct - self._c_last_pct) >= 2.0 or (now - self._c_last_t) >= 1.0:
-                        if _progress_sink is not None:
+                        for cb in list(_progress_sinks):
                             try:
-                                _progress_sink(pct)
+                                cb(pct)
                             except Exception:
                                 pass
                         _emit_line(

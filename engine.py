@@ -1466,28 +1466,39 @@ def load_datacube(scan: Scan, *, log: Log = None) -> None:
 # UI-free; heavy passes run in the GUI's worker. No pyplot.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def vc_compute_dp_probe(scan: Scan, *, log: Log = None) -> dict:
-    """Load the raw datacube (if needed) and compute DP mean/max + probe center.
+def vc_compute_dp_probe(scan: Scan, *, mode: str = "both", log: Log = None) -> dict:
+    """Load the raw datacube (if needed) and compute DP mean and/or max + probe
+    center. ``mode`` selects which full-4D pass(es) to run — 'mean' (dp_max
+    stays None), 'max' (dp_mean stays None), or 'both' (default, original
+    behavior). The probe center/alpha is derived from dp_mean when available,
+    else dp_max — one of the two is always present.
 
     Returns ``{dp_mean, dp_max, alpha, qx0, qy0, qmax}`` (qx0=row, qy0=col). Stores the
     probe centre on the state (so the OriginDialog can start there too)."""
+    m = (mode or "both").lower()
+    if m not in ("mean", "max", "both"):
+        raise ValueError(f"mode must be 'mean', 'max' or 'both' (got {mode!r}).")
     st = scan.ensure_state()
     if getattr(st, "datacube", None) is None:
         load_datacube(scan, log=log)              # heavy .mib load
     cube = getattr(st, "datacube", None)
     if cube is None:
         raise RuntimeError("No raw datacube — this scan needs a raw .mib/.dm4/.h5 path.")
-    _log(log, f"[{scan.name}] DP mean (full 4D pass)…")
-    dp_mean = cube.get_dp_mean()
-    _log(log, f"[{scan.name}] DP max…")
-    dp_max = cube.get_dp_max()
-    _log(log, f"[{scan.name}] probe size from DP mean…")
-    alpha, qx0, qy0 = cube.get_probe_size(dp_mean.data)
+    dp_mean = dp_max = None
+    if m in ("mean", "both"):
+        _log(log, f"[{scan.name}] DP mean (full 4D pass)…")
+        dp_mean = cube.get_dp_mean()
+    if m in ("max", "both"):
+        _log(log, f"[{scan.name}] DP max…")
+        dp_max = cube.get_dp_max()
+    probe_src = dp_mean if dp_mean is not None else dp_max
+    _log(log, f"[{scan.name}] probe size from DP {'mean' if dp_mean is not None else 'max'}…")
+    alpha, qx0, qy0 = cube.get_probe_size(probe_src.data)
     st.probe_alpha = float(alpha); st.probe_qx0 = float(qx0); st.probe_qy0 = float(qy0)
     qshape = getattr(cube, "Qshape", None)
     qmax = float(min(qshape) / 2.0) if qshape else 256.0
-    return {"dp_mean": np.asarray(dp_mean.data, dtype=np.float32),
-            "dp_max": np.asarray(dp_max.data, dtype=np.float32),
+    return {"dp_mean": (np.asarray(dp_mean.data, dtype=np.float32) if dp_mean is not None else None),
+            "dp_max": (np.asarray(dp_max.data, dtype=np.float32) if dp_max is not None else None),
             "alpha": float(alpha), "qx0": float(qx0), "qy0": float(qy0), "qmax": qmax}
 
 

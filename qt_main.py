@@ -2071,7 +2071,19 @@ class VirtualizationDialog(QtWidgets.QDialog):
         v.addLayout(frow)
         v.addWidget(QtWidgets.QLabel("1) Compute DP+probe · 2) place detectors\n"
                                      "3) Compute ADF/BF · 4) Save .h5"))
-        b_dp = QtWidgets.QPushButton("Compute DP mean/max + probe (heavy)")
+        moderow = QtWidgets.QHBoxLayout()
+        moderow.addWidget(QtWidgets.QLabel("Compute:"))
+        self._rb_mode_mean = QtWidgets.QRadioButton("Mean only")
+        self._rb_mode_max = QtWidgets.QRadioButton("Max only")
+        self._rb_mode_both = QtWidgets.QRadioButton("Both (slower)")
+        self._rb_mode_both.setChecked(True)
+        for rb in (self._rb_mode_mean, self._rb_mode_max, self._rb_mode_both):
+            rb.setToolTip("Which full-4D pass(es) to run — skipping one halves the "
+                          "heavy compute time for large files.")
+            moderow.addWidget(rb)
+        moderow.addStretch(1)
+        v.addLayout(moderow)
+        b_dp = QtWidgets.QPushButton("Compute DP + probe (heavy)")
         b_dp.clicked.connect(self._compute_dp); v.addWidget(b_dp)
         # display mean/max
         drow = QtWidgets.QHBoxLayout()
@@ -2110,18 +2122,57 @@ class VirtualizationDialog(QtWidgets.QDialog):
         b_mult = QtWidgets.QPushButton("Init radii from probe (× alpha)")
         b_mult.clicked.connect(self._apply_mult); v.addWidget(b_mult)
         # compute + save
+        self._heavy_buttons = [b_dp]
         for txt, fn in (("Compute ADF", lambda: self._compute_vi("adf")),
                         ("Compute BF", lambda: self._compute_vi("bf")),
                         ("Compute ADF + BF", lambda: self._compute_vi("both")),
                         ("Save .h5", self._save_h5)):
             b = QtWidgets.QPushButton(txt); b.clicked.connect(fn); v.addWidget(b)
+            self._heavy_buttons.append(b)
         v.addStretch(1)
+        self._dp_progress = QtWidgets.QProgressBar()
+        self._dp_progress.setRange(0, 100); self._dp_progress.setValue(0)
+        v.addWidget(self._dp_progress)
         self._status = QtWidgets.QLabel("Ready"); self._status.setWordWrap(True)
         self._status.setStyleSheet("color:#1565C0; font-size:11px;")
         v.addWidget(self._status)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.accept); v.addWidget(bb)
         lay.addWidget(panel)
+
+        # live progress: piggy-back on the same tqdm→GUI bridge the main window
+        # uses, so this dialog's bar moves during the heavy py4DSTEM passes too.
+        self._remove_tqdm_sinks = None
+        try:
+            import qt_tqdm
+        except Exception:
+            qt_tqdm = None
+        if qt_tqdm is not None:
+            def _on_progress(pct: float) -> None:
+                try:
+                    p = int(max(0, min(100, round(float(pct)))))
+                except Exception:
+                    return
+                self._host.sig_call.emit(lambda p=p: self._dp_progress.setValue(p))
+            self._remove_tqdm_sinks = qt_tqdm.add_temp_sinks(progress=_on_progress)
+
+    # ── progress / busy-state plumbing ───────────────────────────────────────
+    def _dialog_log(self, msg: str) -> None:
+        """Same console the host uses, plus mirror the current stage into this
+        dialog's own status label (the console sink already runs off-thread —
+        the label update is marshaled to the GUI thread like progress is)."""
+        self._host._console.log(msg)
+        self._host.sig_call.emit(lambda m=msg: self._status.setText(m))
+
+    def _set_dialog_busy(self, busy: bool) -> None:
+        for b in self._heavy_buttons:
+            b.setEnabled(not busy)
+        self._file_combo.setEnabled(not busy)
+
+    def closeEvent(self, ev) -> None:
+        if self._remove_tqdm_sinks is not None:
+            self._remove_tqdm_sinks()
+        super().closeEvent(ev)
 
     # ── small widget helpers ─────────────────────────────────────────────────
     def _slider(self, layout, label, lo, hi, val):
@@ -2156,6 +2207,9 @@ class VirtualizationDialog(QtWidgets.QDialog):
         for it in (self._c_bf, self._c_in, self._c_out, self._ctr):
             it.setData([], [])
         self._probe_lbl.setText("Probe: (not computed)")
+        self._rb_mean.setEnabled(True); self._rb_max.setEnabled(True)
+        self._rb_mean.setChecked(True)
+        self._dp_progress.setValue(0)
         nm = self._sc.name if self._sc else "?"
         self.setWindowTitle(f"Create ADF / BF / DP  —  {nm}")
         if self._sc is not None and not self._sc.raw_path:
@@ -2170,11 +2224,14 @@ class VirtualizationDialog(QtWidgets.QDialog):
         sc = self._sc
         if not sc.raw_path:
             self._status.setText(f"'{sc.name}' has no raw 4D path to build from."); return
+        mode = ("mean" if self._rb_mode_mean.isChecked()
+                else "max" if self._rb_mode_max.isChecked() else "both")
 
         def work():
-            return E.vc_compute_dp_probe(sc, log=self._host._console.log)
+            return E.vc_compute_dp_probe(sc, mode=mode, log=self._dialog_log)
 
         def done(res):
+            self._set_dialog_busy(False)
             if not isinstance(res, dict):
                 self._status.setText("DP/probe failed — see console."); return
             self._dp_mean = res["dp_mean"]; self._dp_max = res["dp_max"]
@@ -2185,11 +2242,19 @@ class VirtualizationDialog(QtWidgets.QDialog):
                 s.setMaximum(max(qmax, s.value()))
             self._probe_lbl.setText(f"Probe: alpha={res['alpha']:.4f}  "
                                     f"qx0(row)={res['qx0']:.2f}  qy0(col)={res['qy0']:.2f}")
+            self._rb_mean.setEnabled(self._dp_mean is not None)
+            self._rb_max.setEnabled(self._dp_max is not None)
+            if self._dp_mean is not None:
+                self._rb_mean.setChecked(True)
+            elif self._dp_max is not None:
+                self._rb_max.setChecked(True)
             self._apply_mult()
             self._redraw_dp()
-            self._status.setText("DP mean/max + probe ready. Place detectors, then Compute.")
+            self._status.setText("DP+probe ready. Place detectors, then Compute.")
 
-        self._status.setText("Computing DP mean/max + probe (heavy)…")
+        self._set_dialog_busy(True)
+        self._dp_progress.setValue(0)
+        self._status.setText("Computing DP + probe (heavy)…")
         self._host._run_async(work, label=f"DP+probe ({sc.name})", on_done=done)
 
     def _redraw_dp(self):
@@ -2242,7 +2307,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
             self._s_out.setValue(d)
 
     def eventFilter(self, obj, ev):
-        if self._dp_mean is None:
+        if self._dp_mean is None and self._dp_max is None:
             return False
         t = ev.type()
         T = QtCore.QEvent.Type
@@ -2282,7 +2347,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
     def _compute_vi(self, which):
         if self._sc is None or self._host._busy:
             return
-        if self._dp_mean is None:
+        if self._dp_mean is None and self._dp_max is None:
             self._status.setText("Compute DP+probe first."); return
         sc = self._sc
         center = (self._cy, self._cx)                # (row, col)
@@ -2292,9 +2357,10 @@ class VirtualizationDialog(QtWidgets.QDialog):
         def work():
             E.vc_compute_virtual_images(sc, which=which, center_yx=center,
                                         adf_radii=adf, bf_radius=bf,
-                                        log=self._host._console.log)
+                                        log=self._dialog_log)
 
         def done(_r):
+            self._set_dialog_busy(False)
             key_map = {
                 "adf":  [("annular_dark_field", "ADF")],
                 "bf":   [("bright_field", "BF")],
@@ -2310,6 +2376,8 @@ class VirtualizationDialog(QtWidgets.QDialog):
             if imgs:
                 _show_vimg_preview(self, imgs)
 
+        self._set_dialog_busy(True)
+        self._dp_progress.setValue(0)
         self._status.setText(f"Computing {which.upper()} (full 4D pass)…")
         self._host._run_async(work, label=f"Virtual {which} ({sc.name})", on_done=done)
 
@@ -2327,13 +2395,16 @@ class VirtualizationDialog(QtWidgets.QDialog):
             return
 
         def work():
-            E.vc_save_h5(sc, p, log=self._host._console.log)
-            E.load_adf(sc, log=self._host._console.log)   # refresh the ADF preview
+            E.vc_save_h5(sc, p, log=self._dialog_log)
+            E.load_adf(sc, log=self._dialog_log)   # refresh the ADF preview
 
         def done(_r):
+            self._set_dialog_busy(False)
             self._host._refresh_files(); self._host._update_active_views()
             self._status.setText(f"Saved → {p}")
 
+        self._set_dialog_busy(True)
+        self._dp_progress.setValue(0)
         self._status.setText("Saving .h5…")
         self._host._run_async(work, label=f"Save h5 ({sc.name})", on_done=done)
 
@@ -4013,7 +4084,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         # Secondary actions — power-user tools in a single "⋮" menu to keep the
         # Files dock uncluttered without removing any functionality.
         b_more = QtWidgets.QPushButton("⋮ More")
-        b_more.setToolTip("Advanced file actions: save params, embed calibrations, create ADF/BF/DP…")
+        b_more.setToolTip("Advanced file actions: save params, embed calibrations, load calib from h5…")
         def _show_more_menu():
             menu = QtWidgets.QMenu(b_more)
             for txt, fn, tip in (
@@ -4024,10 +4095,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                      "metadata INSIDE each file's .h5 — self-describing, no JSON needed to reopen."),
                     ("Load calib from h5…", self._load_metadata_from_h5,
                      "Browse for any .h5 and restore calibrations from its fast4d_metadata "
-                     "into the selected scan (also sets virtual h5 path when empty)."),
-                    ("Create ADF/BF/DP…", self._open_virtualization,
-                     "Build the virtual-images .h5 (ADF / BF / DP mean / DP max) from "
-                     "the raw scan's datacube (DP+probe → place detectors → compute → save .h5).")):
+                     "into the selected scan (also sets virtual h5 path when empty).")):
                 act = menu.addAction(txt)
                 act.setToolTip(tip)
                 act.triggered.connect(fn)
@@ -4458,6 +4526,10 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         path = E.analysis_path(sc)
         if key == "probe":
             self._add_path_banner(tb, path=path)
+            add("Virtual ADF/BF", self._open_virtualization,
+                tip="Build ADF/BF/DP mean/max virtual images from the raw datacube "
+                    "(place detectors → compute → save .h5). Available regardless "
+                    "of calibration path.")
             if path == "B":
                 add("Choose vacuum file…", self._pick_vacuum)
                 add("Pick vacuum region…", self._pick_vacuum_region)
