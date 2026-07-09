@@ -170,6 +170,36 @@ def drift_shift_key_matched(stem: str, shifts: dict[str, tuple[float, float]]) -
     return False
 
 
+# Short tab titles in the calibration notebook.
+BATCH_CALIBRATION_TAB_LABELS: dict[str, str] = {
+    "step5_roi": "Step 1 - ROI",
+    "step9": "Step 6 - Origin",
+    "step10": "Step 7 - Ellipse",
+    "step11": "Step 8 - Q pixel",
+    "step12": "Step 9 - Strain basis",
+}
+
+# Figure tab / suptitle names (no "Step N" prefix).
+BATCH_CALIBRATION_DISPLAY_NAMES: dict[str, str] = {
+    "step5_roi": "ROI",
+    "step5": "ROI",
+    "step5_test": "ROI (preview)",
+    "step9": "Origin correction",
+    "step9_test": "Origin correction (preview)",
+    "step10": "Ellipse calibration",
+    "step11": "Q pixel size",
+    "step11_test": "Q pixel size (preview)",
+    "step12": "Strain basis",
+    "step12_test": "Strain basis (preview)",
+    "step13": "Strain map",
+    "step14": "Strain ROI",
+    "bragg": "Bragg peaks",
+    "detect": "Disk detection",
+    "load": "Loading data",
+    "probe": "Shared probe",
+}
+
+
 def batch_calibration_display_name(step_id: str) -> str:
     """Human-readable calibration name for activity lines and figure titles."""
     sid = (step_id or "").strip()
