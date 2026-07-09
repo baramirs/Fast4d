@@ -112,3 +112,14 @@ def detect_braggpeaks_streaming(
             if log is not None:
                 log(f"Streaming Bragg detection: {min(start + batch_size, len(all_positions))}/{len(all_positions)} positions done.")
     return out_path
+
+
+def read_streamed_peaks(path: str | Path, ry: int, rx: int) -> dict:
+    """Read one scan position's peaks from a streamed file — O(1) HDF5 lookup,
+    never loads other positions' peaks into RAM."""
+    with h5py.File(path, "r") as f:
+        key = f"{ry}_{rx}"
+        if key not in f["peaks"]:
+            return {"qx": np.array([]), "qy": np.array([]), "intensity": np.array([])}
+        arr = f["peaks"][key][()]
+        return {"qx": arr[:, 0], "qy": arr[:, 1], "intensity": arr[:, 2]}
