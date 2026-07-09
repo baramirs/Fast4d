@@ -4749,6 +4749,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._console.log(f"Template: {len(self._scans)} scan(s) from {Path(p).name}")
         self._active = 0 if self._scans else -1
+        self._recent_scan_indices = []
         self._scans_changed()
 
     def _open_loader(self) -> None:
@@ -4758,6 +4759,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self._scans = dlg.scans
             self._active = 0 if self._scans else -1
+            self._recent_scan_indices = []
             self._console.log(f"Loaded {len(self._scans)} scan(s) via unified loader.")
             self._scans_changed()
             self._load_all_adfs()          # load ADFs immediately (from braggpeaks h5)
@@ -5013,6 +5015,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._console.log(f"Session loaded: {len(self._scans)} scan(s) from {Path(p).name}")
         self._active = 0 if self._scans else -1
+        self._recent_scan_indices = []
         self._scans_changed()
 
     def _load_ws(self) -> None:
@@ -5028,6 +5031,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._scans = scans
         self._active = 0
+        self._recent_scan_indices = []
         jp = E.find_workspace_params_json(root)
         msg = f"Loaded {len(scans)} workspace(s)."
         if jp:
@@ -5069,11 +5073,13 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if 0 <= self._active < len(self._scans):
             self._scans.pop(self._active)
             self._active = min(self._active, len(self._scans) - 1)
+            self._recent_scan_indices = []
             self._scans_changed()
 
     def _scans_changed(self) -> None:
         if self._active < 0 and self._scans:
             self._active = 0
+            self._recent_scan_indices = []
         self._params.rebuild()
         self._params.show_step(self._step)
         self._refresh_files()
