@@ -11,6 +11,7 @@ whole scan's peak list to be resident in RAM at once.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import h5py
 import numpy as np
@@ -50,3 +51,64 @@ class StreamingBraggWriter:
         if self._file is not None:
             self._file.close()
             self._file = None
+
+
+def detect_braggpeaks_streaming(
+    datacube,
+    template,
+    out_path: str | Path,
+    *,
+    batch_size: int = 64,
+    log: Callable[[str], None] | None = None,
+    **detect_kwargs,
+) -> Path:
+    """Detect Bragg disks in small position-batches and stream results to disk.
+
+    Uses the same public, position-scoped call Fast4D already makes for its
+    6-point preview (``pipeline.py:1344,1371``: ``datacube.find_Bragg_disks(
+    data=(<x-positions>, <y-positions>), template=..., **kwargs)``), just
+    looped over the whole scan in ``batch_size``-position chunks instead of
+    either 6 positions (preview) or the whole scan at once
+    (``compute_braggpeaks_step``, ``pipeline.py:1416``). Only ``batch_size``
+    positions' worth of detected peaks are ever held in RAM at a time.
+
+    Axis-order note: ``DataCube.find_Bragg_disks`` unpacks a 2-tuple ``data``
+    as ``dc, rx, ry = data[0], data[1], data[2]`` internally (after prepending
+    ``self``) and indexes ``dc.data[rx, ry, :, :]``
+    (``braggvectors/diskdetection.py:203,220``), matching the axis order the
+    full-datacube path itself loops in
+    (``for rx, ry in tqdmnd(datacube.R_Nx, datacube.R_Ny)``,
+    ``braggvectors/diskdetection.py:479-481``). So the first array in
+    ``data=(...)`` must range over ``R_Nx`` and the second over ``R_Ny``; this
+    function passes ``data=(rxs, rys)`` accordingly (verified by a throwaway
+    script showing this batched call's output matches
+    ``BraggVectors.raw[rx, ry]`` from the full-scan call, position-by-position).
+
+    Accessor note (py4DSTEM==0.14.19): when ``data`` is a 2-tuple of
+    position-index arrays, ``DataCube.find_Bragg_disks`` does NOT return a
+    ``BraggVectors`` instance the way the no-``data`` full-scan call does.
+    It returns a plain ``list[QPoints]``, one entry per requested position, in
+    the same order the position arrays were given (confirmed by reading
+    ``braggvectors/diskdetection.py`` and by a throwaway script that compared
+    this batched call's output position-by-position against the full-scan
+    ``BraggVectors.raw[rx, ry]`` accessor -- they matched exactly). Each
+    ``QPoints`` instance exposes fields directly as ``.qx``, ``.qy``,
+    ``.intensity`` (``py4DSTEM/data/qpoints.py``), so no ``get_vectors``/
+    ``.cal``/``.raw`` fallback chain is needed or applicable here.
+    """
+    out_path = Path(out_path)
+    r_nx, r_ny = datacube.R_Nx, datacube.R_Ny
+    all_positions = [(rx, ry) for rx in range(r_nx) for ry in range(r_ny)]
+
+    with StreamingBraggWriter(out_path, r_shape=(r_nx, r_ny)) as writer:
+        for start in range(0, len(all_positions), batch_size):
+            batch = all_positions[start:start + batch_size]
+            rxs = [p[0] for p in batch]
+            rys = [p[1] for p in batch]
+            results = datacube.find_Bragg_disks(data=(rxs, rys), template=template, **detect_kwargs)
+            for (rx, ry), pl in zip(batch, results):
+                writer.write(ry, rx, qx=np.asarray(pl.qx), qy=np.asarray(pl.qy),
+                             intensity=np.asarray(pl.intensity))
+            if log is not None:
+                log(f"Streaming Bragg detection: {min(start + batch_size, len(all_positions))}/{len(all_positions)} positions done.")
+    return out_path
