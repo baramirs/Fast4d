@@ -361,6 +361,11 @@ def compute_all(scans: list[E.Scan], opts: ComputeOptions | None = None, *,
                 on_scan_done(out)
             except Exception:
                 pass
+        # Release this scan's heavy buffers now that it's saved/reported — mirrors
+        # the manual "Free RAM" button (qt_main.py:4764-4775). Figures, ADF cache,
+        # and braggpeaks survive (drop_braggpeaks=False), so on_scan_done's GUI
+        # update above already had everything it needs before this line runs.
+        E.free_memory([scan], log=log)
         if out.error == "cancelled" or (cancel is not None and cancel()):
             _log(log, f"CANCELLED — stopped after '{scan.name}' ({i + 1}/{n}).")
             break
