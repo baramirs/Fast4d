@@ -1178,6 +1178,48 @@ def _enforce_figure_ram_limit(scan: "Scan") -> None:
             _close_figure(fig)
 
 
+@dataclass
+class ResidentDataPolicy:
+    """How many scans' heavy compute buffers (datacube / BVM / probe) may stay
+    resident in RAM at once — the same LRU-with-eviction idea FigurePolicy
+    already proves out for figures (engine.py:975-1178), applied to the bigger
+    objects instead. Eviction here calls the cheap `release_scans` (nulls
+    references only, no gc.collect/OS trim — see its own docstring for why),
+    not the heavier `free_memory`."""
+    max_scans_in_ram: int = 2
+
+
+_data_policy = ResidentDataPolicy()
+
+
+def get_data_policy() -> ResidentDataPolicy:
+    return _data_policy
+
+
+def set_data_policy(*, max_scans_in_ram: int | None = None) -> None:
+    """Update the global resident-data policy (GUI settings)."""
+    global _data_policy
+    if max_scans_in_ram is not None:
+        _data_policy.max_scans_in_ram = max(1, int(max_scans_in_ram))
+
+
+def enforce_resident_data_limit(scans: list, active_index: int, recent_indices: list[int],
+                                *, log: Log = None) -> list[int]:
+    """Update the LRU window to include ``active_index`` first, release every
+    scan that falls outside the resulting window (per ``get_data_policy()``),
+    and return the new window for the caller to store.
+
+    Pure w.r.t. its inputs aside from the ``release_scans`` side effect — safe
+    to call on every scan-switch."""
+    limit = get_data_policy().max_scans_in_ram
+    new_recent = ([active_index] + [i for i in recent_indices if i != active_index])[:limit]
+    if len(new_recent) == limit:
+        to_release = [sc for i, sc in enumerate(scans) if i not in new_recent]
+        if to_release:
+            release_scans(to_release, log=log)
+    return new_recent
+
+
 def clear_preview_figures(scan: "Scan") -> list[str]:
     """Drop registered figures marked as non-report (``DEFAULT_STORE_FIGURE`` False)."""
     removed: list[str] = []
