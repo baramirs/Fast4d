@@ -4120,6 +4120,13 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act_guide.setToolTip("Workflow help: overlays, RAM, Compute fit/apply, step jumps.")
         act_guide.triggered.connect(self._show_calib_guide)
         help_m.addAction(act_guide)
+        settings_m = mb.addMenu("&Settings")
+        act_mem = QtGui.QAction("Resident data (RAM)…", self)
+        act_mem.setToolTip(
+            "Configure how many scans stay fully resident in RAM "
+            "when switching scans.")
+        act_mem.triggered.connect(self._configure_resident_data_policy)
+        settings_m.addAction(act_mem)
 
     def _sync_figure_policy(self) -> None:
         kw = dict(
@@ -4139,6 +4146,19 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._store_figure = dlg.values()
             self._sync_figure_policy()
             self._console.log("Figure store updated — affects next register / Compute.")
+
+    def _configure_resident_data_policy(self) -> None:
+        """Settings → Memory → Max scans kept in RAM."""
+        current = E.get_data_policy().max_scans_in_ram
+        n, ok = QtWidgets.QInputDialog.getInt(
+            self, "Memory settings",
+            "Max scans kept fully resident in RAM\n"
+            "(others release their datacube/BVM/probe on scan-switch;\n"
+            "figures, ADF previews, and braggpeaks are unaffected):",
+            current, 1, 20, 1)
+        if ok:
+            E.set_data_policy(max_scans_in_ram=n)
+            self._console.log(f"Resident-data policy: max_scans_in_ram={n}")
 
     def _clear_figures(self) -> None:
         if self._busy:
