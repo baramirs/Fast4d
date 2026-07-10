@@ -66,6 +66,10 @@ class _GroupTable(QtWidgets.QTableWidget):
         self.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.horizontalHeader().setMinimumSectionSize(90)
+        # The column HEADER (showing the file name) is what users actually click to
+        # pick a file — it's a separate QHeaderView, not the table body, so it needs
+        # its own signal; mousePressEvent below only covers clicks inside the grid.
+        self.horizontalHeader().sectionClicked.connect(self.fileClicked.emit)
         self.setAlternatingRowColors(True)
         self.setMinimumWidth(260)
         self._fill_origin: tuple | None = None      # (row, col) where a fill-drag began
