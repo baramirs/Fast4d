@@ -3988,6 +3988,34 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._select_step(self._step)
         self._refresh_files()
         self._update_workflow_icons()
+        self._restore_window_layout()   # user's saved panel arrangement, if any (after build)
+
+    def _layout_settings(self) -> QtCore.QSettings:
+        """Per-user panel-layout file (Files/ADF/Resources positions, sizes, floating
+        state) — a real file the user can find, not the OS registry. First launch has
+        no file yet, so the default arrangement built in _build_docks stands."""
+        import os
+        from pathlib import Path
+        cfg_dir = Path(os.environ.get("APPDATA", str(Path.home()))) / "Fast4D"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        return QtCore.QSettings(str(cfg_dir / "window_layout.ini"),
+                                QtCore.QSettings.Format.IniFormat)
+
+    def _restore_window_layout(self) -> None:
+        settings = self._layout_settings()
+        geo = settings.value("geometry")
+        state = settings.value("windowState")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        if state is not None:
+            self.restoreState(state)
+
+    def closeEvent(self, ev) -> None:
+        """Save the user's current panel arrangement so it's restored next launch."""
+        settings = self._layout_settings()
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        super().closeEvent(ev)
 
     def _on_heavy_ready_poll(self) -> None:
         from qt_splash import heavy_ready
@@ -4130,6 +4158,19 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         fl.addWidget(self._files, 1)
         self._files_dock = self._dock("Files", files, L, name="files")
 
+        # ADF dock + ADF gallery (tabbed with it) — user-requested layout: everything
+        # stacked on the LEFT, top to bottom: Files / ADF viewer+gallery / Resources.
+        self._adf = AdfView()
+        self._adf.popoutRequested.connect(self._popout_adf)
+        self._adf_dock = self._dock("ADF viewer", self._adf, L, name="adf")
+        self._gallery = AdfGallery()
+        self._gallery.selected.connect(self._on_gallery_selected)
+        self._gallery.loadAllRequested.connect(self._load_all_adfs)
+        self._gallery_dock = self._dock("ADF Gallery", self._gallery, L, name="gallery")
+        self.tabifyDockWidget(self._adf_dock, self._gallery_dock)
+        self._adf_dock.raise_()
+        # (Report now lives as the LAST tab of the central calibration table, after Stress.)
+
         # Status dock (resources + calstate)
         status = QtWidgets.QWidget()
         sl = QtWidgets.QVBoxLayout(status)
@@ -4153,17 +4194,10 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         sl.addStretch(1)
         self._status_dock = self._dock("Resources / Calibration state", status, L, name="status")
 
-        # ADF dock (right) + ADF gallery (tabbed with it)
-        self._adf = AdfView()
-        self._adf.popoutRequested.connect(self._popout_adf)
-        self._adf_dock = self._dock("ADF viewer", self._adf, R, name="adf")
-        self._gallery = AdfGallery()
-        self._gallery.selected.connect(self._on_gallery_selected)
-        self._gallery.loadAllRequested.connect(self._load_all_adfs)
-        self._gallery_dock = self._dock("ADF Gallery", self._gallery, R, name="gallery")
-        self.tabifyDockWidget(self._adf_dock, self._gallery_dock)
-        self._adf_dock.raise_()
-        # (Report now lives as the LAST tab of the central calibration table, after Stress.)
+        # Explicit vertical stacking (top → bottom): Files, then ADF (+ Gallery tab), then
+        # Resources/Calibration — don't rely on Qt's implicit same-area insertion order.
+        self.splitDockWidget(self._files_dock, self._adf_dock, QtCore.Qt.Orientation.Vertical)
+        self.splitDockWidget(self._adf_dock, self._status_dock, QtCore.Qt.Orientation.Vertical)
 
         # Console dock (bottom)
         self._console = ConsoleWidget()
