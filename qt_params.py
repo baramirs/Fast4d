@@ -49,6 +49,11 @@ _PATH_A_DET_TIP = (
 class _GroupTable(QtWidgets.QTableWidget):
     """One tab: rows = a group's params, columns = scans. Buffered edits."""
 
+    # Emits the clicked column's scan index, so the host window can keep the
+    # Files panel (the "who does Play Calibration/Analysis act on" selection)
+    # in sync with whatever file the user is pointing at in this table.
+    fileClicked = QtCore.Signal(int)
+
     def __init__(self, group_key: str, get_scans, parent=None) -> None:
         super().__init__(parent)
         self._group_key = group_key
@@ -100,7 +105,8 @@ class _GroupTable(QtWidgets.QTableWidget):
                     fig = (sc.figures or {}).get(fk)
                     spill = E.resolve_figure_path(sc, fk) if not fig else ""
                     self.setCellWidget(row, c, ClickableFigureLabel(
-                        fig, spill_path=spill, title=f"{sc.name} — {fk}"))
+                        fig, spill_path=spill, title=f"{sc.name} — {fk}",
+                        scan=sc, fig_key=fk))
 
     def reload(self) -> None:
         self.build()
@@ -263,6 +269,8 @@ class _GroupTable(QtWidgets.QTableWidget):
             idx = self.indexAt(e.position().toPoint() if hasattr(e, "position")
                                else e.pos())
             self._fill_origin = (idx.row(), idx.column()) if idx.isValid() else None
+            if idx.isValid():
+                self.fileClicked.emit(idx.column())
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e) -> None:
@@ -289,6 +297,7 @@ class ParamTable(QtWidgets.QWidget):
 
     applied = QtCore.Signal(list)
     tabStep = QtCore.Signal(str)        # emitted when the USER selects a tab → icon strip syncs
+    fileSelected = QtCore.Signal(int)   # user clicked a file column → host syncs the Files panel
 
     def __init__(self, get_scans, parent=None) -> None:
         super().__init__(parent)
@@ -354,6 +363,7 @@ class ParamTable(QtWidgets.QWidget):
         self._tabs.addTab(self._probe_view, "Probe")
         for gk, title, _steps in PARAM_GROUPS:
             tbl = _GroupTable(gk, self._get_scans)
+            tbl.fileClicked.connect(self.fileSelected)
             self._tables[gk] = tbl
             self._tabs.addTab(tbl, title)
         # Report — the LAST tab (user choice: in the calibration window, after Stress)

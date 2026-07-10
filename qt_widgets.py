@@ -783,12 +783,24 @@ class FigureDialog(QtWidgets.QDialog):
 
 
 class ClickableFigureLabel(QtWidgets.QLabel):
-    """A figure thumbnail; click → open it full-size (with residuals etc.)."""
+    """A figure thumbnail; click → open it full-size (with residuals etc.).
+
+    Pass ``scan``/``fig_key`` so the label re-resolves the Figure lazily on
+    click via ``engine.resolve_figure`` (RAM-or-spilled-PNG) instead of holding
+    its own permanent reference. A permanent reference can outlive
+    ``FigurePolicy``'s eviction of the same Figure from ``scan.figures``
+    (engine.py:1162-1178), keeping it — and the arrays it plots — resident
+    longer than the policy intends. Omit ``scan``/``fig_key`` to keep today's
+    behavior (used by qt_report.py's ad hoc report figures, which aren't part
+    of the ``scan.figures`` pool in the first place).
+    """
 
     def __init__(self, fig, *, spill_path: str = "", title: str = "Figure",
-                 parent=None, max_w: int = 240, max_h: int = 150, dpi: int = 80) -> None:
+                 parent=None, max_w: int = 240, max_h: int = 150, dpi: int = 80,
+                 scan=None, fig_key: str = "") -> None:
         super().__init__(parent)
-        self._fig = fig
+        self._scan = scan
+        self._fig_key = fig_key
         self._spill_path = spill_path or ""
         self._title = title
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -810,10 +822,20 @@ class ClickableFigureLabel(QtWidgets.QLabel):
         else:
             self.setText("—")
             self.setStyleSheet("color:#aaa;")
+        # Only cache a direct Figure reference when there's no (scan, fig_key) to
+        # re-resolve from later — lazy mode is preferred whenever it's available.
+        self._fig = fig if (scan is None or not fig_key) else None
+
+    def _resolve_fig(self):
+        if self._scan is not None and self._fig_key:
+            import engine as E
+            return E.resolve_figure(self._scan, self._fig_key)
+        return self._fig
 
     def mousePressEvent(self, ev) -> None:
-        if self._fig is not None:
-            FigureDialog(self._fig, self.window(), self._title).exec()
+        fig = self._resolve_fig()
+        if fig is not None:
+            FigureDialog(fig, self.window(), self._title).exec()
         elif self._spill_path:
             FigureDialog.from_png(self._spill_path, self.window(), self._title).exec()
 
@@ -1171,8 +1193,8 @@ class _LabeledSlider(QtWidgets.QWidget):
         self._sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl.setRange(0, n)
         self._val = QtWidgets.QLineEdit()
-        self._val.setMinimumWidth(56)
-        self._val.setMaximumWidth(70)
+        self._val.setMinimumWidth(72)
+        self._val.setMaximumWidth(96)
         self._val.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
                                | QtCore.Qt.AlignmentFlag.AlignVCenter)
         if self._decimals:
