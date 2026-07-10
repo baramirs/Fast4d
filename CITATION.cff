@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: >-
+  If you use Fast4D in academic or research work, please cite it as below.
+  Check this repository for an associated publication that may supersede
+  this citation.
+title: Fast4D
+type: software
+authors:
+  - family-names: Tapia Caceres
+    given-names: Jose Manuel
+repository-code: "https://github.com/baramirs/Fast4d"
+abstract: >-
+  A desktop GUI and processing pipeline for 4D-STEM (four-dimensional
+  scanning transmission electron microscopy) analysis, built on py4DSTEM
+  and PySide6 (Qt6).
+license-url: "https://github.com/baramirs/Fast4d/blob/main/LICENSE"

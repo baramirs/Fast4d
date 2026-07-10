@@ -75,8 +75,24 @@ and `PY` paths inside it to point at your own environment).
 
 ## License
 
-No license specified yet. All rights reserved by the author unless a license is
-added.
+Fast4D is released under the **GNU General Public License v3.0 (GPLv3)**. See
+[`LICENSE`](LICENSE) for the full terms and [`CITATION.cff`](CITATION.cff) for
+how to cite this software.
+
+Fast4D imports [py4DSTEM](https://github.com/py4dstem/py4DSTEM) directly
+(`engine.py`, `pipeline.py`, `viewer.py`), which is itself GPLv3-licensed —
+GPLv3 is the license required for the combined work to stay compliant.
+
+### Third-party licenses
+
+| Library | License |
+| --- | --- |
+| py4DSTEM | GPLv3 |
+| PySide6 (Qt for Python) | LGPLv3 / GPLv2 / GPLv3 (used here under the open-source terms) |
+| tqdm | MPL-2.0 / MIT |
+| numpy, scipy, pandas, matplotlib, scikit-image, scikit-learn, uncertainties, h5py, pillow, psutil, PyYAML, python-pptx, pyqtgraph, cupy, pynvml | BSD / MIT / PSF (permissive) |
+
+All of the above are compatible with GPLv3; none impose conflicting terms.
 
 ## Author
 
