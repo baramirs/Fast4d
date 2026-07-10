@@ -2133,7 +2133,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
 
     def _dspin(self, lo, hi, val):
         s = QtWidgets.QDoubleSpinBox(); s.setDecimals(2); s.setRange(lo, hi)
-        s.setSingleStep(0.1); s.setValue(val); s.setMaximumWidth(64)
+        s.setSingleStep(0.1); s.setValue(val); s.setMinimumWidth(80); s.setMaximumWidth(96)
         return s
 
     def _circle(self, r, n=160):
@@ -4053,6 +4053,12 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._files = FilesTree(explore_fn=E.explore_h5)
         self._files.scanSelected.connect(self._on_file_selected)
         self._files.nodeActivated.connect(self._on_node_activated)
+        # Clicking a file's column in the middle parameter table must select that
+        # same file in the Files panel too — Play Calibration/Analysis always acts
+        # on the Files-panel selection (self._active), so without this the two
+        # views could point at different files and an action would silently run
+        # on the wrong one.
+        self._params.fileSelected.connect(self._files.select_scan)
         fl.addWidget(self._files, 1)
         self._files_dock = self._dock("Files", files, L, name="files")
 
@@ -5781,8 +5787,10 @@ class Fast4DWindow(QtWidgets.QMainWindow):
 
     def _open_detect_tuner(self) -> None:
         """Interactive 6-point detection tuner: drag a knob → live re-detect on the
-        6 points (mirrors the notebook). Needs datacube + probe + 6 points loaded;
-        the dialog shows a clear error in its status if something's missing."""
+        6 points (mirrors the notebook). Needs datacube + probe loaded; if either
+        isn't loaded yet for the active file, this loads them first (the same work
+        the "Load data + probe" button does) and THEN opens the tuner automatically
+        — no more manual Load-then-Update every time."""
         sc = self._need_active()
         if sc is None:
             return
@@ -5792,54 +5800,76 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                 f"'{sc.name}' already has braggpeaks.h5 — the 6-point detection tuner "
                 "is only for Path B (before the first braggpeaks file exists).")
             return
-        from qt_widgets import TunerDialog
-        knobs = [
-            {"attr": "detect_min_absolute_intensity", "label": "minAbsoluteIntensity (threshold)",
-             "kind": "int", "min": 0, "max": 500, "step": 1},
-            {"attr": "detect_min_relative_intensity", "label": "minRelativeIntensity",
-             "kind": "float", "min": 0.0, "max": 1.0, "step": 0.001, "decimals": 3},
-            {"attr": "detect_min_peak_spacing", "label": "minPeakSpacing",
-             "kind": "int", "min": 0, "max": 80, "step": 1},
-            {"attr": "detect_edge_boundary", "label": "edgeBoundary",
-             "kind": "int", "min": 0, "max": 80, "step": 1},
-            {"attr": "detect_sigma", "label": "sigma",
-             "kind": "float", "min": 0.0, "max": 10.0, "step": 0.5, "decimals": 1},
-            {"attr": "detect_max_num_peaks", "label": "maxNumPeaks",
-             "kind": "int", "min": 1, "max": 300, "step": 1},
-            {"attr": "detect_corr_power", "label": "corrPower",
-             "kind": "float", "min": 0.1, "max": 2.0, "step": 0.05, "decimals": 2},
-            {"attr": "detect_subpixel", "label": "subpixel",
-             "kind": "enum", "values": ["none", "poly", "com"]},
-            {"attr": "detect_cuda", "label": "CUDA (GPU)", "kind": "bool"},
-        ]
-        views = [
-            {"key": "mode", "label": "View filter", "values": E.DETECT_VIEW_MODES},
-            {"key": "cmap", "label": "cmap", "values": E.DETECT_CMAPS},
-            {"key": "p_lo", "label": "percentile lo", "kind": "slider",
-             "min": 0.0, "max": 20.0, "step": 0.5, "decimals": 1, "default": 1.0,
-             "depends_on": {"key": "mode", "in": ["pclip_gamma"]}},
-            {"key": "p_hi", "label": "percentile hi", "kind": "slider",
-             "min": 80.0, "max": 100.0, "step": 0.1, "decimals": 1, "default": 99.8,
-             "depends_on": {"key": "mode", "in": ["pclip_gamma", "log", "highpass", "raw"]}},
-            {"key": "gamma", "label": "gamma", "kind": "slider",
-             "min": 0.1, "max": 2.0, "step": 0.05, "decimals": 2, "default": 0.45,
-             "depends_on": {"key": "mode", "in": ["pclip_gamma"]}},
-            {"key": "hp_sigma", "label": "highpass sigma", "kind": "slider",
-             "min": 0.0, "max": 20.0, "step": 0.5, "decimals": 1, "default": 6.0,
-             "depends_on": {"key": "mode", "in": ["highpass"]}},
-        ]
-        def render(_obj, view):
-            return E.build_six_point_detection_figure(
-                sc, view_mode=view.get("mode", "highpass"),
-                cmap=view.get("cmap", "inferno"), log=self._console.log,
-                p_lo=view.get("p_lo", 1.0), p_hi=view.get("p_hi", 99.8),
-                gamma=view.get("gamma", 0.45), hp_sigma=view.get("hp_sigma", 6.0))
-        self._show_tool(TunerDialog(
-            self, title=f"Tune detection (6 points) — {sc.name}", obj=sc.params,
-            knob_specs=knobs, view_specs=views, render_fig=render,
-            view={"mode": "highpass", "cmap": "inferno"},
-            extra_actions=[("Load data + probe (one click)", self._load_data_and_probe)],
-            on_commit=lambda _o: self._params.reload()))
+
+        def _show_tuner() -> None:
+            from qt_widgets import TunerDialog
+            knobs = [
+                {"attr": "detect_min_absolute_intensity", "label": "minAbsoluteIntensity (threshold)",
+                 "kind": "int", "min": 0, "max": 500, "step": 1},
+                {"attr": "detect_min_relative_intensity", "label": "minRelativeIntensity",
+                 "kind": "float", "min": 0.0, "max": 1.0, "step": 0.001, "decimals": 3},
+                {"attr": "detect_min_peak_spacing", "label": "minPeakSpacing",
+                 "kind": "int", "min": 0, "max": 80, "step": 1},
+                {"attr": "detect_edge_boundary", "label": "edgeBoundary",
+                 "kind": "int", "min": 0, "max": 80, "step": 1},
+                {"attr": "detect_sigma", "label": "sigma",
+                 "kind": "float", "min": 0.0, "max": 10.0, "step": 0.5, "decimals": 1},
+                {"attr": "detect_max_num_peaks", "label": "maxNumPeaks",
+                 "kind": "int", "min": 1, "max": 300, "step": 1},
+                {"attr": "detect_corr_power", "label": "corrPower",
+                 "kind": "float", "min": 0.1, "max": 2.0, "step": 0.05, "decimals": 2},
+                {"attr": "detect_subpixel", "label": "subpixel",
+                 "kind": "enum", "values": ["none", "poly", "com"]},
+                {"attr": "detect_cuda", "label": "CUDA (GPU)", "kind": "bool"},
+            ]
+            views = [
+                {"key": "mode", "label": "View filter", "values": E.DETECT_VIEW_MODES},
+                {"key": "cmap", "label": "cmap", "values": E.DETECT_CMAPS},
+                {"key": "p_lo", "label": "percentile lo", "kind": "slider",
+                 "min": 0.0, "max": 20.0, "step": 0.5, "decimals": 1, "default": 1.0,
+                 "depends_on": {"key": "mode", "in": ["pclip_gamma"]}},
+                {"key": "p_hi", "label": "percentile hi", "kind": "slider",
+                 "min": 80.0, "max": 100.0, "step": 0.1, "decimals": 1, "default": 99.8,
+                 "depends_on": {"key": "mode", "in": ["pclip_gamma", "log", "highpass", "raw"]}},
+                {"key": "gamma", "label": "gamma", "kind": "slider",
+                 "min": 0.1, "max": 2.0, "step": 0.05, "decimals": 2, "default": 0.45,
+                 "depends_on": {"key": "mode", "in": ["pclip_gamma"]}},
+                {"key": "hp_sigma", "label": "highpass sigma", "kind": "slider",
+                 "min": 0.0, "max": 20.0, "step": 0.5, "decimals": 1, "default": 6.0,
+                 "depends_on": {"key": "mode", "in": ["highpass"]}},
+            ]
+            def render(_obj, view):
+                return E.build_six_point_detection_figure(
+                    sc, view_mode=view.get("mode", "highpass"),
+                    cmap=view.get("cmap", "inferno"), log=self._console.log,
+                    p_lo=view.get("p_lo", 1.0), p_hi=view.get("p_hi", 99.8),
+                    gamma=view.get("gamma", 0.45), hp_sigma=view.get("hp_sigma", 6.0))
+            self._show_tool(TunerDialog(
+                self, title=f"Tune detection (6 points) — {sc.name}", obj=sc.params,
+                knob_specs=knobs, view_specs=views, render_fig=render,
+                view={"mode": "highpass", "cmap": "inferno"},
+                extra_actions=[("Load data + probe (one click)", self._load_data_and_probe)],
+                on_commit=lambda _o: self._params.reload()))
+
+        st = getattr(sc, "state", None)
+        needs_load = (getattr(st, "datacube", None) is None
+                     or getattr(st, "probe", None) is None)
+        if not needs_load:
+            _show_tuner()
+            return
+        if self._busy:
+            return
+        self._console.log(f"[{sc.name}] datacube/probe not loaded yet — loading "
+                          "automatically before opening the detection tuner.")
+        self._run_async(
+            lambda: E.load_datacube_and_probe(sc, log=self._console.log),
+            label=f"Load data + probe ({sc.name})",
+            on_done=lambda _r: (
+                self._params.set_probe_figure(E.build_probe_figure(sc), focus=False)
+                if E.build_probe_figure(sc) is not None else None,
+                self._update_active_views(),
+                _show_tuner(),
+            ))
 
     def _compute_braggpeaks(self) -> None:
         sc = self._need_active()

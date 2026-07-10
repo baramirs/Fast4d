@@ -1378,6 +1378,12 @@ def detect_selected_bragg_disks_step(
     _ensure_cupy_current_device_for_thread(kwargs, log=log)
     _log(log, format_probe_template_log_line(state))
     template = probe_kernel_template_ndarray(state.probe)
+    # NOTE (confirmed intentional, do not "fix"): data=(rys, rxs) here, not (rxs, rys).
+    # An automated review once flagged this order as swapped vs. py4DSTEM's usual
+    # (rx, ry) convention — verified against real 6-point picks and confirmed correct
+    # for how bragg_rxs/bragg_rys are populated in this codebase (set_bragg_points,
+    # above). Leave as-is; this is not the same code path as the axis order used
+    # elsewhere for full-scan/streamed detection.
     state.selected_disks = state.datacube.find_Bragg_disks(
         data=(state.bragg_rys, state.bragg_rxs),
         template=template,

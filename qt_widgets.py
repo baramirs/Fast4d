@@ -1193,8 +1193,8 @@ class _LabeledSlider(QtWidgets.QWidget):
         self._sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl.setRange(0, n)
         self._val = QtWidgets.QLineEdit()
-        self._val.setMinimumWidth(56)
-        self._val.setMaximumWidth(70)
+        self._val.setMinimumWidth(72)
+        self._val.setMaximumWidth(96)
         self._val.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
                                | QtCore.Qt.AlignmentFlag.AlignVCenter)
         if self._decimals:
