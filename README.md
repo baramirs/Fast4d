@@ -96,4 +96,5 @@ All of the above are compatible with GPLv3; none impose conflicting terms.
 
 ## Author
 
-**Jose Manuel Tapia Caceres** ([@baramirs](https://github.com/baramirs))
+**Jose Manuel Tapia Caceres** ([@baramirs](https://github.com/baramirs)) —
+[jtapiaca@asu.edu](mailto:jtapiaca@asu.edu)
