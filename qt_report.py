@@ -67,6 +67,11 @@ _PERSCAN_KINDS = {K_FIG, K_CORR, K_LINE_PROF, K_MAPS_LINES, K_ROI_PROF, K_ROI_DI
 _GROUPLINE_KINDS = {K_LINE_GROUP, K_LINE_TABLE}
 _GROUPROI_KINDS = {K_ROI_GROUP, K_ROI_TABLE}
 _PIXDIFF_KINDS = {K_PIXDIFF, K_PIXDIFF_TABLE}
+# Views that silently combine EVERY currently loaded scan unless the user has
+# explicitly opted into "Repro. exp." (engine.AnalysisScopePolicy.shared_stats).
+# K_PIXDIFF/K_PIXDIFF_TABLE are deliberately excluded — the user always picks
+# the two files by hand there, so there's no silent mixing to guard against.
+_GROUPED_ANALYSIS_KINDS = {K_DIST, K_BOX, K_PCA, K_STRESS, K_STATS} | _GROUPLINE_KINDS | _GROUPROI_KINDS
 _CHANNELS = [("ε_yy", "eyy"), ("ε_xx", "exx"), ("ε_xy", "exy"),
              ("σ_xx", "sxx"), ("σ_yy", "syy"), ("σ_xy", "sxy"), ("ADF", "adf")]
 
@@ -270,9 +275,10 @@ class ReportPanel(QtWidgets.QWidget):
     liveRoiRequested = QtCore.Signal()      # open the interactive Live ROI-stats tool
     exportPptxRequested = QtCore.Signal()   # build PPTX report from saved summary/images
 
-    def __init__(self, get_scans, parent=None) -> None:
+    def __init__(self, get_scans, get_active_scan=None, parent=None) -> None:
         super().__init__(parent)
         self._get_scans = get_scans
+        self._get_active_scan = get_active_scan
         self._fig = None            # currently shown Figure (for Maximize)
         self._df = None             # currently shown DataFrame (for Export)
         self._canvas = None         # ClickableFigureLabel thumbnail (figure page)
@@ -334,6 +340,12 @@ class ReportPanel(QtWidgets.QWidget):
         sel = self._tabs.currentWidget()
         kind = sel._kind.currentText()
         label = sel._label.currentText()
+        restricted_to_active = False
+        if kind in _GROUPED_ANALYSIS_KINDS and not E.get_analysis_scope().shared_stats:
+            active = self._get_active_scan() if self._get_active_scan else None
+            if active is not None:
+                scans = [active]
+                restricted_to_active = True
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
             import analysis as A
@@ -433,7 +445,12 @@ class ReportPanel(QtWidgets.QWidget):
                 self._set_table(E.pixel_difference_table(
                     scans, sel._item.currentData(), label, reference_idx=max(0, ref),
                     drift_correct=sel._chk_drift_corr.isChecked()))
-            self._status.setText(f"Showing: {kind}")
+            if restricted_to_active:
+                self._status.setText(
+                    f"Showing: {kind} — active file only (enable 'Repro. exp.' in "
+                    "Analysis to compare across files)")
+            else:
+                self._status.setText(f"Showing: {kind}")
         except Exception as exc:
             self._status.setText(f"Error: {exc}")
         finally:

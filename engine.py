@@ -1219,6 +1219,33 @@ def enforce_resident_data_limit(scans: list, active_index: int, recent_indices: 
     return new_recent
 
 
+@dataclass
+class AnalysisScopePolicy:
+    """Whether the Report's cross-file views (lines/ROIs "across files", and the
+    cross-scan distribution/box/PCA/stress/stats views) may combine every
+    currently loaded scan.
+
+    Off by default: two unrelated files loaded in the same session must never
+    get silently averaged/compared just because they happen to share a line or
+    ROI id like "L1". Turn this on only for a genuine reproducibility experiment
+    (repeated measurements of the same sample/line across files)."""
+    shared_stats: bool = False
+
+
+_analysis_scope = AnalysisScopePolicy()
+
+
+def get_analysis_scope() -> AnalysisScopePolicy:
+    return _analysis_scope
+
+
+def set_analysis_scope(*, shared_stats: bool | None = None) -> None:
+    """Update the global analysis-scope policy (Analysis panel checkbox)."""
+    global _analysis_scope
+    if shared_stats is not None:
+        _analysis_scope.shared_stats = bool(shared_stats)
+
+
 def clear_preview_figures(scan: "Scan") -> list[str]:
     """Drop registered figures marked as non-report (``DEFAULT_STORE_FIGURE`` False)."""
     removed: list[str] = []
