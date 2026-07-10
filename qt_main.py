@@ -4201,6 +4201,17 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             "when switching scans.")
         act_mem.triggered.connect(self._configure_resident_data_policy)
         settings_m.addAction(act_mem)
+        self._cb_save = QtGui.QAction("Auto-save on Compute", self)
+        self._cb_save.setCheckable(True)
+        self._cb_save.setChecked(True)
+        self._cb_save.setToolTip(
+            "ON (default): every Compute (File or All) saves the workspace + "
+            "figures automatically, same as before.\n"
+            "OFF: Compute only runs the calculation — nothing is written to disk "
+            "until you Save manually (Report panel Save / Save As). Skips the "
+            "figure-overwrite I/O on every calculation, which is slow for "
+            "large/frequent recomputes.")
+        settings_m.addAction(self._cb_save)
 
     def _sync_figure_policy(self) -> None:
         kw = dict(
@@ -4690,9 +4701,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         g_file_v.addLayout(file_top)
 
         file_mid = hrow()
-        self._cb_save = QtWidgets.QCheckBox("Save")
-        self._cb_save.setChecked(True)
-        file_mid.addWidget(self._cb_save)
         file_mid.addWidget(QtWidgets.QLabel("Calib:"))
         self._calib = QtWidgets.QComboBox()
         self._calib.addItems(["fit", "apply"])
