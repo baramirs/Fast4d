@@ -1,0 +1,300 @@
+# Instincts generated from https://github.com/baramirs/Fast4d
+# Generated: 2026-07-10T18:24:32.032Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: Fast4d-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: docs
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: docs: license Fast4D under GPLv3 for py4DSTEM compatibility
+
+---
+id: Fast4d-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Commit Length
+
+## Action
+
+Write moderate-length commit messages (~59 characters)
+
+## Evidence
+
+- Average commit message length: 59 chars
+- Based on 1 commits
+
+---
+id: Fast4d-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Naming Files
+
+## Action
+
+Use PascalCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: PascalCase
+
+---
+id: Fast4d-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: Fast4d-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: Fast4d-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/baramirs/Fast4d
+---
+
+# Fast4d Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: fast4d-instinct-file-naming
+trigger: "When creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct File Naming
+
+## Action
+
+Name the file using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.files: PascalCase
+
+---
+id: fast4d-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: fast4d-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Class Naming
+
+## Action
+
+Name the class using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: fast4d-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: fast4d-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: fast4d-instinct-export-style
+trigger: "When exporting code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: fast4d-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Git Commit Format
+
+## Action
+
+Use the conventional commit format with a prefix (e.g., 'docs:')
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Example: 'docs: license Fast4D under GPLv3 for py4DSTEM compatibility'
+
+---
+id: fast4d-instinct-git-commit-prefix
+trigger: "When documenting changes in a commit"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Git Commit Prefix
+
+## Action
+
+Use the 'docs' prefix for documentation-related commits
+
+## Evidence
+
+- Pattern in commits.prefixes: docs
+- Example: 'docs: license Fast4D under GPLv3 for py4DSTEM compatibility'
+
+---
+id: fast4d-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: baramirs/Fast4d
+---
+
+# Fast4d Instinct Test Location
+
+## Action
+
+Place test files in a separate location from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
