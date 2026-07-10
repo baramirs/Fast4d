@@ -3601,7 +3601,8 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
 
         self._status = QtWidgets.QLabel(
             "Drag / resize the rectangles on the map. Each curve = one file; "
-            "y = the ROI mean of the selected channel. Use + ROI for more regions.")
+            "y = the ROI mean of the selected channel (error bars = ±1 SD of the "
+            "pixels inside that ROI). Use + ROI for more regions.")
         self._status.setStyleSheet("color:#1565C0; font-size:11px;")
         self._status.setWordWrap(True)
         lay.addWidget(self._status)
@@ -3818,15 +3819,26 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
             else:
                 dx, dy = E._line_drift_shift(sc, use_drift=use_drift)
             means = []
+            stds = []
             for b in bounds_tpl:
                 if b is None:
-                    means.append(self._np.nan); continue
+                    means.append(self._np.nan); stds.append(self._np.nan); continue
                 bb = E._roi_shift_clamp(b, H, W, dx, dy)
                 v = E._roi_region_values(m, bb)
                 means.append(float(self._np.mean(v)) if v.size else self._np.nan)
+                stds.append(float(self._np.std(v)) if v.size else self._np.nan)
             c = COLS[si % len(COLS)]
             self._plot.plot(xs, means, pen=self._pg.mkPen(c, width=2),
                             symbol="o", symbolBrush=c, symbolSize=8, name=sc.name)
+            means_arr = self._np.asarray(means, dtype=float)
+            stds_arr = self._np.asarray(stds, dtype=float)
+            valid = ~self._np.isnan(means_arr) & ~self._np.isnan(stds_arr)
+            if valid.any():
+                # ±1 SD of the pixel values inside each ROI (not across files).
+                err = self._pg.ErrorBarItem(
+                    x=self._np.asarray(xs, dtype=float)[valid], y=means_arr[valid],
+                    height=stds_arr[valid] * 2, pen=self._pg.mkPen(c, width=1.5))
+                self._plot.addItem(err)
             n_curves += 1
         clab = E._channel_label(tpl, ch) if tpl else ch
         self._plot.setLabel("left", clab)
@@ -4059,8 +4071,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if self._params.report is not None:        # Report-tab Save / Save As
             self._params.report.saveRequested.connect(
                 lambda save_as: self._save_results(save_as=save_as))
-            self._params.report.liveLineRequested.connect(self._open_live_line)
-            self._params.report.liveRoiRequested.connect(self._open_live_roi)
             self._params.report.exportPptxRequested.connect(self._export_pptx_report)
         self._params.tabStep.connect(self._select_step)   # tab → icon strip + step buttons
 
@@ -4633,20 +4643,17 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         elif key == "basis":
             add_setting_bar("basis")
         elif key == "lines":
-            add("Stress (file)", lambda: self._compute_stress(all_files=False),
-                tip="Compute Hooke stress from strain — active file only.")
-            add("Stress (all)", lambda: self._compute_stress(all_files=True),
-                tip="Compute Hooke stress from strain — all loaded files.")
-            tb.addSeparator()
-            add("Set up lines…", self._open_line_setup,
+            add("Set up Lines & ROI", self._open_line_setup,
                 tip="Configure line ROIs, area ROIs, drift, and propagation.")
-            add("Calculate lines", self._calculate_lines,
-                tip="Build line-profile figures for the Report.")
-            tb.addSeparator()
-            add("Analyze (file)", self._analyze_active,
+            add("Analyse (file)", self._analyze_active,
                 tip="Run full analysis (stress + lines) on the active file.")
-            add("Analyze (all)", lambda: self._on_analysis(),
+            add("Analysis (all)", lambda: self._on_analysis(),
                 tip="Run full analysis (stress + lines) on all loaded files.")
+            tb.addSeparator()
+            add("Live Line Profile", self._open_live_line,
+                tip="Interactive line-profile tool (modeless).")
+            add("Live ROI profile", self._open_live_roi,
+                tip="Interactive area-ROI stats tool (modeless).")
         elif key == "strain":
             add("Apply", self._apply_strain_params, tip="Commit strain parameters from the table.")
             add("Compute (file)", self._compute_active)

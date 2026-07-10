@@ -271,8 +271,6 @@ class _ViewSelector(QtWidgets.QWidget):
 
 class ReportPanel(QtWidgets.QWidget):
     saveRequested = QtCore.Signal(bool)     # True → "Save As" (always ask); False → "Save"
-    liveLineRequested = QtCore.Signal()     # open the interactive Live line-profile tool
-    liveRoiRequested = QtCore.Signal()      # open the interactive Live ROI-stats tool
     exportPptxRequested = QtCore.Signal()   # build PPTX report from saved summary/images
 
     def __init__(self, get_scans, get_active_scan=None, parent=None) -> None:
@@ -298,8 +296,6 @@ class ReportPanel(QtWidgets.QWidget):
         row3 = QtWidgets.QHBoxLayout()
         for txt, fn in (("Show", self._show), ("Refresh", self.refresh),
                         ("Maximize", self._maximize), ("Export table…", self._export),
-                        ("Live line profile…", lambda: self.liveLineRequested.emit()),
-                        ("Live ROI stats…", lambda: self.liveRoiRequested.emit()),
                         ("Export PPTX…", lambda: self.exportPptxRequested.emit()),
                         ("Save", lambda: self.saveRequested.emit(False)),
                         ("Save As…", lambda: self.saveRequested.emit(True))):
