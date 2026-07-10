@@ -299,9 +299,10 @@ class ParamTable(QtWidgets.QWidget):
     tabStep = QtCore.Signal(str)        # emitted when the USER selects a tab → icon strip syncs
     fileSelected = QtCore.Signal(int)   # user clicked a file column → host syncs the Files panel
 
-    def __init__(self, get_scans, parent=None) -> None:
+    def __init__(self, get_scans, get_active_scan=None, parent=None) -> None:
         super().__init__(parent)
         self._get_scans = get_scans
+        self._get_active_scan = get_active_scan
         self._tables: dict[str, _GroupTable] = {}
         self._report = None             # persistent Report tab (created on first rebuild)
         self._suppress_tab = False      # guard: don't echo programmatic tab changes back
@@ -369,7 +370,7 @@ class ParamTable(QtWidgets.QWidget):
         # Report — the LAST tab (user choice: in the calibration window, after Stress)
         if self._report is None:
             from qt_report import ReportPanel
-            self._report = ReportPanel(self._get_scans)
+            self._report = ReportPanel(self._get_scans, self._get_active_scan)
         self._tabs.addTab(self._report, "Report")
         self._report.refresh()
 
