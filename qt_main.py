@@ -4928,13 +4928,35 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._scans_changed()
             self._load_all_adfs()          # load ADFs immediately (from braggpeaks h5)
 
+    def _braggpeaks_reloadable(self, scan) -> bool:
+        """True when a scan's detected peaks are persisted to disk, so dropping them
+        from RAM is free — ensure_braggpeaks_for_calibration re-loads from the .h5."""
+        bp = getattr(scan, "braggpeaks_path", None)
+        try:
+            return bool(bp) and Path(str(bp)).exists()
+        except Exception:
+            return False
+
     def _free_ram(self) -> None:
         """Release the heavy datacube + buffers + CUDA pool after a compute (RAM stays
-        full otherwise, e.g. a 33 GB .mib). Runs in a worker so the UI stays live."""
+        full otherwise, e.g. a 33 GB .mib). Runs in a worker so the UI stays live.
+
+        When any loaded scan's peaks are persisted to a braggpeaks .h5, offer to also
+        drop the peaks from RAM — they reload from disk on demand (Path A)."""
         if self._busy:
             return
+        drop_bp = False
+        if any(self._braggpeaks_reloadable(s) for s in self._scans if s is not None):
+            ans = QtWidgets.QMessageBox.question(
+                self, "Free RAM",
+                "Also drop detected Bragg peaks from RAM?\n\n"
+                "They are saved to disk and will reload automatically from the "
+                "braggpeaks .h5 when calibration/strain next needs them.",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No)
+            drop_bp = (ans == QtWidgets.QMessageBox.StandardButton.Yes)
         self._run_async(
-            lambda: E.free_memory(self._scans, log=self._console.log),
+            lambda: E.free_memory(self._scans, drop_braggpeaks=drop_bp, log=self._console.log),
             label="Free RAM",
             on_done=lambda r: self._status.showMessage(
                 f"Freed {r.get('buffers', 0)} buffer(s)"
@@ -6021,7 +6043,8 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._run_async(lambda: E.compute_braggpeaks(sc, save_path=save, log=self._console.log),
                         label=f"braggpeaks ({sc.name})",
-                        on_done=lambda _r: (self._refresh_files(), self._update_active_views()))
+                        on_done=lambda _r: (self._refresh_files(), self._update_active_views(),
+                                            E.free_memory([sc], log=self._console.log)))
 
     # ── compute / analysis ─────────────────────────────────────────────────────
     def _compute_options(self) -> D.ComputeOptions:

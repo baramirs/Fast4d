@@ -362,10 +362,15 @@ def compute_all(scans: list[E.Scan], opts: ComputeOptions | None = None, *,
             except Exception:
                 pass
         # Release this scan's heavy buffers now that it's saved/reported — mirrors
-        # the manual "Free RAM" button (qt_main.py:4764-4775). Figures, ADF cache,
-        # and braggpeaks survive (drop_braggpeaks=False), so on_scan_done's GUI
-        # update above already had everything it needs before this line runs.
-        E.free_memory([scan], log=log)
+        # the manual "Free RAM" button. Figures and ADF cache survive so the
+        # on_scan_done GUI update above already had everything it needs. Also drop
+        # the detected peaks IF they are persisted to disk (Path A): calibration and
+        # strain for this scan are done, and ensure_braggpeaks_for_calibration will
+        # re-load them from the .h5 on demand — so keeping them resident only wastes
+        # RAM across a multi-scan batch.
+        bp_path = getattr(scan, "braggpeaks_path", None)
+        drop_bp = bool(bp_path) and Path(str(bp_path)).exists()
+        E.free_memory([scan], drop_braggpeaks=drop_bp, log=log)
         if out.error == "cancelled" or (cancel is not None and cancel()):
             _log(log, f"CANCELLED — stopped after '{scan.name}' ({i + 1}/{n}).")
             break

@@ -27,3 +27,21 @@ def test_compute_all_still_calls_on_scan_done_before_releasing(monkeypatch):
     driver.compute_all(scans, on_scan_done=lambda out: order.append("on_scan_done"))
 
     assert order == ["on_scan_done", "release"]
+
+
+def test_compute_all_drops_braggpeaks_when_path_persisted(monkeypatch, tmp_path):
+    bp = tmp_path / "braggpeaks.h5"
+    bp.write_bytes(b"x")  # a real on-disk file → peaks are reloadable
+    scans = [SimpleNamespace(name="a", braggpeaks_path=str(bp)),
+             SimpleNamespace(name="b", braggpeaks_path=None)]
+    fake_outcome = SimpleNamespace(ok=True, error=None, elapsed_s=0.1)
+    monkeypatch.setattr(driver, "compute_scan", lambda *a, **k: fake_outcome)
+
+    drop_flags = []
+    monkeypatch.setattr(E, "free_memory",
+                        lambda scans_arg, **k: drop_flags.append(k.get("drop_braggpeaks")))
+
+    driver.compute_all(scans)
+
+    # scan a has a persisted .h5 → drop; scan b has none → keep.
+    assert drop_flags == [True, False]

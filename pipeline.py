@@ -1393,6 +1393,65 @@ def detect_selected_bragg_disks_step(
     return state.selected_disks
 
 
+def _close_datacube_memmap(state: WorkflowState) -> None:
+    """Close a memmap-backed datacube's file handle before its reference is
+    dropped, otherwise the OS keeps the mapping resident. Mirrors
+    ``engine._close_memmap_handle`` but is duplicated here (a few lines) so
+    ``pipeline`` stays free of an ``import engine`` cycle (engine imports
+    pipeline lazily, never the reverse)."""
+    dc = getattr(state, "datacube", None)
+    try:
+        data = getattr(dc, "data", None)
+        base = getattr(data, "base", None)
+        for obj in (data, base):
+            mm = getattr(obj, "_mmap", None) or (
+                obj if "mmap" in type(obj).__name__.lower() else None
+            )
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _datacube_is_memmap(state: WorkflowState) -> bool:
+    """True when the loaded datacube is memmap-backed — a proxy for "large":
+    ``_pick_mib_mem_mode`` / MEMMAP import chose memmap precisely because the cube
+    did not comfortably fit in RAM."""
+    dc = getattr(state, "datacube", None)
+    data = getattr(dc, "data", None)
+    for obj in (data, getattr(data, "base", None)):
+        if obj is not None and "memmap" in type(obj).__name__.lower():
+            return True
+    return False
+
+
+def _should_stream_braggpeaks(state: WorkflowState, kwargs: dict) -> bool:
+    """Decide whether to run bounded-RAM streaming detection instead of the
+    full-scan ``find_Bragg_disks`` -> in-RAM ``BraggVectors`` build.
+
+    Residency-only decision — the detection parameters (and therefore the peaks)
+    are identical either way:
+
+    - GPU path (``CUDA`` / ``CUDA_batched``) always uses full-scan: py4DSTEM's
+      batched-GPU path is the throughput winner, and the position-list
+      ``data=(...)`` streaming call is a CPU / low-RAM lever, not a GPU one.
+    - ``FAST4D_STREAM_BRAGG=1`` forces streaming; ``=0`` forces full-scan.
+    - Otherwise stream only when the cube is memmap-backed (large enough that the
+      loader chose not to hold it in RAM).
+    """
+    if bool(kwargs.get("CUDA")) or bool(kwargs.get("CUDA_batched")):
+        return False
+    flag = os.environ.get("FAST4D_STREAM_BRAGG", "").strip()
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    return _datacube_is_memmap(state)
+
+
 def compute_braggpeaks_step(
     state: WorkflowState,
     save_path: str | Path | None = None,
@@ -1417,6 +1476,49 @@ def compute_braggpeaks_step(
             f"subpixel: normalized {raw_sp!r} → {kwargs['subpixel']!r} for py4DSTEM.",
         )
     use_cuda = bool(kwargs.get("CUDA")) or bool(kwargs.get("CUDA_batched"))
+    _ensure_cupy_current_device_for_thread(kwargs, log=log)
+    template = probe_kernel_template_ndarray(state.probe)
+    out_path = Path(save_path).expanduser() if save_path else _auto_bragg_path(state)
+
+    if _should_stream_braggpeaks(state, kwargs):
+        # Bounded-RAM path: detect in position-batches and stream peaks to a temp
+        # file, release the raw cube, THEN assemble a py4DSTEM-native BraggVectors
+        # from disk and save it. Same detection params -> same peaks (parity locked
+        # by tests/test_bragg_stream_detect.py); only residency differs. Reuses the
+        # library's position-scoped find_Bragg_disks(data=(rxs, rys)) call — no
+        # custom detector, no science change.
+        from bragg_stream import (
+            detect_braggpeaks_streaming,
+            finalize_stream_to_braggvectors,
+        )
+
+        q_shape = tuple(int(v) for v in state.datacube.Qshape)
+        _log(log, f"Computing streamed braggpeaks (bounded RAM) with params: {kwargs}")
+        _log(log, format_probe_template_log_line(state))
+        stream_tmp = out_path.with_name(out_path.stem + ".stream.h5")
+        detect_braggpeaks_streaming(
+            state.datacube, template, stream_tmp, log=log, **kwargs
+        )
+        # Release the raw cube BEFORE materializing the full peak list, so peak RAM
+        # never holds the tens-of-GB cube and the full PointListArray at once — this
+        # is exactly what streaming buys over the full-scan build below.
+        _close_datacube_memmap(state)
+        state.datacube = None
+        import gc
+        gc.collect()
+        state.braggpeaks = finalize_stream_to_braggvectors(
+            stream_tmp, Qshape=q_shape, log=log
+        )
+        save_braggpeaks_file(state.braggpeaks, out_path, log=log)
+        try:
+            stream_tmp.unlink()
+        except Exception:
+            pass
+        state.braggpeaks_path = out_path
+        _log(log, f"Full-scan braggpeaks ready (streamed): {out_path}")
+        return state.braggpeaks
+
+    # Full-scan path (default; GPU-batched throughput when CUDA is enabled).
     if use_cuda:
         _log(
             log,
@@ -1425,16 +1527,13 @@ def compute_braggpeaks_step(
         )
     else:
         _log(log, "GPU: find_Bragg_disks CUDA=False — full scan runs on CPU only (nvidia-smi may stay flat).")
-    _ensure_cupy_current_device_for_thread(kwargs, log=log)
     _log(log, f"Computing full-scan braggpeaks with params: {kwargs}")
     _log(log, format_probe_template_log_line(state))
-    template = probe_kernel_template_ndarray(state.probe)
     state.braggpeaks = state.datacube.find_Bragg_disks(
         template=template,
         **kwargs,
     )
 
-    out_path = Path(save_path).expanduser() if save_path else _auto_bragg_path(state)
     try:
         save_braggpeaks_datacube_notebook_style(state, out_path, log=log)
     except Exception as exc:
@@ -1446,11 +1545,18 @@ def compute_braggpeaks_step(
         save_braggpeaks_file(state.braggpeaks, out_path, log=log)
     state.braggpeaks_path = out_path
     _log(log, f"Full-scan braggpeaks ready: {out_path}")
-    # The full datacube and the freshly detected braggpeaks were both alive at once
-    # during the save above (see save_braggpeaks_datacube_notebook_style); this
-    # is the one designed-in double-residency point in the pipeline. A single
-    # gc.collect() here reclaims any transient copies py4DSTEM's own save path made
-    # (e.g. internal serialization buffers) before the next step runs.
+    # Peaks are now detected AND persisted to ``out_path``. The full raw datacube
+    # (tens of GB) and the braggpeaks were both alive at once during the save above
+    # (the one designed-in double-residency point); release the cube now that it is
+    # no longer needed. Everything downstream — calibration, strain, stress — runs
+    # on the compact braggpeaks/BVM layer (Path A) and never touches the raw cube
+    # again. If a Path-B step is revisited, ``engine.load_datacube`` re-loads it from
+    # ``raw_path``. This is a pure lifecycle change: the detection math already ran
+    # and its result (``state.braggpeaks``) + the on-disk .h5 are untouched.
+    _close_datacube_memmap(state)
+    state.datacube = None
+    # A single gc.collect() reclaims the freed cube and any transient copies
+    # py4DSTEM's save path made before the next step runs.
     import gc
     gc.collect()
     return state.braggpeaks
@@ -1722,8 +1828,31 @@ def load_braggpeaks_file(
     if not bragg_path.exists():
         raise FileNotFoundError(f"braggpeaks file does not exist: {bragg_path}")
 
+    # Datapaths to try, in order. The literal ``None`` (auto-detect the single
+    # EMD root) is first for backward compatibility, but emdfile's auto-detect
+    # occasionally raises "dictionary changed size during iteration" on the FIRST
+    # read of a file — a nondeterministic dict-iteration bug in Root.from_h5 that
+    # a retry clears. We therefore (a) also enumerate the file's actual top-level
+    # HDF5 groups (EMD root groups) as explicit datapaths — e.g. a streamed result
+    # finalized to a py4DSTEM ``BraggVectors`` lands under a ``braggvectors_root``
+    # group whose name none of the hardcoded guesses match — and (b) retry ``None``
+    # once at the end so the flaky-first-read case still resolves.
+    try:
+        import h5py
+
+        with h5py.File(str(bragg_path), "r") as _f:
+            root_group_names = [k for k in _f.keys() if isinstance(_f[k], h5py.Group)]
+    except Exception:
+        root_group_names = []
+
+    datapaths: list[Any] = [None, "datacube_root", "braggpeaks", "braggvectors", "root"]
+    for name in root_group_names:
+        if name not in datapaths:
+            datapaths.append(name)
+    datapaths.append(None)  # retry auto-detect last (dodges the flaky first read)
+
     bragg_candidates: list[Any] = []
-    for datapath in (None, "datacube_root", "braggpeaks", "braggvectors", "root"):
+    for datapath in datapaths:
         try:
             if datapath is None:
                 obj = py4DSTEM.read(filepath=str(bragg_path))

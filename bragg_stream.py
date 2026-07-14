@@ -114,6 +114,65 @@ def detect_braggpeaks_streaming(
     return out_path
 
 
+def finalize_stream_to_braggvectors(
+    streamed_path: str | Path,
+    *,
+    Qshape: tuple[int, int],
+    name: str = "braggvectors",
+    log: Callable[[str], None] | None = None,
+):
+    """Assemble a py4DSTEM ``BraggVectors`` from a streamed peaks file.
+
+    The streamed layout (``/peaks/{ry}_{rx}``) written by
+    :class:`StreamingBraggWriter` is NOT a py4DSTEM-native format, so Fast4D's
+    normal Path-A loader (``pipeline.load_braggpeaks_file`` → ``py4DSTEM.read``)
+    cannot read it directly. This converts the streamed peaks into a real
+    ``BraggVectors`` whose ``_v_uncal`` ``PointListArray`` matches the exact dtype
+    ``BraggVectors.__init__`` creates — ``[("qx", f8), ("qy", f8),
+    ("intensity", f8)]`` (``braggvectors/braggvectors.py:73-77``) — so it saves and
+    reloads through the standard py4DSTEM round-trip like any full-scan result.
+
+    The full peak list is materialized here ONCE, but this is meant to run only
+    AFTER the raw datacube has been released, so peak RAM never holds the
+    tens-of-GB cube and the full peak list simultaneously. No detection math runs
+    here: peaks were already computed (with identical params) during streaming.
+
+    Axis-order note: the streamed key ``{ry}_{rx}`` corresponds to
+    ``BraggVectors.raw[rx, ry]`` (verified by ``tests/test_bragg_stream_detect.py``
+    comparing ``f["peaks"][f"{ry}_{rx}"]`` against ``reference.raw[rx, ry]``), so
+    cell ``_v_uncal[rx, ry]`` is filled from key ``{ry}_{rx}``.
+    """
+    try:
+        from py4DSTEM.braggvectors import BraggVectors
+    except Exception:  # pragma: no cover - exercised only without py4DSTEM
+        from py4DSTEM.braggvectors.braggvectors import BraggVectors
+
+    streamed_path = Path(streamed_path)
+    with h5py.File(streamed_path, "r") as f:
+        r_nx, r_ny = (int(v) for v in f["r_shape"][()])
+        r_shape = (r_nx, r_ny)
+        bv = BraggVectors(r_shape, tuple(int(v) for v in Qshape), name=name)
+        pla = bv._v_uncal
+        peaks_grp = f["peaks"]
+        for rx in range(r_nx):
+            for ry in range(r_ny):
+                key = f"{ry}_{rx}"
+                if key not in peaks_grp:
+                    continue
+                arr = peaks_grp[key][()]
+                if arr.shape[0] == 0:
+                    continue
+                data = np.zeros(arr.shape[0], dtype=pla.dtype)
+                data["qx"] = arr[:, 0]
+                data["qy"] = arr[:, 1]
+                data["intensity"] = arr[:, 2]
+                pla.get_pointlist(rx, ry).add(data)
+    bv.set_raw_vectors(pla)
+    if log is not None:
+        log(f"Finalized streamed peaks → BraggVectors {r_shape} from {streamed_path.name}")
+    return bv
+
+
 def read_streamed_peaks(path: str | Path, ry: int, rx: int) -> dict:
     """Read one scan position's peaks from a streamed file — O(1) HDF5 lookup,
     never loads other positions' peaks into RAM."""
