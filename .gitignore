@@ -20,6 +20,7 @@ Thumbs.db
 
 # Outputs / temporary analysis
 outputs/
+notebooks/output/
 results/
 figures_temp/
 tmp/
@@ -41,6 +42,10 @@ graphify-out/
 # Internal notes / docs (not shipped)
 *.md
 !README.md
+!ForGITHUB-Updates.md
+!CHANGELOG_*.md
+!MEMORY_ARCHITECTURE_REPORT.md
+!docs/**/*.md
 
 # Raw / heavy microscopy data
 data/

@@ -283,6 +283,12 @@ class CalibrationParams:
     edge_boundary: int = 4
     vis_vmin: float = 0.0
     vis_vmax: float = 0.995
+    # BVM indexing (RANSAC + hkl / zone axis) — used by IndexerDialog before basis
+    zone_axis: list = field(default_factory=lambda: [1, 1, 0])
+    real_axis_h: list = field(default_factory=lambda: [0, 0, -1])   # +ry (left→right)
+    real_axis_v: list = field(default_factory=lambda: [-1, 1, 0])  # +rx (top→bottom)
+    indexing_tol_px: float | None = None   # None → use max_peak_spacing
+    indexing_seed: int = 0
 
     # ── Strain mapping (cell 41) ──────────────────────────────────────────────
     coordinate_rotation: float = 0.0
@@ -376,6 +382,7 @@ class Scan:
     cal_checkpoints: dict = field(default_factory=dict)  # {stage: calibration snapshot} —
                                        # pre-<step> baselines so re-testing/re-applying a
                                        # calibration starts from the clean state (no compounding)
+    indexing_result: Any = None        # bvm_indexing.IndexingResult from IndexerDialog / index_bvm
 
     def ensure_state(self) -> Any:
         if self.state is None:
@@ -945,6 +952,7 @@ DEFAULT_STORE_FIGURE: dict[str, bool] = {
     "ellipse": True,
     "q_pixel": True,
     "basis": True,
+    "indexing": True,
     "strain_without_roi": True,
     "strain_with_roi": True,
     "stress_without_roi": True,
@@ -963,6 +971,7 @@ STORE_FIGURE_LABELS: dict[str, str] = {
     "ellipse": "Ellipse",
     "q_pixel": "Q-pixel",
     "basis": "Basis",
+    "indexing": "BVM indexing",
     "strain_without_roi": "Strain (full scan)",
     "strain_with_roi": "Strain (ROI)",
     "stress_without_roi": "Stress (full scan)",
@@ -2817,6 +2826,87 @@ def basis_preview(scan: Scan, *, log: Log = None):
     return fig
 
 
+def index_bvm(scan: Scan, *, log: Log = None, make_figure: bool = True):
+    """Prep calibrations through (not including) basis, then run BVM RANSAC+hkl indexing.
+
+    Stages QR / basis detection params via ``update_strain_basis_params``, builds the
+    calibrated BVM, and stores ``scan.indexing_result``. Optionally registers figure
+    key ``\"indexing\"``. Returns the :class:`bvm_indexing.IndexingResult`.
+    """
+    import bvm_indexing as bix
+
+    pl = _pipeline()
+    st = scan.ensure_state()
+    p = scan.params
+    # Upstream calibrations only (origin / ellipse / q-pixel) — indexing runs BEFORE basis setup
+    apply_calibrations_through(scan, "basis", inclusive=False, log=log)
+    pl.update_strain_basis_params(
+        st,
+        min_spacing=int(p.min_spacing),
+        min_absolute_intensity=int(p.min_absolute_intensity),
+        max_num_peaks=int(p.max_num_peaks),
+        edge_boundary=int(p.edge_boundary),
+        vmin=float(p.vis_vmin), vmax=float(p.vis_vmax),
+        qr_rotation=float(p.qr_rotation), qr_flip=bool(p.qr_flip),
+        manual_enabled=False,  # do not lock indices yet — indexer proposes them
+        log=log,
+    )
+    bp = getattr(st, "braggpeaks", None)
+    if bp is None:
+        raise RuntimeError(f"[{scan.name}] no braggpeaks loaded for BVM indexing")
+
+    bvm_cal = np.asarray(bp.histogram(mode="cal", sampling=1).data, dtype=float)
+    origin = np.asarray(bp.calibration.get_origin_mean(), dtype=float)
+    Q = float(bp.calibration.get_Q_pixel_size())
+    Q_units = str(bp.calibration.get_Q_pixel_units())
+    crystal = p.cal_crystal_obj()
+    tol = float(p.indexing_tol_px) if p.indexing_tol_px is not None else float(p.max_peak_spacing)
+
+    result = bix.index_bvm(
+        bvm_cal, origin,
+        Q_pixel=Q,
+        Q_units=Q_units,
+        lattice_a=float(crystal.a_lat),
+        zone_axis=list(p.zone_axis) or [1, 1, 0],
+        real_axis_h=list(p.real_axis_h) or [0, 0, -1],
+        real_axis_v=list(p.real_axis_v) or [-1, 1, 0],
+        qr_rotation_deg=float(p.qr_rotation),
+        qr_flip=bool(p.qr_flip),
+        tol_px=tol,
+        seed=int(p.indexing_seed),
+        min_spacing=float(p.min_spacing),
+        min_absolute_intensity=float(p.min_absolute_intensity),
+        max_num_peaks=int(p.max_num_peaks),
+        edge_boundary=float(p.edge_boundary),
+    )
+    scan.indexing_result = result
+    _log(log, f"[{scan.name}] BVM indexing: {result.n_inliers}/{len(result.peaks)} inliers; "
+              f"propose origin={result.index_origin} g1={result.index_g1} g2={result.index_g2} "
+              f"({result.metrics.get('g1_hkl_str')}/{result.metrics.get('g2_hkl_str')})")
+
+    if make_figure:
+        try:
+            fig = bix.make_indexing_figure(result, title=f"{scan.name} — BVM indexing")
+            register_figure(scan, "indexing", fig, force=True)
+        except Exception as exc:
+            _log(log, f"[{scan.name}] indexing figure skipped: {exc}")
+    return result
+
+
+def apply_indexing_to_basis_params(scan: Scan, result=None, *, log: Log = None) -> None:
+    """Write proposed index_origin/g1/g2 into ``scan.params`` for choose_basis_vectors."""
+    result = result if result is not None else scan.indexing_result
+    if result is None:
+        raise RuntimeError(f"[{scan.name}] no indexing_result — run index_bvm first")
+    p = scan.params
+    p.index_origin = int(result.index_origin)
+    p.index_g1 = int(result.index_g1)
+    p.index_g2 = int(result.index_g2)
+    p.basis_manual_enabled = True
+    _log(log, f"[{scan.name}] basis indices from indexing: "
+              f"origin={p.index_origin} g1={p.index_g1} g2={p.index_g2}")
+
+
 def run_calibration_sequence(scan: Scan, *, make_figures: bool = True,
                              log: Log = None, progress_step=None) -> None:
     """Run the full calibration in canonical order: ROI→origin→ellipse→q-pixel→basis.
@@ -2938,6 +3028,16 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     """
     st = scan.ensure_state()
     pl = _pipeline()
+    p = scan.params
+    # Always push table params into state before get_strain (vrange_theta etc.).
+    pl.update_strain_params(
+        st,
+        coordinate_rotation=float(p.coordinate_rotation),
+        max_peak_spacing=float(p.max_peak_spacing),
+        layout=str(p.strain_layout),
+        vrange=list(p.vrange), vrange_theta=list(p.vrange_theta),
+        cmap=str(p.strain_cmap), cmap_theta=str(p.strain_cmap_theta),
+        show_orientation=bool(p.strain_show_orientation), log=log)
     label = "with_roi" if use_roi else "without_roi"
 
     gvects = None

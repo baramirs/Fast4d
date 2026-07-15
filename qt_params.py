@@ -28,14 +28,15 @@ _HDR_FG = QtGui.QColor("#0D47A1")
 # no-ROI and ROI stress maps under each file, like the other per-step figures).
 GROUP_FIGURE_KEY = {
     "detection": "detection", "roi": None, "origin": "origin",
-    "ellipse": "ellipse", "qpixel": "q_pixel", "basis": "basis",
+    "ellipse": "ellipse", "qpixel": "q_pixel",
+    "basis": ["basis", "indexing"],
     "strain": ["strain_without_roi", "strain_with_roi"],
     "tools": ["stress_without_roi", "stress_with_roi"],
 }
 # Row labels for the figure rows (the vertical-header text).
 FIG_ROW_LABEL = {
     "detection": "Detection", "origin": "Origin (+res)", "ellipse": "Ellipse",
-    "q_pixel": "Q-pixel", "basis": "Basis",
+    "q_pixel": "Q-pixel", "basis": "Basis", "indexing": "BVM indexing",
     "strain_without_roi": "Strain", "strain_with_roi": "Strain (ROI)",
     "stress_without_roi": "Stress", "stress_with_roi": "Stress (ROI)",
 }

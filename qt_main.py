@@ -183,6 +183,45 @@ with a dashed border; reloads on click).</p>
 <p><b>View DPI</b> — resolution for spilled / temp PNG sidecars (GUI thumbnails; lower = smaller files).<br>
 <b>Save DPI</b> — resolution for <code>figures/</code> export on Compute / Save (raise for publication).</p>
 """
+
+_INDEX_BVM_GUIDE_HTML = """
+<h3>Index BVM — how to use it</h3>
+<p>Use this tool <b>before Basis setup</b> when you want Fast4D to propose lattice
+vectors (<code>g1</code>/<code>g2</code>) from the Bragg Vector Map (BVM) instead of
+typing them by hand.</p>
+<hr>
+<p><b>Where to open it</b><br>
+Toolbar step <b>Basis</b> &rarr; button <b>Index BVM&hellip;</b></p>
+<p><b>When to use it</b><br>
+Path A (braggpeaks already loaded) after Origin / Ellipse / Q-pixel are in good
+shape. Indexing needs a calibrated diffraction frame so peak positions match the
+crystal model.</p>
+<hr>
+<p><b>Workflow (3 clicks):</b></p>
+<ol>
+<li><b>Check crystal + axes</b> — zone axis <code>[uvw]</code> and real-space axes
+H (+ry) / V (+rx) must match your experiment orientation. Tolerance (px) and
+RANSAC seed fine-tune peak matching.</li>
+<li><b>Run indexing</b> — Fast4D runs RANSAC on BVM maxima, assigns hkl with
+zone-axis anchoring, and shows an overlay + peak table.</li>
+<li><b>Send to Fast4D</b> — writes <code>index_origin</code>, <code>g1</code>,
+<code>g2</code> and enables manual basis. Then open <b>Basis</b> as usual; the
+proposed vectors are already in the parameter table.</li>
+</ol>
+<hr>
+<p><b>Optional controls:</b></p>
+<ul>
+<li><b>Set as g1 / Set as g2</b> — pick a row in the table if you disagree with the
+automatic proposal.</li>
+<li><b>Export CSV/PNG</b> — save the indexed table and overlay into the analysis
+folder for notebooks / papers.</li>
+</ul>
+<p style="background:#E3F2FD; padding:10px; border-radius:6px;">
+<b>Tip:</b> If Send looks wrong, re-check zone axis and real axes first — a wrong
+orientation flips hkl signs more often than RANSAC failing.
+</p>
+"""
+
 # Calibration steps: prep key for apply_calibrations_through, dialog opener.
 _CALIB_META: dict[str, tuple[str | None, str]] = {
     "origin": (None, "_pick_origin"),
@@ -391,7 +430,7 @@ class LineSetupDialog(QtWidgets.QDialog):
     """Set up the line profiles on the ADF: preview any file's ADF with its placed
     lines, and run the tools (pick rows, load lines from the loader JSON, load the
     drift CSV, propagate with/without drift). Delegates to the host window's
-    line-tool methods so behaviour matches the Profiles-step buttons exactly."""
+    line-tool methods so behaviour matches the Analysis-step buttons exactly."""
 
     def __init__(self, host) -> None:
         super().__init__(host)
@@ -4215,7 +4254,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
 
     # ── menu (View → reopen panels) ─────────────────────────────────────────────
     def _build_menu(self) -> None:
-        """View / Help menu bar (always visible)."""
+        """View / Settings / Help menu bar (always visible)."""
         mb = self.menuBar()
         mb.setVisible(True)
         mb.setNativeMenuBar(False)   # keep menus in-window on Windows (not hidden in title bar)
@@ -4228,16 +4267,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act = QtGui.QAction("Show all panels", self)
         act.triggered.connect(self._show_all_docks)
         view.addAction(act)
-        help_m = mb.addMenu("&Help")
-        act_qs = QtGui.QAction("Quick Start Guide…", self)
-        act_qs.setToolTip("5-step introduction: data types, workflow, fastest path to strain maps.")
-        act_qs.triggered.connect(self._show_quick_start)
-        help_m.addAction(act_qs)
-        help_m.addSeparator()
-        act_guide = QtGui.QAction("Calibration guide…", self)
-        act_guide.setToolTip("Workflow help: overlays, RAM, Compute fit/apply, step jumps.")
-        act_guide.triggered.connect(self._show_calib_guide)
-        help_m.addAction(act_guide)
+
         settings_m = mb.addMenu("&Settings")
         act_mem = QtGui.QAction("Resident data (RAM)…", self)
         act_mem.setToolTip(
@@ -4256,6 +4286,21 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             "figure-overwrite I/O on every calculation, which is slow for "
             "large/frequent recomputes.")
         settings_m.addAction(self._cb_save)
+
+        help_m = mb.addMenu("&Help")
+        act_qs = QtGui.QAction("Quick Start Guide…", self)
+        act_qs.setToolTip("5-step introduction: data types, workflow, fastest path to strain maps.")
+        act_qs.triggered.connect(self._show_quick_start)
+        help_m.addAction(act_qs)
+        help_m.addSeparator()
+        act_guide = QtGui.QAction("Calibration guide…", self)
+        act_guide.setToolTip("Workflow help: overlays, RAM, Compute fit/apply, step jumps.")
+        act_guide.triggered.connect(self._show_calib_guide)
+        help_m.addAction(act_guide)
+        act_bvm = QtGui.QAction("Index BVM guide…", self)
+        act_bvm.setToolTip("How to index Bragg Vector Map peaks and send g1/g2 to Basis.")
+        act_bvm.triggered.connect(self._show_index_bvm_guide)
+        help_m.addAction(act_bvm)
 
     def _sync_figure_policy(self) -> None:
         kw = dict(
@@ -4322,6 +4367,20 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(dlg)
         browser = QtWidgets.QTextBrowser()
         browser.setHtml(_CALIB_GUIDE_HTML)
+        browser.setOpenExternalLinks(True)
+        lay.addWidget(browser, 1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.accept)
+        lay.addWidget(bb)
+        dlg.exec()
+
+    def _show_index_bvm_guide(self) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Index BVM guide — fast4d")
+        dlg.resize(560, 520)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        browser = QtWidgets.QTextBrowser()
+        browser.setHtml(_INDEX_BVM_GUIDE_HTML)
         browser.setOpenExternalLinks(True)
         lay.addWidget(browser, 1)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
@@ -4641,24 +4700,31 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                  "Edit the Q-pixel calibration crystal (element, structure, a)."),
             ])
         elif key == "basis":
-            add_setting_bar("basis")
+            add_setting_bar("basis", extra=[
+                ("Index BVM…", self._open_bvm_indexer,
+                 "RANSAC + hkl indexing on the calibrated BVM (before Basis setup). "
+                 "Send proposed index_origin/g1/g2 into the parameter table."),
+            ])
         elif key == "lines":
+            # Analysis step (icon label "Analysis"). Interactive Live tools first,
+            # then setup + batch analysis — same toolbar the user opens after Strain.
+            add("Live Line Profile", self._open_live_line,
+                tip="Interactive line-profile tool (modeless) — pick a map, drag a line.")
+            add("Live ROI profile", self._open_live_roi,
+                tip="Interactive area-ROI stats tool (modeless).")
+            tb.addSeparator()
             add("Set up Lines & ROI", self._open_line_setup,
                 tip="Configure line ROIs, area ROIs, drift, and propagation.")
             add("Analyse (file)", self._analyze_active,
                 tip="Run full analysis (stress + lines) on the active file.")
             add("Analysis (all)", lambda: self._on_analysis(),
                 tip="Run full analysis (stress + lines) on all loaded files.")
-            tb.addSeparator()
-            add("Live Line Profile", self._open_live_line,
-                tip="Interactive line-profile tool (modeless).")
-            add("Live ROI profile", self._open_live_roi,
-                tip="Interactive area-ROI stats tool (modeless).")
         elif key == "strain":
             add("Apply", self._apply_strain_params, tip="Commit strain parameters from the table.")
             add("Compute (file)", self._compute_active)
             add("Compute (all)", lambda: self._on_compute())
             add("Analyze (file)", self._analyze_active)
+            # Live Line/ROI live under Analysis (next step), not here.
         else:
             lbl = QtWidgets.QLabel("  Edit parameters in the table, then Compute. ")
             lbl.setStyleSheet("color:#888;")
@@ -5558,6 +5624,14 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._show_tool(BasisDialog(self))
 
+    def _open_bvm_indexer(self) -> None:
+        """BVM RANSAC + hkl indexer (runs before basis setup; Send writes index_*)."""
+        sc = self._need_active()
+        if sc is None:
+            return
+        from qt_indexer import IndexerDialog
+        self._show_tool(IndexerDialog(self))
+
     def _open_virtualization(self) -> None:
         """Open the virtual-images generator (raw datacube → ADF/BF/DP → .h5). The
         dialog has a File selector over the loaded scans; needs ≥1 with a raw 4D path."""
@@ -5615,7 +5689,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._run_async(work, label=f"Reset {step} ({sc.name})",
                         on_done=lambda _r: (self._params.reload(), self._update_active_views()))
 
-    # ── line tool (Profiles step): same lines across files + per-file drift ──────
+    # ── line tool (Analysis step): same lines across files + per-file drift ──────
     def _set_template(self) -> None:
         sc = self._need_active()
         if sc is None:
@@ -5677,14 +5751,14 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._propagate_lines(use_drift=True)
 
     def _open_live_line(self) -> None:
-        """Report → 'Live line profile…' → the interactive line-profile tool (modeless)."""
+        """Analysis toolbar → Live Line Profile (modeless)."""
         if not self._scans:
             QtWidgets.QMessageBox.information(self, "Live line profile", "Load files first.")
             return
         self._show_tool(LiveLineProfileDialog(self))
 
     def _open_live_roi(self) -> None:
-        """Report → 'Live ROI stats…' → the interactive area-ROI tool (modeless)."""
+        """Analysis toolbar → Live ROI profile (modeless)."""
         if not self._scans:
             QtWidgets.QMessageBox.information(self, "Live ROI stats", "Load files first.")
             return

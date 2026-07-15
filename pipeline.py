@@ -3474,13 +3474,7 @@ def _effective_orientation_clims(
     if data_is_radians:
         return float(np.deg2rad(t_lo)), float(np.deg2rad(t_hi))
 
-    # Data is already in degrees: widen tiny symmetric legacy ranges (e.g. ±1°) so
-    # the colorbar scale still spans the actual data when users haven't customised.
-    gui_half = max(abs(t_lo), abs(t_hi))
-    sym = np.isclose(t_lo + t_hi, 0.0, rtol=1e-9, atol=1e-9)
-    if sym and gui_half <= 2.5 and p99_abs > max(4.5, 1.55 * gui_half):
-        cap = float(min(max(p99_abs * 1.06, 5.0), 180.0))
-        return (-cap, cap)
+    # Data already in degrees: ALWAYS honour the user's vrange_theta (no auto-widen).
     return t_lo, t_hi
 
 
@@ -3580,7 +3574,11 @@ def _iter_figure_matplotlib_colorbars(fig: Any):
         pass
 
 
-def _refresh_strain_figure_colorbars(fig: Any) -> None:
+def _refresh_strain_figure_colorbars(
+    fig: Any,
+    *,
+    theta_gui_deg: tuple[float, float] | None = None,
+) -> None:
     """
     Refresh colorbars after clim changes.
 
@@ -3638,36 +3636,38 @@ def _refresh_strain_figure_colorbars(fig: Any) -> None:
                 except Exception:
                     data_is_radians = max(abs(vmin), abs(vmax)) <= float(np.pi) + 0.08
 
-                if data_is_radians:
-                    fmt = mticker.FuncFormatter(
-                        lambda x, _pos: f"{np.rad2deg(float(x)):.1f}\u00b0"
-                    )
+                # Prefer explicit GUI degree labels (overrides py4DSTEM set_xticklabels).
+                if theta_gui_deg is not None:
+                    tlo, thi = float(theta_gui_deg[0]), float(theta_gui_deg[1])
+                    label_vals = np.linspace(tlo, thi, num=5)
+                elif data_is_radians:
+                    label_vals = np.rad2deg(np.linspace(float(vmin), float(vmax), num=5))
                 else:
-                    fmt = mticker.StrMethodFormatter("{x:.1f}\u00b0")
+                    label_vals = np.linspace(float(vmin), float(vmax), num=5)
+                labels = [f"{float(v):.1f}\u00b0" for v in label_vals]
+                ticks = np.linspace(float(vmin), float(vmax), num=5)
 
                 ori = str(getattr(cb, "orientation", "vertical") or "vertical").lower()
                 try:
                     cb.ax.minorticks_off()
                 except Exception:
                     pass
-
-                ticks = np.linspace(float(vmin), float(vmax), num=5)
                 try:
                     cb.set_ticks(ticks)
-                    cb.formatter = fmt
+                    cb.set_ticklabels(labels)
                     cb.update_ticks()
                 except Exception:
                     pass
                 try:
                     if ori.startswith("h"):
                         cb.ax.set_xticks(ticks)
-                        cb.ax.xaxis.set_major_formatter(fmt)
+                        cb.ax.set_xticklabels(labels)
                         cb.ax.tick_params(axis="x", labelsize=9)
                         for lbl in cb.ax.get_xticklabels():
                             lbl.set_ha("center")
                     else:
                         cb.ax.set_yticks(ticks)
-                        cb.ax.yaxis.set_major_formatter(fmt)
+                        cb.ax.set_yticklabels(labels)
                         cb.ax.tick_params(axis="y", labelsize=9)
                 except Exception:
                     pass
@@ -3778,7 +3778,7 @@ def _apply_get_strain_vrange_to_figures(
                     n_updated += 1
                 except Exception:
                     pass
-        _refresh_strain_figure_colorbars(fig)
+        _refresh_strain_figure_colorbars(fig, theta_gui_deg=(tmin, tmax))
         try:
             fig.canvas.draw_idle()
         except Exception:

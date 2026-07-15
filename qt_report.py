@@ -13,6 +13,10 @@ A single dockable panel that browses everything the session produced, on demand:
 Figures show as a clickable thumbnail (click, or "Maximize", opens a full
 pan/zoom dialog); tables render in a QTableWidget and can be exported to
 CSV/XLSX. Analysis is computed synchronously (it's light) under a wait cursor.
+
+The panel auto-renders whenever the user changes View / Scan / Item / Map
+(or after Refresh / workspace load). Only the *current* selection is built —
+never every map at once — so RAM stays bounded.
 """
 from __future__ import annotations
 
@@ -79,9 +83,12 @@ _CHANNELS = [("ε_yy", "eyy"), ("ε_xx", "exx"), ("ε_xy", "exy"),
 class _ViewSelector(QtWidgets.QWidget):
     """One category's "View:" combo + its scan/ref/item/map filter controls."""
 
+    changed = QtCore.Signal()
+
     def __init__(self, kinds: list[str], get_scans, parent=None) -> None:
         super().__init__(parent)
         self._get_scans = get_scans
+        self._quiet = False
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
@@ -99,9 +106,11 @@ class _ViewSelector(QtWidgets.QWidget):
         self._lbl_scan2 = QtWidgets.QLabel("Ref:")
         self._scan = QtWidgets.QComboBox()
         self._scan.currentIndexChanged.connect(self._on_scan)
-        self._scan2.currentIndexChanged.connect(self._update_drift_info)
+        self._scan2.currentIndexChanged.connect(self._on_scan2)
         self._item = QtWidgets.QComboBox()
+        self._item.currentIndexChanged.connect(self._notify)
         self._label = QtWidgets.QComboBox(); self._label.addItems(["without_roi", "with_roi"])
+        self._label.currentIndexChanged.connect(self._notify)
         self._lbl_scan = QtWidgets.QLabel("Scan:")
         self._lbl_item = QtWidgets.QLabel("Item:")
         self._lbl_label = QtWidgets.QLabel("Map:")
@@ -116,6 +125,7 @@ class _ViewSelector(QtWidgets.QWidget):
         self._chk_drift_corr.setToolTip(
             "Desplaza B (sub-píxel) al marco de A usando el drift cargado "
             "('Load drift CSV…') antes de calcular Δ.")
+        self._chk_drift_corr.toggled.connect(self._notify)
         self._lbl_drift_info = QtWidgets.QLabel("")
         self._lbl_drift_info.setStyleSheet("color:#666; font-size:10px;")
         row2b.addWidget(self._chk_drift_corr)
@@ -126,7 +136,15 @@ class _ViewSelector(QtWidgets.QWidget):
         self._on_kind()
 
     def refresh(self) -> None:
-        self._on_kind()
+        self._quiet = True
+        try:
+            self._on_kind()
+        finally:
+            self._quiet = False
+
+    def _notify(self, *_args) -> None:
+        if not self._quiet:
+            self.changed.emit()
 
     def _all_line_ids(self) -> list:
         ids: list = []
@@ -214,12 +232,18 @@ class _ViewSelector(QtWidgets.QWidget):
             self._item.addItem("violin", "violin"); self._item.addItem("box", "box")
         self._item.blockSignals(False)
         self._update_drift_info()
+        self._notify()
 
     def _on_scan(self) -> None:
         if self._kind.currentText() == K_FIG:
             self._item.blockSignals(True); self._item.clear()
             self._populate_fig_items(); self._item.blockSignals(False)
         self._update_drift_info()
+        self._notify()
+
+    def _on_scan2(self) -> None:
+        self._update_drift_info()
+        self._notify()
 
     def _update_drift_info(self) -> None:
         if self._kind.currentText() not in _PIXDIFF_KINDS:
@@ -280,6 +304,7 @@ class ReportPanel(QtWidgets.QWidget):
         self._fig = None            # currently shown Figure (for Maximize)
         self._df = None             # currently shown DataFrame (for Export)
         self._canvas = None         # ClickableFigureLabel thumbnail (figure page)
+        self._suppress_auto = False
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -289,17 +314,29 @@ class ReportPanel(QtWidgets.QWidget):
         self._selectors: list[_ViewSelector] = []
         for label, kinds in CATEGORIES:
             sel = _ViewSelector(kinds, self._get_scans)
+            sel.changed.connect(self._on_selector_changed)
             self._selectors.append(sel)
             self._tabs.addTab(sel, label)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         lay.addWidget(self._tabs)
 
         row3 = QtWidgets.QHBoxLayout()
-        for txt, fn in (("Show", self._show), ("Refresh", self.refresh),
-                        ("Maximize", self._maximize), ("Export table…", self._export),
-                        ("Export PPTX…", lambda: self.exportPptxRequested.emit()),
-                        ("Save", lambda: self.saveRequested.emit(False)),
-                        ("Save As…", lambda: self.saveRequested.emit(True))):
-            b = QtWidgets.QPushButton(txt); b.clicked.connect(fn); row3.addWidget(b)
+        for txt, fn, tip in (
+            ("Show", self._show,
+             "Re-render the current selection. Usually unnecessary — the view "
+             "updates automatically when you change View / Scan / Item / Map, "
+             "or after loading data / Compute."),
+            ("Maximize", self._maximize, None),
+            ("Export table…", self._export, None),
+            ("Export PPTX…", lambda: self.exportPptxRequested.emit(), None),
+            ("Save", lambda: self.saveRequested.emit(False), None),
+            ("Save As…", lambda: self.saveRequested.emit(True), None),
+        ):
+            b = QtWidgets.QPushButton(txt)
+            b.clicked.connect(fn)
+            if tip:
+                b.setToolTip(tip)
+            row3.addWidget(b)
         row3.addStretch(1)
         self._status = QtWidgets.QLabel("")
         self._status.setStyleSheet("color:#1565C0; font-size:10px;")
@@ -311,7 +348,8 @@ class ReportPanel(QtWidgets.QWidget):
         figpage = QtWidgets.QWidget(); self._fig_host = QtWidgets.QVBoxLayout(figpage)
         self._fig_host.setContentsMargins(0, 0, 0, 0)
         self._placeholder = QtWidgets.QLabel(
-            "Pick a view and press Show.\n(Per-scan figures appear after Compute; "
+            "Select a view — it shows automatically.\n"
+            "(Per-scan figures appear after Compute or when a workspace is loaded; "
             "analysis needs computed strain.)")
         self._placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#888;")
@@ -325,8 +363,40 @@ class ReportPanel(QtWidgets.QWidget):
 
     # ── population ──────────────────────────────────────────────────────────────
     def refresh(self) -> None:
-        for sel in self._selectors:
-            sel.refresh()
+        """Rebuild selector contents, then auto-show the current selection.
+
+        Only the *current* view is rendered (lazy). We deliberately do not
+        pre-build every figure/map into the display — that would spike RAM
+        without helping UX. Workspace hydrate already owns figure objects;
+        Show just references the selected one.
+        """
+        self._suppress_auto = True
+        try:
+            for sel in self._selectors:
+                sel.refresh()
+        finally:
+            self._suppress_auto = False
+        self._auto_show()
+
+    def _on_selector_changed(self) -> None:
+        if self._suppress_auto:
+            return
+        if self.sender() is not self._tabs.currentWidget():
+            return
+        self._auto_show()
+
+    def _on_tab_changed(self, _index: int = 0) -> None:
+        if self._suppress_auto:
+            return
+        self._auto_show()
+
+    def _auto_show(self) -> None:
+        scans = self._get_scans() or []
+        if not scans:
+            self._status.setText("No scans loaded.")
+            self._set_figure(None)
+            return
+        self._show()
 
     # ── render ────────────────────────────────────────────────────────────────
     def _show(self) -> None:
@@ -368,13 +438,13 @@ class ReportPanel(QtWidgets.QWidget):
             elif kind == K_LINE_GROUP:
                 lid = sel._scan.currentText()
                 if not lid:
-                    self._status.setText("No lines set — use Profiles → Set up Lines."); return
+                    self._status.setText("No lines set — use Analysis → Set up Lines & ROI."); return
                 self._set_figure(E.build_grouped_line_figure(
                     scans, lid, sel._item.currentData(), label))
             elif kind == K_LINE_TABLE:
                 lid = sel._scan.currentText()
                 if not lid:
-                    self._status.setText("No lines set — use Profiles → Set up Lines."); return
+                    self._status.setText("No lines set — use Analysis → Set up Lines & ROI."); return
                 self._set_table(E.grouped_line_table(
                     scans, lid, sel._item.currentData(), label))
             elif kind == K_MAPS_LINES:
@@ -397,13 +467,13 @@ class ReportPanel(QtWidgets.QWidget):
             elif kind == K_ROI_GROUP:
                 rid = sel._scan.currentText()
                 if not rid:
-                    self._status.setText("No ROIs set — use Profiles → Set up Lines → Area ROIs."); return
+                    self._status.setText("No ROIs set — use Analysis → Set up Lines & ROI → Area ROIs."); return
                 self._set_figure(E.build_grouped_roi_figure(
                     scans, rid, sel._item.currentData(), label))
             elif kind == K_ROI_TABLE:
                 rid = sel._scan.currentText()
                 if not rid:
-                    self._status.setText("No ROIs set — use Profiles → Set up Lines → Area ROIs."); return
+                    self._status.setText("No ROIs set — use Analysis → Set up Lines & ROI → Area ROIs."); return
                 self._set_table(E.grouped_roi_table(
                     scans, rid, sel._item.currentData(), label))
             elif kind == K_MAPS_ROIS:
@@ -495,8 +565,16 @@ class ReportPanel(QtWidgets.QWidget):
     def _maximize(self) -> None:
         if self._fig is None:
             self._status.setText("Maximize works on a figure view."); return
-        from qt_widgets import FigureDialog
-        FigureDialog(self._fig, self.window(), "Report figure").exec()
+        from qt_widgets import FigureDialog, _is_visible_dialog
+        host = self.window()
+        if host is not None and not hasattr(host, "_figure_windows"):
+            host._figure_windows = []
+        if host is not None:
+            host._figure_windows = [d for d in host._figure_windows if _is_visible_dialog(d)]
+        dlg = FigureDialog(self._fig, host, "Report figure")
+        if host is not None:
+            host._figure_windows.append(dlg)
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
 
     def _export(self) -> None:
         if self._df is None:

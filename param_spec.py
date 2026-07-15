@@ -19,7 +19,7 @@ import engine as E
 class ParamSpec:
     field: str           # CalibrationParams attribute name
     label: str
-    kind: str            # float|int|bool|enum|list2|list4|points|fitted
+    kind: str            # float|int|bool|enum|list2|list3|list4|points|fitted|scan_path
     options: tuple = ()  # for enum
     decimals: int = 4    # float display precision
     readonly: bool = False
@@ -84,6 +84,10 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("edge_boundary", "edgeBoundary", "int"),
         ParamSpec("vis_vmin", "vis vmin", "float", decimals=3),
         ParamSpec("vis_vmax", "vis vmax", "float", decimals=3),
+        ParamSpec("zone_axis", "Zone axis [uvw]", "list3"),
+        ParamSpec("real_axis_h", "Real axis H (+ry)", "list3"),
+        ParamSpec("real_axis_v", "Real axis V (+rx)", "list3"),
+        ParamSpec("indexing_seed", "Indexing RANSAC seed", "int"),
     ],
     "strain": [
         ParamSpec("coordinate_rotation", "coordinate_rotation (deg)", "float", decimals=2),
@@ -170,7 +174,7 @@ def format_value(spec: ParamSpec, value: Any) -> str:
             return str(int(value))
         except (TypeError, ValueError):
             return str(value)
-    if k in ("list2", "list4"):
+    if k in ("list2", "list3", "list4"):
         if not value:
             return ""
         vals = list(value)
@@ -205,16 +209,18 @@ def parse_value(spec: ParamSpec, text: str) -> Any:
         return float(s)
     if k == "int":
         return int(float(s))   # tolerate "2.0"
-    if k in ("list2", "list4"):
+    if k in ("list2", "list3", "list4"):
         if not s:
-            return [] if k == "list4" else [0.0, 0.0]
+            return [] if k != "list2" else [0.0, 0.0]
         parts = [p for p in s.replace(";", ",").split(",") if p.strip() != ""]
         nums = [float(p) for p in parts]
-        n_expected = 2 if k == "list2" else 4
+        n_expected = {"list2": 2, "list3": 3, "list4": 4}[k]
         if len(nums) != n_expected:
             raise ValueError(f"expected {n_expected} numbers, got {len(nums)}")
         # the user types xy_display fields as (x, y); store them back as (y, x)
         if spec.xy_display and len(nums) == 2:
             nums = [nums[1], nums[0]]
+        if k == "list3":
+            return [int(round(v)) for v in nums]
         return nums
     return s   # enum/bool handled by widgets

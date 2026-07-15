@@ -752,6 +752,13 @@ class FigureDialog(QtWidgets.QDialog):
         _enable_minmax(self)
         self.setWindowTitle(title)
         self.resize(980, 760)
+        # Independent modeless window so several figures can stay open for comparison.
+        self.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        self.setWindowFlags(
+            self.windowFlags()
+            | QtCore.Qt.WindowType.Window
+            | QtCore.Qt.WindowType.WindowMinMaxButtonsHint
+        )
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)  # prompt teardown
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         lay = QtWidgets.QVBoxLayout(self)
@@ -766,6 +773,12 @@ class FigureDialog(QtWidgets.QDialog):
         _enable_minmax(dlg)
         dlg.setWindowTitle(title)
         dlg.resize(980, 760)
+        dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            | QtCore.Qt.WindowType.Window
+            | QtCore.Qt.WindowType.WindowMinMaxButtonsHint
+        )
         lay = QtWidgets.QVBoxLayout(dlg)
         lab = QtWidgets.QLabel()
         lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -834,10 +847,28 @@ class ClickableFigureLabel(QtWidgets.QLabel):
 
     def mousePressEvent(self, ev) -> None:
         fig = self._resolve_fig()
+        host = self.window()
+        if host is not None and not hasattr(host, "_figure_windows"):
+            host._figure_windows = []
+        if host is not None:
+            host._figure_windows = [d for d in host._figure_windows if _is_visible_dialog(d)]
         if fig is not None:
-            FigureDialog(fig, self.window(), self._title).exec()
+            dlg = FigureDialog(fig, host, self._title)
+            if host is not None:
+                host._figure_windows.append(dlg)
+            dlg.show(); dlg.raise_(); dlg.activateWindow()
         elif self._spill_path:
-            FigureDialog.from_png(self._spill_path, self.window(), self._title).exec()
+            dlg = FigureDialog.from_png(self._spill_path, host, self._title)
+            if host is not None:
+                host._figure_windows.append(dlg)
+            dlg.show(); dlg.raise_(); dlg.activateWindow()
+
+
+def _is_visible_dialog(d) -> bool:
+    try:
+        return d is not None and d.isVisible()
+    except RuntimeError:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
