@@ -203,6 +203,29 @@ python tools/validate_bvm_indexer_e2e.py
 
 ---
 
-## 11. Resumen ultra-corto (si solo quieres un párrafo)
+## 12. Report browser (árbol) — 2026-07-14 (sesión siguiente)
 
-Añadimos Index BVM (RANSAC + hkl) como diálogo en Basis con Send a la tabla de parámetros; arreglamos figuras modeless, el rango de orientación theta, y el QR flip del indexer; reordenamos el menú a View / Settings / Help con guía de Index BVM; el Report ahora muestra solo la selección actual al cambiar el selector o al cargar datos (sin botón Refresh); y las herramientas Live Line/ROI quedan al frente del toolbar de Analysis.
+- Panel Report rediseñado: árbol por scan con filtros (Calibrations / Maps / Reports / Legacy / Session) + búsqueda.
+- Maps agrupados en **Theoretical reference (without ROI)** / **Experimental reference (with ROI)** (mismo naming en Live tools, Store, ParamTable).
+- Show perezoso al click; sin botón Refresh.
+- Live Line/ROI → Send escribe solo keys `report_*` (no `maps_with_lines` / `line_profiles` genéricos).
+- Session analysis como nodo de sesión (distribución, PCA, tablas, …).
+- Tests: `tests/test_report_tree.py`.
+
+## 12b. Menú Tools — Analysis fuera del toolbar
+
+- Orden del menú: **View → Tools → Settings → Help**.
+- Tools: Live Line Profile, Live ROI Profile, Set up Lines & ROI, Analyse (file), Analysis (all).
+- Quitados del toolbar del paso Analysis y del botón ∑ Analysis de la barra inferior.
+
+## 13. Report export PDF/DOCX/PPTX sin tijeras — 2026-07-14 (Plan B cerrado)
+
+- Nuevo `tools/report_export/`:
+  - `prepare_export_assets(...)` — mapas **por canal** desde arrays + calibraciones / `report_*` como figura completa; `manifest.json`.
+  - Writers PDF (`PdfPages`), DOCX (`python-docx`), PPTX (`python-pptx`) con portada (fecha, scans, conteos).
+- GUI: **Report → Export…** abre `ExportReportDialog` (formato PDF/DOCX/PPTX + checkboxes Maps / Calibrations / Reports).
+- `split_map_figures` queda **deprecated** (warning); ya no es el path feliz de la GUI.
+- El layout vertical/square de strain deja de romper el export porque **no se corta el collage**.
+- Tests: `tests/test_report_export.py` (PDF/DOCX/PPTX + flags include_*).
+- Dep: `python-docx` en `requirements.txt` (env `py4dstem-01419`).
+

@@ -972,13 +972,24 @@ STORE_FIGURE_LABELS: dict[str, str] = {
     "q_pixel": "Q-pixel",
     "basis": "Basis",
     "indexing": "BVM indexing",
-    "strain_without_roi": "Strain (full scan)",
-    "strain_with_roi": "Strain (ROI)",
-    "stress_without_roi": "Stress (full scan)",
-    "stress_with_roi": "Stress (ROI)",
+    "strain_without_roi": "Strain — Theoretical reference (without ROI)",
+    "strain_with_roi": "Strain — Experimental reference (with ROI)",
+    "stress_without_roi": "Stress — Theoretical reference (without ROI)",
+    "stress_with_roi": "Stress — Experimental reference (with ROI)",
     "lines": "Line map",
     "line_profiles": "Line profiles",
 }
+
+# User-facing names for strain/stress reference maps (keys stay without_roi / with_roi).
+ROI_REF_LABELS: dict[str, str] = {
+    "without_roi": "Theoretical reference (without ROI)",
+    "with_roi": "Experimental reference (with ROI)",
+}
+
+
+def roi_ref_label(key: str) -> str:
+    """Pretty title for a without_roi / with_roi map label."""
+    return ROI_REF_LABELS.get(str(key), str(key))
 
 
 @dataclass
@@ -1058,6 +1069,14 @@ def _registered_figure_set(scans: list | None = None) -> set:
 def _figure_keys(scan: "Scan") -> set[str]:
     spill = getattr(scan, "figure_spill", None) or {}
     return set(scan.figures) | set(spill)
+
+
+def list_figure_keys(scan: "Scan") -> list[str]:
+    """Keys available for the Report browser (in-RAM or spilled) — no Figure load."""
+    keys = _figure_keys(scan)
+    ordered = [k for k in FIGURE_ORDER if k in keys]
+    rest = sorted(k for k in keys if k not in FIGURE_ORDER)
+    return ordered + rest
 
 
 def _spill_dir(scan: "Scan") -> "Path":
@@ -1313,7 +1332,7 @@ def tidy_figure_memory(scans: list | None = None, *, log: Log = None) -> dict:
 # Canonical figure order for the Report (detection → calibration → maps).
 FIGURE_ORDER = (
     "probe", "select6", "detection",
-    "roi", "origin", "ellipse", "q_pixel", "basis",
+    "roi", "origin", "ellipse", "q_pixel", "basis", "indexing",
     "strain_without_roi", "strain_with_roi",
     "stress_without_roi", "stress_with_roi",
 )
@@ -2515,6 +2534,58 @@ def _ellipse_figure(res: dict, st):
 
 
 # ── 4. Q-PIXEL ────────────────────────────────────────────────────────────────
+def braggpeaks_has_origin(scan: Scan) -> bool:
+    """True when braggpeaks carry a diffraction origin (required for Q-pixel fit)."""
+    st = getattr(scan, "state", None)
+    bp = getattr(st, "braggpeaks", None) if st is not None else None
+    if bp is None:
+        return False
+    try:
+        cal = getattr(bp, "calibration", None)
+        if cal is not None and getattr(cal, "get_origin", None) is not None:
+            if cal.get_origin() is not None:
+                return True
+    except Exception:
+        pass
+    try:
+        cs = getattr(bp, "calstate", None)
+        if isinstance(cs, dict) and cs.get("center"):
+            return True
+        if cs is not None and bool(getattr(cs, "get", lambda *_: False)("center", False)):
+            return True
+        if cs is not None and bool(getattr(cs, "center", False)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_origin_for_qpixel(scan: Scan, *, log: Log = None) -> None:
+    """Q-pixel crystal fit always requests ``center=True`` in py4DSTEM.
+
+    If origin is missing, run Origin from ``center_guess`` (same as Compute Calib=fit).
+    Raises a clear error when even that cannot proceed.
+    """
+    st = scan.ensure_state()
+    if getattr(st, "braggpeaks", None) is None:
+        load_braggpeaks(scan, log=log)
+    if braggpeaks_has_origin(scan):
+        return
+    cg = getattr(scan.params, "center_guess", None)
+    if not cg:
+        raise RuntimeError(
+            f"[{scan.name}] Q-pixel fit needs Origin first — braggpeaks have "
+            f"calstate.center=False. Open Origin → set center_guess → Apply calibration "
+            f"(or use Setting Q-pixel / Through / Compute with Calib=fit).")
+    _log(log, f"[{scan.name}] Origin missing on braggpeaks — running Origin "
+              f"(required before Q-pixel fit) from center_guess={list(cg)}…")
+    calibrate_origin(scan, make_figure=True, log=log)
+    if not braggpeaks_has_origin(scan):
+        raise RuntimeError(
+            f"[{scan.name}] Origin ran but calstate.center is still False — "
+            f"cannot fit Q-pixel. Re-run Origin (Apply calibration) and check the log.")
+
+
 def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                       make_figure: bool = True, log: Log = None) -> float:
     """Calibrate the Q pixel size (notebook cell 37).
@@ -2525,6 +2596,8 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                 ``scan.params.q_px_fitted`` (the guess ``q_px`` is left untouched).
                 NOTE: calibrate_pixel_size fits from the structure factors — the
                 guess does not seed it, so the fitted value is what gets used.
+                Requires a calibrated origin (auto-runs Origin from center_guess
+                when missing).
     refit=False : use ``params.q_px`` (the GUESS) directly as the pixel size, no
                 fit — pick this to keep your own calibrated value.
 
@@ -2541,6 +2614,7 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
 
     def _fit_threadsafe() -> float:
         """The proven fast-mode fit WITHOUT pyplot (sanity-checked). Returns px_fit."""
+        ensure_origin_for_qpixel(scan, log=log)
         crystal = _build_crystal(scan)            # honours Si / Au / Custom
         crystal.calculate_structure_factors(float(p.q_kmax))
         bragg_use = pl._braggpeaks_for_roi(st, use_roi=bool(p.q_use_roi))
@@ -2591,21 +2665,64 @@ def register_q_pixel_fit_figure(scan: Scan, *, log: Log = None) -> bool:
 
     Must run on the **GUI / main thread** — uses pyplot internally. Falls back to a
     scattering overlay at the fitted px if the slow path fails.
+
+    Does **not** reload uncalibrated braggpeaks from disk and re-fit blindly: that
+    produced ``Requested calibration was not found!`` after Compute when RAM had
+    dropped the calibrated object. Prefer overlay from ``q_px_fitted`` when origin
+    is missing after a reload.
     """
     pl = _pipeline()
     st = _set_q_crystal(scan)
     p = scan.params
-    if getattr(st, "braggpeaks", None) is None:
-        load_braggpeaks(scan, log=log)
     px_guess = float(p.q_px)
+    px_fit = float(p.q_px_fitted) if p.q_px_fitted not in (None, 0, 0.0) else None
+
+    if getattr(st, "braggpeaks", None) is None:
+        # Prefer calibrated in-RAM / checkpoint over a fresh disk reload that
+        # wipes Origin (calstate all False) and then fails the FIT re-plot.
+        snap = (getattr(scan, "cal_checkpoints", {}) or {}).get("pre_basis") \
+            or (getattr(scan, "cal_checkpoints", {}) or {}).get("pre_qpixel")
+        restored = False
+        if snap:
+            try:
+                restored = bool(restore_calibration(scan, snap, log=log))
+            except Exception:
+                restored = False
+        if not restored:
+            load_braggpeaks(scan, log=log)
+            _log(log, f"[{scan.name}] Q-pixel figure: reloaded braggpeaks from disk "
+                      f"(uncalibrated). Will restore Origin before any re-fit.")
+
+    try:
+        ensure_origin_for_qpixel(scan, log=log)
+    except Exception as exc:
+        _log(log, f"[{scan.name}] q-pixel FIT figure: cannot ensure Origin ({exc})")
+        # Overlay-only fallback at fitted/guess px — never call calibrate_pixel_size
+        # without origin (py4DSTEM raises "Requested calibration was not found!").
+        try:
+            px = float(px_fit if px_fit is not None else px_guess)
+            fig = pl.q_pixel_overlay_figure(
+                st, px=px, k_max=float(p.q_kmax), bragg_k_power=float(p.q_kpow),
+                use_roi=bool(p.q_use_roi), log=log)
+            pl._annotate_q_pixel_fit(
+                fig, px_guess, px, bool(p.q_use_roi), float(p.q_kpow), float(p.q_kmax))
+            register_figure(scan, "q_pixel", fig, force=True)
+            _log(log, f"[{scan.name}] registered Q-pixel OVERLAY (no Origin — fit not re-run)")
+            return True
+        except Exception as exc2:
+            _log(log, f"[{scan.name}] q-pixel overlay fallback figure skipped: {exc2}")
+            return False
+
+    # Origin OK — rebuild FIT plot. If we already fitted during Compute, still
+    # allow py4DSTEM's plot_result path; on failure fall back to overlay.
     try:
         res = pl.finalize_q_pixel_refit_step(
             st, px_guess=px_guess, k_max=float(p.q_kmax),
             bragg_k_power=float(p.q_kpow), use_roi=bool(p.q_use_roi),
             plot_result=True, log=log)
-        px_fit = float(res.get("px_fit", p.q_px_fitted or px_guess))
-        if 0.0 < px_fit < 1.0:
-            p.q_px_fitted = px_fit
+        px_new = float(res.get("px_fit", px_fit or px_guess))
+        if 0.0 < px_new < 1.0:
+            p.q_px_fitted = px_new
         fig = res.get("figure")
         if fig is not None:
             register_figure(scan, "q_pixel", fig, force=True)
@@ -2682,6 +2799,7 @@ def q_pixel_finalize(scan: Scan, *, px_guess, k_max, kpow, use_roi,
     st = _set_q_crystal(scan)
     if getattr(st, "braggpeaks", None) is None:
         load_braggpeaks(scan, log=log)
+    ensure_origin_for_qpixel(scan, log=log)
     res = pl.finalize_q_pixel_refit_step(
         st, px_guess=float(px_guess), k_max=float(k_max), bragg_k_power=float(kpow),
         use_roi=bool(use_roi), plot_result=True, log=log)
@@ -3496,22 +3614,37 @@ def place_line_from_spec(scans: list, line_id: str, spec: dict, *,
 
 def register_live_line_report_figures(scans: list, line_ids: list, *,
                                       channel: str = "eyy", label: str = "without_roi",
-                                      width: int = 3, log: Log = None) -> None:
-    """Build maps / per-scan profiles / grouped cross-file figures for new lines."""
+                                      width: int = 3, log: Log = None) -> list[str]:
+    """Materialize Live-line figures only under ``report_*`` keys (Send to Report).
+
+    Does **not** register generic ``line_profiles`` / ``maps_with_lines`` — those
+    stay on-demand. Returns the figure keys written on the first scan (for UI jump).
+    """
+    keys_written: list[str] = []
     for sc in scans:
-        if getattr(sc, "lines", None):
-            build_maps_with_lines_figure(sc)
-            build_line_profiles_figure(sc, label, channel, width=width)
+        if not getattr(sc, "lines", None):
+            continue
+        for lid in line_ids:
+            key = f"report_line_{lid}_{channel}_{label}"
+            fig = build_single_line_map_figure(sc, lid, channel, label, width=width)
+            if register_figure(sc, key, fig, force=True):
+                if sc is scans[0]:
+                    keys_written.append(key)
+        prof_key = f"report_line_profiles_{channel}_{label}"
+        fig = build_line_profiles_figure(sc, label, channel, width=width, register=False)
+        if register_figure(sc, prof_key, fig, force=True):
+            if sc is scans[0] and prof_key not in keys_written:
+                keys_written.append(prof_key)
     for lid in line_ids:
+        if not scans:
+            break
+        gkey = f"report_line_group_{lid}_{channel}_{label}"
         fig = build_grouped_line_figure(scans, lid, channel, label, width=width)
-        if scans:
-            register_figure(scans[0], f"line_group_{lid}", fig, force=True)
-            # focused single-line map (only that line drawn) — optional view
-            register_figure(scans[0], f"line_map_{lid}",
-                            build_single_line_map_figure(scans[0], lid, channel, label,
-                                                         width=width),
-                            force=True)
-    _log(log, f"Report: {len(line_ids)} line(s) on {len(scans)} file(s), width={width}px")
+        if register_figure(scans[0], gkey, fig, force=True):
+            keys_written.append(gkey)
+    _log(log, f"Report (Send): {len(line_ids)} line(s) on {len(scans)} file(s), "
+              f"width={width}px → {', '.join(keys_written) or '(none)'}")
+    return keys_written
 
 
 def scan_line_segments(scan: "Scan") -> list:
@@ -4012,7 +4145,9 @@ def build_lines_overlay_figure(scan: "Scan"):
 _CH_IDX = {"eyy": 0, "exx": 1, "exy": 2}                 # strain channels (in strain_raw[...,idx])
 _STRESS_KEY = {"sxx": "sigma_xx", "syy": "sigma_yy", "sxy": "sigma_xy"}  # stress (stress_tensors_pa, Pa)
 _CH_LABEL = {"eyy": "ε_yy (%)", "exx": "ε_xx (%)", "exy": "ε_xy (%)", "adf": "ADF",
-             "sxx": "σ_xx", "syy": "σ_yy", "sxy": "σ_xy"}
+             "sxx": "σ_xx", "syy": "σ_yy", "sxy": "σ_xy",
+             "orientation": "θ (°)", "theta": "θ (°)"}
+_ORIENT_CH = frozenset({"orientation", "theta"})
 
 
 def _stress_scale(scan: "Scan"):
@@ -4025,6 +4160,68 @@ def _channel_label(scan: "Scan", channel: str) -> str:
     if channel in _STRESS_KEY:
         return f"{_CH_LABEL[channel]} ({_stress_scale(scan)[1]})"
     return _CH_LABEL.get(channel, channel)
+
+
+def channel_clim(scan: "Scan", channel: str) -> tuple[float, float] | None:
+    """Symmetric or explicit (vmin, vmax) from GUI params — shared across panels.
+
+    Strain ε → ``params.vrange`` (%). Orientation → ``params.vrange_theta`` (°).
+    Stress → ±``params.stress_vmax`` when > 0; otherwise None (caller may auto).
+    """
+    p = getattr(scan, "params", None)
+    if p is None:
+        return None
+    ch = str(channel).lower()
+    if ch in _CH_IDX:
+        vr = list(getattr(p, "vrange", None) or [-5.0, 5.0])
+        return float(vr[0]), float(vr[1])
+    if ch in _ORIENT_CH:
+        vr = list(getattr(p, "vrange_theta", None) or [-5.0, 5.0])
+        return float(vr[0]), float(vr[1])
+    if ch in _STRESS_KEY:
+        vmax = float(getattr(p, "stress_vmax", 0.0) or 0.0)
+        if vmax > 0:
+            return -vmax, vmax
+        return None
+    return None
+
+
+def build_channel_panel_figure(scan: "Scan", channel: str, label: str = "without_roi",
+                               *, title: str | None = None):
+    """One-panel map figure for Report tree channel leaves / export (GUI vranges)."""
+    import matplotlib.pyplot as plt
+
+    arr = channel_map_2d(scan, channel, label)
+    if arr is None:
+        return None
+    a = np.asarray(arr, dtype=float)
+    cmap = str(getattr(scan.params, "strain_cmap", None) or "RdBu_r")
+    if str(channel).lower() in _ORIENT_CH:
+        cmap = str(getattr(scan.params, "strain_cmap_theta", None) or "PRGn")
+    clim = channel_clim(scan, channel)
+    if clim is None:
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            vmax = float(np.nanpercentile(np.abs(finite), 98)) or 1.0
+            clim = (-vmax, vmax)
+        else:
+            clim = (-1.0, 1.0)
+    vmin, vmax = clim
+    fig, ax = plt.subplots(figsize=(5.2, 4.4), constrained_layout=True)
+    im = ax.imshow(a, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(title or f"{scan.name} — {_channel_label(scan, channel)} ({label})")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return fig
+
+
+def map_key_label_channel(map_key: str) -> tuple[str, str]:
+    """``strain_with_roi`` → (``with_roi``, ``strain``); stress similarly."""
+    label = "with_roi" if "with_roi" in map_key else "without_roi"
+    kind = "stress" if map_key.startswith("stress") else "strain"
+    return label, kind
+
 
 
 def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
@@ -4085,7 +4282,8 @@ def line_profiles(scan: "Scan", label: str = "without_roi", *, width: int = 3) -
 
 
 def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
-                               channel: str = "eyy", *, width: int = 3):
+                               channel: str = "eyy", *, width: int = 3,
+                               register: bool = True):
     """Top: the chosen map (strain channel or ADF) with the lines overlaid.
     Bottom: that channel's profile vs distance (px), one curve per line."""
     from matplotlib.figure import Figure
@@ -4133,7 +4331,8 @@ def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
     if prof:
         ax_p.legend(fontsize=7, ncol=4)
     ax_p.set_title("Line profiles", fontsize=9)
-    register_figure(scan, "line_profiles", fig)
+    if register:
+        register_figure(scan, "line_profiles", fig)
     return fig
 
 
@@ -4289,24 +4488,40 @@ def grouped_line_table(scans: list, line_id: str, channel: str = "eyy",
 # ─────────────────────────────────────────────────────────────────────────────
 
 def channel_map_2d(scan: "Scan", channel: str = "eyy", label: str = "without_roi"):
-    """A 2-D map for one channel: strain εyy/εxx/εxy in %, stress σxx/σyy/σxy in the
-    display units, or the ADF. Returns None when that map isn't available."""
+    """A 2-D map for one channel: strain εyy/εxx/εxy in %, orientation θ in degrees,
+    stress σxx/σyy/σxy in the display units, or the ADF. Returns None when unavailable."""
     from fast_artifacts import _as_hw3
     st = scan.ensure_state()
-    if channel in _CH_IDX:
+    ch = str(channel).lower()
+    if ch in _CH_IDX:
         hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
         if hw3 is None:
             return None
-        return np.asarray(hw3[..., _CH_IDX[channel]], dtype=float) * 100.0
-    if channel in _STRESS_KEY:
+        return np.asarray(hw3[..., _CH_IDX[ch]], dtype=float) * 100.0
+    if ch in _ORIENT_CH:
+        from pipeline import _strain_maps_dict_from_raw
+        raw = (getattr(st, "strain_raw", {}) or {}).get(label)
+        maps = _strain_maps_dict_from_raw(raw)
+        th = maps.get("theta")
+        if th is None:
+            return None
+        a = np.asarray(th, dtype=float)
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            mx = float(np.nanmax(np.abs(finite)))
+            p99 = float(np.nanpercentile(np.abs(finite), 99))
+            if mx <= float(np.pi) + 0.08 and p99 <= float(np.pi) + 0.08:
+                a = np.rad2deg(a)
+        return a
+    if ch in _STRESS_KEY:
         stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
         if not stress:
             return None
-        arr = stress.get(_STRESS_KEY[channel])
+        arr = stress.get(_STRESS_KEY[ch])
         if arr is None:
             return None
         return np.asarray(arr, dtype=float) / _stress_scale(scan)[0]
-    if channel == "adf":
+    if ch == "adf":
         return cached_adf(scan)
     return None
 
@@ -4609,7 +4824,7 @@ def roi_profiles(scan: "Scan", label: str = "without_roi") -> dict:
 
 
 def build_roi_profiles_figure(scan: "Scan", label: str = "without_roi",
-                              channel: str = "eyy"):
+                              channel: str = "eyy", *, register: bool = True):
     """Top: the chosen map with this scan's ROI rectangles overlaid. Bottom: a bar of
     each ROI's mean (±std) for that channel. ROI analog of ``build_line_profiles_figure``."""
     from matplotlib.figure import Figure
@@ -4650,7 +4865,8 @@ def build_roi_profiles_figure(scan: "Scan", label: str = "without_roi",
     ax_b.axhline(0, color="#999", lw=0.7, ls="--")
     ax_b.set_ylabel(ylab); ax_b.set_title("ROI means (±std)", fontsize=9)
     ax_b.grid(alpha=0.3, axis="y")
-    register_figure(scan, "roi_profiles", fig)
+    if register:
+        register_figure(scan, "roi_profiles", fig)
     return fig
 
 
@@ -4929,22 +5145,37 @@ def build_single_roi_map_figure(scan: "Scan", roi_id: str, channel: str = "eyy",
 
 def register_live_roi_report_figures(scans: list, roi_ids: list, *,
                                      channel: str = "eyy", label: str = "without_roi",
-                                     log: Log = None) -> None:
-    """Build maps / per-scan ROI stats / grouped cross-file figures for new ROIs.
-    Mirrors ``register_live_line_report_figures``."""
+                                     log: Log = None) -> list[str]:
+    """Materialize Live-ROI figures only under ``report_*`` keys (Send to Report).
+
+    Does **not** register generic ``roi_profiles`` / ``maps_with_rois``.
+    Returns keys written on the first scan (for UI jump).
+    """
+    keys_written: list[str] = []
     for sc in scans:
-        if scan_area_rois(sc):
-            build_maps_with_rois_figure(sc)
-            build_roi_profiles_figure(sc, label, channel)
+        if not scan_area_rois(sc):
+            continue
+        for rid in roi_ids:
+            key = f"report_roi_{rid}_{channel}_{label}"
+            fig = build_single_roi_map_figure(sc, rid, channel, label)
+            if register_figure(sc, key, fig, force=True):
+                if sc is scans[0]:
+                    keys_written.append(key)
+        prof_key = f"report_roi_profiles_{channel}_{label}"
+        fig = build_roi_profiles_figure(sc, label, channel, register=False)
+        if register_figure(sc, prof_key, fig, force=True):
+            if sc is scans[0] and prof_key not in keys_written:
+                keys_written.append(prof_key)
     for rid in roi_ids:
+        if not scans:
+            break
+        gkey = f"report_roi_group_{rid}_{channel}_{label}"
         fig = build_grouped_roi_figure(scans, rid, channel, label)
-        if scans:
-            register_figure(scans[0], f"roi_group_{rid}", fig, force=True)
-            # focused single-ROI map (only that ROI drawn) — optional view
-            register_figure(scans[0], f"roi_map_{rid}",
-                            build_single_roi_map_figure(scans[0], rid, channel, label),
-                            force=True)
-    _log(log, f"Report: {len(roi_ids)} ROI(s) on {len(scans)} file(s)")
+        if register_figure(scans[0], gkey, fig, force=True):
+            keys_written.append(gkey)
+    _log(log, f"Report (Send): {len(roi_ids)} ROI(s) on {len(scans)} file(s) → "
+              f"{', '.join(keys_written) or '(none)'}")
+    return keys_written
 
 
 # ─────────────────────────────────────────────────────────────────────────────

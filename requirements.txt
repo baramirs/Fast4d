@@ -24,6 +24,7 @@ tqdm
 psutil
 PyYAML
 python-pptx
+python-docx
 
 # --- Optional: GPU acceleration (NVIDIA/CUDA) ---
 # Install manually to match your CUDA version, e.g. cupy-cuda12x

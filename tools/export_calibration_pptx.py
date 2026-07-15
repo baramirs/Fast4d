@@ -191,12 +191,21 @@ def _iter_scan_figure_dirs(summary: Path) -> list[Path]:
 
 
 def split_map_figures(summary: Path) -> dict[tuple[str, str], list[Path]]:
-    """Split saved composite strain/stress figures into per-map panel images.
+    """LEGACY — equal-strip PIL crops of strain/stress composites.
 
-    Fast4D saves per-scan composite figures such as
-    ``<scan>/figures/strain_with_roi.png``. This routine crops those composites
-    into equal panels so a PPT slide can be made for each channel.
+    .. deprecated::
+        Prefer ``tools.report_export.build_report``, which redraws **per-channel**
+        panels from arrays and never crops collages. This helper assumes a
+        *horizontal* py4DSTEM layout and **breaks** for ``vertical`` / ``square``
+        (maps look cut in half). Kept only for old scripts that call it directly.
     """
+    import warnings
+    warnings.warn(
+        "split_map_figures is legacy and layout-blind; use tools.report_export "
+        "build_report() for PDF/DOCX/PPTX instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     out: dict[tuple[str, str], list[Path]] = {}
     split_root = summary / "maps_split"
     split_root.mkdir(parents=True, exist_ok=True)

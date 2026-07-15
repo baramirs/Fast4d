@@ -10,7 +10,7 @@ table:
     right   : ADF dock               (pyqtgraph viewer)
     bottom  : Console dock           (py4DSTEM messages)
     toolbars: icon strip (drives the tabs) + context step-actions (movable, wrap)
-    bottom bar: strain options + Compute / Analysis + progress
+    bottom bar: strain options + Compute + progress
 
 Heavy work runs off the GUI thread (``threading.Thread``); driver log/progress/
 done callbacks are delivered back through Qt signals (thread-safe, queued).
@@ -36,7 +36,7 @@ import engine as E
 import driver as D
 from qt_params import ParamTable
 from qt_widgets import (AdfGallery, AdfView, CalStateStrip, ConsoleWidget,
-                        ExportSelectionDialog, FilesTree, FlowLayout, ResourceMonitor,
+                        ExportReportDialog, ExportSelectionDialog, FilesTree, FlowLayout, ResourceMonitor,
                         _LabeledSlider)
 
 _ICONS = ICONS_DIR
@@ -789,7 +789,10 @@ class OriginDialog(QtWidgets.QDialog):
         self._status.setStyleSheet("color:#1565C0; font-size:11px;")
         v.addWidget(self._status)
         b_use = QtWidgets.QPushButton(LBL_TO_TABLE)
-        b_use.setToolTip("Push center_guess and sampling to the parameter table.")
+        b_use.setToolTip(
+            "Push center_guess + sampling to the parameter table only.\n"
+            "Does NOT write Origin onto braggpeaks yet.\n\n"
+            "Next: step toolbar → Apply calibration (Origin), or Compute with Calib=fit.")
         b_use.clicked.connect(self._use_center); v.addWidget(b_use)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)
@@ -891,6 +894,10 @@ class OriginDialog(QtWidgets.QDialog):
         self._host._console.log(
             f"[{self._sc.name}] center_guess (y,x) = ({self._cy:.2f}, {self._cx:.2f}), "
             f"sampling={self._sampling}")
+        self._host._console.log(
+            f"[{self._sc.name}] NOTE: Origin is NOT on braggpeaks yet — "
+            f"press Apply calibration on the Origin step (or Compute with Calib=fit). "
+            f"Q-pixel fit needs calstate.center=True.")
         self._host._params.reload()
         self.accept()
 
@@ -2785,9 +2792,10 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
         self._chan.currentIndexChanged.connect(self._reload_map)
         r1.addWidget(self._chan)
         self._label = QtWidgets.QComboBox()
-        self._label.addItems(["without_roi", "with_roi"])
+        for key, title in E.ROI_REF_LABELS.items():
+            self._label.addItem(title, key)
         self._label.currentIndexChanged.connect(self._reload_map)
-        r1.addWidget(QtWidgets.QLabel("ROI:"))
+        r1.addWidget(QtWidgets.QLabel("Ref:"))
         r1.addWidget(self._label)
         self._width = QtWidgets.QSpinBox()
         self._width.setRange(1, 51)
@@ -3046,7 +3054,7 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
     # ── map reload ────────────────────────────────────────────────────────────
     def _reload_map(self, *_):
         sc = self._cur()
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         m = E.channel_map_2d(sc, ch, lab) if sc else None
         if m is None:
             self._img.clear()
@@ -3107,7 +3115,7 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
     def _update_profiles(self, *_):
         if not self._line_entries:
             return
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         w = int(self._width.value())
         use_drift = self._chk_drift.isChecked()
         tpl = self._cur()
@@ -3186,7 +3194,7 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
             if ans != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
             use_drift = False
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         w = int(self._width.value())
         line_ids = E.allocate_line_ids(self._host._scans, len(specs))
         log = self._host._console.log
@@ -3197,14 +3205,23 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
             scans, line_ids, channel=ch, label=lab, width=w, log=log)
         self._host._update_active_views()
         self._host._params.report_refresh()
+        # Jump Report tree to the first report_* key on the template scan
+        try:
+            report = self._host._params.report
+            idx = self._host._scans.index(tpl) if tpl in self._host._scans else 0
+            keys = [k for k in E.list_figure_keys(tpl) if k.startswith("report_")]
+            if report is not None and keys:
+                report.select_figure(idx, keys[0])
+                self._host._params._tabs.setCurrentWidget(report)
+        except Exception:
+            pass
         self._host._console.log(
             f"Live lines → Report: {', '.join(line_ids)} on {len(scans)} file(s), "
             f"{ch}/{lab}, width={w}px.")
         QtWidgets.QMessageBox.information(
             self, "Send to Report",
             f"Added {len(line_ids)} line(s): {', '.join(line_ids)}\n\n"
-            f"Open Report → «Line profiles», «Maps with lines», or "
-            f"«Lines across files» and pick the line id.")
+            f"Open Report → tree → «Reports» under the scan.")
 
 
 class AreaRoiEditorDialog(QtWidgets.QDialog):
@@ -3567,9 +3584,10 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
         self._chan.currentIndexChanged.connect(self._reload_map)
         r1.addWidget(self._chan)
         self._label = QtWidgets.QComboBox()
-        self._label.addItems(["without_roi", "with_roi"])
+        for key, title in E.ROI_REF_LABELS.items():
+            self._label.addItem(title, key)
         self._label.currentIndexChanged.connect(self._reload_map)
-        r1.addWidget(QtWidgets.QLabel("ROI ref:"))
+        r1.addWidget(QtWidgets.QLabel("Ref:"))
         r1.addWidget(self._label)
         lay.addLayout(r1)
 
@@ -3771,7 +3789,7 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
     # ── map reload ────────────────────────────────────────────────────────────
     def _reload_map(self, *_):
         sc = self._cur()
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         m = E.channel_map_2d(sc, ch, lab) if sc else None
         if m is None:
             self._img.clear()
@@ -3831,7 +3849,7 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
     def _update_profiles(self, *_):
         if not self._roi_entries:
             return
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         use_drift = self._chk_drift.isChecked()
         tpl = self._cur()
         self._plot.clear()
@@ -3925,7 +3943,7 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
             if ans != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
             use_drift = False
-        ch, lab = self._chan.currentData(), self._label.currentText()
+        ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         roi_ids = E.allocate_roi_ids(self._host._scans, len(bounds))
         log = self._host._console.log
         for rid, b in zip(roi_ids, bounds):
@@ -3935,13 +3953,21 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
             scans, roi_ids, channel=ch, label=lab, log=log)
         self._host._update_active_views()
         self._host._params.report_refresh()
+        try:
+            report = self._host._params.report
+            idx = self._host._scans.index(tpl) if tpl in self._host._scans else 0
+            keys = [k for k in E.list_figure_keys(tpl) if k.startswith("report_")]
+            if report is not None and keys:
+                report.select_figure(idx, keys[0])
+                self._host._params._tabs.setCurrentWidget(report)
+        except Exception:
+            pass
         self._host._console.log(
             f"Live ROIs → Report: {', '.join(roi_ids)} on {len(scans)} file(s), {ch}/{lab}.")
         QtWidgets.QMessageBox.information(
             self, "Send to Report",
             f"Added {len(roi_ids)} ROI(s): {', '.join(roi_ids)}\n\n"
-            f"Open Report → «ROI stats», «Maps with ROIs», or "
-            f"«ROIs across files» and pick the ROI id.")
+            f"Open Report → tree → «Reports» under the scan.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4254,7 +4280,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
 
     # ── menu (View → reopen panels) ─────────────────────────────────────────────
     def _build_menu(self) -> None:
-        """View / Settings / Help menu bar (always visible)."""
+        """View → Tools → Settings → Help menu bar (always visible)."""
         mb = self.menuBar()
         mb.setVisible(True)
         mb.setNativeMenuBar(False)   # keep menus in-window on Windows (not hidden in title bar)
@@ -4267,6 +4293,34 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act = QtGui.QAction("Show all panels", self)
         act.triggered.connect(self._show_all_docks)
         view.addAction(act)
+
+        tools = mb.addMenu("&Tools")
+        act_live_line = QtGui.QAction("Live Line Profile…", self)
+        act_live_line.setToolTip(
+            "Interactive line-profile tool — pick a map, drag a line.")
+        act_live_line.triggered.connect(self._open_live_line)
+        tools.addAction(act_live_line)
+        act_live_roi = QtGui.QAction("Live ROI Profile…", self)
+        act_live_roi.setToolTip("Interactive area-ROI stats tool.")
+        act_live_roi.triggered.connect(self._open_live_roi)
+        tools.addAction(act_live_roi)
+        tools.addSeparator()
+        act_setup = QtGui.QAction("Set up Lines & ROI…", self)
+        act_setup.setToolTip(
+            "Configure line ROIs, area ROIs, drift, and propagation.")
+        act_setup.triggered.connect(self._open_line_setup)
+        tools.addAction(act_setup)
+        tools.addSeparator()
+        act_an_file = QtGui.QAction("Analyse (file)", self)
+        act_an_file.setToolTip(
+            "Run full analysis (stress + lines) on the active file.")
+        act_an_file.triggered.connect(self._analyze_active)
+        tools.addAction(act_an_file)
+        act_an_all = QtGui.QAction("Analysis (all)", self)
+        act_an_all.setToolTip(
+            "Run full analysis (stress + lines) on all loaded files.")
+        act_an_all.triggered.connect(lambda: self._on_analysis())
+        tools.addAction(act_an_all)
 
         settings_m = mb.addMenu("&Settings")
         act_mem = QtGui.QAction("Resident data (RAM)…", self)
@@ -4706,25 +4760,20 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                  "Send proposed index_origin/g1/g2 into the parameter table."),
             ])
         elif key == "lines":
-            # Analysis step (icon label "Analysis"). Interactive Live tools first,
-            # then setup + batch analysis — same toolbar the user opens after Strain.
-            add("Live Line Profile", self._open_live_line,
-                tip="Interactive line-profile tool (modeless) — pick a map, drag a line.")
-            add("Live ROI profile", self._open_live_roi,
-                tip="Interactive area-ROI stats tool (modeless).")
-            tb.addSeparator()
-            add("Set up Lines & ROI", self._open_line_setup,
-                tip="Configure line ROIs, area ROIs, drift, and propagation.")
-            add("Analyse (file)", self._analyze_active,
-                tip="Run full analysis (stress + lines) on the active file.")
-            add("Analysis (all)", lambda: self._on_analysis(),
-                tip="Run full analysis (stress + lines) on all loaded files.")
+            # Analysis tools live in menu bar → Tools (View · Tools · Settings · Help).
+            lbl = QtWidgets.QLabel(
+                "  Analysis tools moved to menu  Tools  "
+                "(Live Line / Live ROI / Set up / Analyse).  ")
+            lbl.setStyleSheet("color:#1565C0; font-size:10px;")
+            lbl.setToolTip(
+                "Use the Tools menu: Live Line Profile, Live ROI Profile, "
+                "Set up Lines & ROI, Analyse (file), Analysis (all).")
+            tb.addWidget(lbl)
         elif key == "strain":
             add("Apply", self._apply_strain_params, tip="Commit strain parameters from the table.")
             add("Compute (file)", self._compute_active)
             add("Compute (all)", lambda: self._on_compute())
-            add("Analyze (file)", self._analyze_active)
-            # Live Line/ROI live under Analysis (next step), not here.
+            # Analyse / Live tools → menu Tools
         else:
             lbl = QtWidgets.QLabel("  Edit parameters in the table, then Compute. ")
             lbl.setStyleSheet("color:#888;")
@@ -4863,7 +4912,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         root.addWidget(g_compute)
         add_sep()
 
-        # Group 3: figure storage / DPI options → Analysis action.
+        # Group 3: figure storage / DPI options (Analysis actions → menu Tools).
         g_store, g_store_v = group_widget()
         store_top = hrow()
         self._cb_spill = QtWidgets.QCheckBox("Spill")
@@ -4917,14 +4966,11 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         b_store.setToolTip("Choose which figure types are saved to the Report (report mode).")
         b_store.clicked.connect(self._open_figure_store)
         store_bottom.addWidget(b_store)
-        self._btn_analysis = QtWidgets.QPushButton("∑ Analysis")
-        self._btn_analysis.clicked.connect(lambda: self._on_analysis())
-        store_bottom.addWidget(self._btn_analysis)
         store_bottom.addStretch(1)
         g_store_v.addLayout(store_bottom)
         root.addWidget(g_store)
 
-        for b in (self._btn_reset_cal, self._btn_compute, self._btn_analysis, b_store):
+        for b in (self._btn_reset_cal, self._btn_compute, b_store):
             b.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed,
                             QtWidgets.QSizePolicy.Policy.Fixed)
 
@@ -5191,69 +5237,95 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                         on_done=lambda _r: self._status.showMessage(f"Saved → {d}"))
 
     def _export_pptx_report(self) -> None:
-        """Report button: export calibration/maps PPTX, optionally using a template."""
-        summary = Path(self._save_root) / "summary" if self._save_root else Path()
-        if not (summary / "calibrations").is_dir():
-            d = QtWidgets.QFileDialog.getExistingDirectory(
-                self, "Select Fast4D summary folder (contains calibrations/)",
-                str(summary if summary else Path.home()))
-            if not d:
-                return
-            summary = Path(d)
-        if not (summary / "calibrations").is_dir():
+        """Report → Export… : PDF / DOCX / PPTX from full panels (no PIL crops)."""
+        if not self._scans:
+            QtWidgets.QMessageBox.information(self, "Export", "Load files first.")
+            return
+        # Prefer scans with strain; still allow calib/reports-only export
+        ready = list(self._scans)
+        has_strain = any(
+            (getattr(getattr(sc, "state", None), "strain_raw", None) or {})
+            for sc in ready)
+        has_figs = any(E.list_figure_keys(sc) for sc in ready)
+        if not has_strain and not has_figs:
             QtWidgets.QMessageBox.warning(
-                self, "Export PPTX",
-                "That folder does not contain summary/calibrations.\n\n"
-                "Run Save first, or select the 'summary' folder created by Fast4D.")
+                self, "Export",
+                "Nothing to export yet.\n\n"
+                "Run Compute (for maps) and/or open calibration tools so figures exist.")
             return
 
-        ans = QtWidgets.QMessageBox.question(
-            self, "Export PPTX",
-            "Do you want to use a PowerPoint template (.pptx)?",
-            QtWidgets.QMessageBox.StandardButton.Yes
-            | QtWidgets.QMessageBox.StandardButton.No
-            | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Yes)
-        if ans == QtWidgets.QMessageBox.StandardButton.Cancel:
+        dlg = ExportReportDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        template = None
-        if ans == QtWidgets.QMessageBox.StandardButton.Yes:
-            p, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Choose PPTX template", "", "PowerPoint (*.pptx);;All (*)")
-            if not p:
-                return
-            template = Path(p)
+        opts = dlg.result()
+        fmt = opts["fmt"]
+        if not (opts["include_maps"] or opts["include_calib"] or opts["include_reports"]):
+            QtWidgets.QMessageBox.information(
+                self, "Export", "Select at least one content category.")
+            return
+        if opts["include_maps"] and not has_strain:
+            QtWidgets.QMessageBox.warning(
+                self, "Export",
+                "Maps selected but no strain in memory — uncheck Maps or run Compute.")
+            return
 
-        default = summary.parent / "Fast4D_Calibration_Report.pptx"
+        filters = {
+            "pdf": "PDF (*.pdf)",
+            "docx": "Word (*.docx)",
+            "pptx": "PowerPoint (*.pptx)",
+        }
+        default_name = {
+            "pdf": "Fast4D_Report.pdf",
+            "docx": "Fast4D_Report.docx",
+            "pptx": "Fast4D_Report.pptx",
+        }[fmt]
+        start = Path(self._save_root) if self._save_root else Path.home()
         out, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save PPTX report", str(default), "PowerPoint (*.pptx);;All (*)")
+            self, "Save report", str(start / default_name),
+            f"{filters[fmt]};;All (*)")
         if not out:
             return
         out_path = Path(out)
-        if out_path.suffix.lower() != ".pptx":
-            out_path = out_path.with_suffix(".pptx")
+        template = None
+        if fmt == "pptx":
+            ans = QtWidgets.QMessageBox.question(
+                self, "Export PPTX",
+                "Use a PowerPoint template (.pptx)?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.No)
+            if ans == QtWidgets.QMessageBox.StandardButton.Cancel:
+                return
+            if ans == QtWidgets.QMessageBox.StandardButton.Yes:
+                p, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Choose PPTX template", "", "PowerPoint (*.pptx);;All (*)")
+                if not p:
+                    return
+                template = Path(p)
 
-        dlg = ExportSelectionDialog(self, self._export_categories)
-        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        cats = dlg.result_selection()
-        self._export_categories = cats
+        assets_dir = (Path(self._save_root) / "export_assets"
+                      if self._save_root else out_path.parent / "export_assets")
 
         def work():
-            from tools.export_calibration_pptx import build_pptx
-            return build_pptx(summary, out_path, template=template,
-                              include_trends=cats["calib_trends"],
-                              include_maps=cats["strain_maps"],
-                              split_basis=cats["basis_panels"])
+            from tools.report_export import build_report
+            return build_report(
+                scans=ready, assets_dir=assets_dir, out_path=out_path,
+                fmt=fmt, template=template,
+                title="Fast4D Strain / Stress Report",
+                include_maps=opts["include_maps"],
+                include_calib=opts["include_calib"],
+                include_reports=opts["include_reports"],
+            )
 
         def done(res):
             if isinstance(res, Exception):
-                QtWidgets.QMessageBox.critical(self, "Export PPTX", f"Could not export:\n{res}")
+                QtWidgets.QMessageBox.critical(self, "Export", f"Could not export:\n{res}")
                 return
-            self._console.log(f"PPTX report written → {res}")
-            self._status.showMessage(f"PPTX written → {res}")
+            self._console.log(f"Report exported → {res}")
+            self._status.showMessage(f"Report written → {res}")
 
-        self._run_async(work, label="Export PPTX report", on_done=done)
+        self._run_async(work, label=f"Export {fmt.upper()}", on_done=done)
 
     def _load_session(self) -> None:
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -5751,14 +5823,14 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._propagate_lines(use_drift=True)
 
     def _open_live_line(self) -> None:
-        """Analysis toolbar → Live Line Profile (modeless)."""
+        """Menu Tools → Live Line Profile (modeless)."""
         if not self._scans:
             QtWidgets.QMessageBox.information(self, "Live line profile", "Load files first.")
             return
         self._show_tool(LiveLineProfileDialog(self))
 
     def _open_live_roi(self) -> None:
-        """Analysis toolbar → Live ROI profile (modeless)."""
+        """Menu Tools → Live ROI profile (modeless)."""
         if not self._scans:
             QtWidgets.QMessageBox.information(self, "Live ROI stats", "Load files first.")
             return
@@ -6334,7 +6406,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
     def _set_busy(self, busy: bool, label: str = "") -> None:
         self._busy = busy
         self._btn_compute.setEnabled(not busy)
-        self._btn_analysis.setEnabled(not busy)
         self._btn_reset_cal.setEnabled(not busy)
         self._btn_cancel.setEnabled(busy)
         if busy:

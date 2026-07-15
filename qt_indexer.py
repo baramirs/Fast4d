@@ -248,6 +248,9 @@ class IndexerDialog(QtWidgets.QDialog):
                 import bvm_indexing as bix
                 fig = bix.make_indexing_figure(r, title=f"{sc.name} — BVM indexing")
                 self._show_fig(fig, owned=True)
+                # Register immediately so Report → Calibrations shows Index BVM
+                E.register_figure(sc, "indexing", fig, force=True)
+                self._preview_owned = False
             except Exception as exc:
                 self._status.setText(f"Indexed, but figure failed: {exc}")
             self._fill_table(r)

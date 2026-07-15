@@ -128,7 +128,8 @@ _PAGES = [
           <tr style="background:#EEF7FF;">
             <td style="padding:4px 8px;"><b>Analysis</b></td>
             <td style="padding:4px 8px; color:#1565C0;"><b>All paths</b></td>
-            <td style="padding:4px 8px;">Stress maps (Hooke's law) + line profiles across interfaces</td>
+            <td style="padding:4px 8px;">Stress + line/ROI tools via menu
+            <b>Tools</b> (Live Line, Live ROI, Set up, Analyse)</td>
           </tr>
         </table>
         """,

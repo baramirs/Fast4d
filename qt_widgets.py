@@ -340,13 +340,60 @@ class ExportSelectionDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
-    def _set_all(self, checked: bool) -> None:
+    def _set_all(self, on: bool) -> None:
         for cb in self._checks.values():
-            cb.setChecked(checked)
+            cb.setChecked(on)
 
     def result_selection(self) -> dict:
-        """{category_key: bool} reflecting the current checkbox states."""
-        return {key: cb.isChecked() for key, cb in self._checks.items()}
+        return {k: cb.isChecked() for k, cb in self._checks.items()}
+
+
+class ExportReportDialog(QtWidgets.QDialog):
+    """Format + content picker for the new channel-based report export."""
+
+    def __init__(self, parent=None, *, initial_fmt: str = "PDF") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export report")
+        self.setModal(True)
+        self.resize(420, 260)
+        lay = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel(
+            "Builds a report from <b>full panels</b> (per-channel maps + "
+            "calibration / Send-to-Report figures).\n"
+            "Does <b>not</b> crop strain collages — vertical/square layouts stay intact.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Format:"))
+        self._fmt = QtWidgets.QComboBox()
+        self._fmt.addItems(["PDF", "DOCX", "PPTX"])
+        idx = max(0, self._fmt.findText(initial_fmt.upper()))
+        self._fmt.setCurrentIndex(idx)
+        row.addWidget(self._fmt, 1)
+        lay.addLayout(row)
+
+        self._chk_maps = QtWidgets.QCheckBox("Strain / stress maps (per channel)")
+        self._chk_calib = QtWidgets.QCheckBox("Calibrations (probe, origin, ellipse, …)")
+        self._chk_reports = QtWidgets.QCheckBox("Reports (Live Line / ROI → Send)")
+        for cb in (self._chk_maps, self._chk_calib, self._chk_reports):
+            cb.setChecked(True)
+            lay.addWidget(cb)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def result(self) -> dict:
+        return {
+            "fmt": self._fmt.currentText().lower(),
+            "include_maps": self._chk_maps.isChecked(),
+            "include_calib": self._chk_calib.isChecked(),
+            "include_reports": self._chk_reports.isChecked(),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,9 +753,17 @@ def figure_to_pixmap(fig, max_w: int = 240, max_h: int = 150, *, png_path: str =
     w_in, h_in = fig.get_size_inches()
     eff_dpi = min(max(dpi, target_w / w_in, target_h / h_in), 400)
     buf = io.BytesIO()
-    try:
-        fig.savefig(buf, format="png", dpi=eff_dpi, bbox_inches="tight")
-    except Exception:
+    # Prefer tight crop; fall back without it — some strain/stress composites
+    # (esp. with_roi after colorbar edits) raise on bbox_inches='tight'.
+    for kwargs in ({"bbox_inches": "tight"}, {}):
+        buf.seek(0)
+        buf.truncate(0)
+        try:
+            fig.savefig(buf, format="png", dpi=eff_dpi, **kwargs)
+            break
+        except Exception:
+            continue
+    else:
         return QtGui.QPixmap()
     pix = QtGui.QPixmap()
     pix.loadFromData(buf.getvalue(), "PNG")

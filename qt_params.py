@@ -37,8 +37,10 @@ GROUP_FIGURE_KEY = {
 FIG_ROW_LABEL = {
     "detection": "Detection", "origin": "Origin (+res)", "ellipse": "Ellipse",
     "q_pixel": "Q-pixel", "basis": "Basis", "indexing": "BVM indexing",
-    "strain_without_roi": "Strain", "strain_with_roi": "Strain (ROI)",
-    "stress_without_roi": "Stress", "stress_with_roi": "Stress (ROI)",
+    "strain_without_roi": "Strain — Theoretical",
+    "strain_with_roi": "Strain — Experimental",
+    "stress_without_roi": "Stress — Theoretical",
+    "stress_with_roi": "Stress — Experimental",
 }
 # Detection-tab cells skipped on Path A (braggpeaks already on disk).
 _PATH_A_DET_CELL = "(Path A — braggpeaks)"
