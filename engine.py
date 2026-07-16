@@ -194,6 +194,95 @@ def build_custom_crystal(structure: str, a_lat: float, element_a, element_b=None
             "structure": s}
 
 
+# ── CIF → CalCrystal / py4DSTEM Crystal (shared by Index BVM + Q-pixel) ───────
+
+_CUBIC_LEN_RTOL = 1e-3
+_CUBIC_ANG_ATOL_DEG = 0.5
+
+
+def is_approximately_cubic(
+    cell: tuple[float, float, float, float, float, float] | list[float] | np.ndarray,
+    *,
+    len_rtol: float = _CUBIC_LEN_RTOL,
+    ang_atol_deg: float = _CUBIC_ANG_ATOL_DEG,
+) -> bool:
+    """True when a≈b≈c and α≈β≈γ≈90° (within tolerances)."""
+    a, b, c, alpha, beta, gamma = (float(x) for x in np.asarray(cell, dtype=float).ravel()[:6])
+    scale = max(abs(a), abs(b), abs(c), 1e-15)
+    if max(abs(a - b), abs(b - c), abs(a - c)) > len_rtol * scale:
+        return False
+    return (
+        abs(alpha - 90.0) <= ang_atol_deg
+        and abs(beta - 90.0) <= ang_atol_deg
+        and abs(gamma - 90.0) <= ang_atol_deg
+    )
+
+
+@dataclass(frozen=True)
+class CifCrystalInfo:
+    """Result of :func:`load_crystal_from_cif` (CalCrystal + cubic metadata)."""
+    cal: CalCrystal
+    cell: tuple[float, float, float, float, float, float]  # a,b,c,α,β,γ
+    is_cubic: bool
+    path: str
+    warning: str | None = None
+
+
+def load_crystal_from_cif(
+    path: str | Path,
+    *,
+    primitive: bool = False,
+    conventional_standard_structure: bool = True,
+) -> CifCrystalInfo:
+    """Load a CIF via py4DSTEM ``Crystal.from_CIF`` (needs pymatgen).
+
+    For Index BVM v1 (cubic metric): if the cell is not cubic, ``cal.a_lat`` is
+    still set to conventional ``a`` and ``warning`` explains the limitation.
+    """
+    from py4DSTEM.process.diffraction import Crystal
+
+    cif = Path(path)
+    if not cif.is_file():
+        raise FileNotFoundError(f"CIF not found: {cif}")
+    crystal = Crystal.from_CIF(
+        str(cif),
+        primitive=bool(primitive),
+        conventional_standard_structure=bool(conventional_standard_structure),
+    )
+    cell_arr = np.asarray(crystal.cell, dtype=float).ravel()
+    if cell_arr.size < 6:
+        raise ValueError(f"CIF cell incomplete ({cell_arr.size} values): {cif}")
+    cell = tuple(float(x) for x in cell_arr[:6])
+    a, b, c, alpha, beta, gamma = cell
+    cubic = is_approximately_cubic(cell)
+    if cubic:
+        a_lat = float(np.mean([a, b, c]))
+        warning = None
+    else:
+        a_lat = float(a)
+        warning = (
+            f"CIF cell is not cubic "
+            f"(a={a:.4f}, b={b:.4f}, c={c:.4f} Å; "
+            f"α={alpha:.1f}, β={beta:.1f}, γ={gamma:.1f}°). "
+            f"Index BVM v1 uses effective a={a_lat:.4f} Å (cubic metric)."
+        )
+    positions = tuple(map(tuple, np.asarray(crystal.positions, dtype=float)))
+    numbers = np.asarray(crystal.numbers).ravel().astype(int)
+    if numbers.size == 0:
+        raise ValueError(f"CIF has no atomic sites: {cif}")
+    uniq = sorted({int(z) for z in numbers.tolist()})
+    atom_num: int | list[int] = (
+        [int(z) for z in numbers.tolist()] if len(uniq) > 1 else int(uniq[0])
+    )
+    cal = CalCrystal(cif.stem, a_lat, atom_num, positions)
+    return CifCrystalInfo(
+        cal=cal,
+        cell=cell,
+        is_cubic=cubic,
+        path=str(cif.resolve()),
+        warning=warning,
+    )
+
 
 @dataclass(frozen=True)
 class StressMaterial:
@@ -289,6 +378,9 @@ class CalibrationParams:
     real_axis_v: list = field(default_factory=lambda: [-1, 1, 0])  # +rx (top→bottom)
     indexing_tol_px: float | None = None   # None → use max_peak_spacing
     indexing_seed: int = 0
+    # "unknown" = lattice + g1/g2 for Basis (no absolute hkl);
+    # "known" = anchor with zone + real axes + QR
+    indexing_orientation_mode: str = "unknown"
 
     # ── Strain mapping (cell 41) ──────────────────────────────────────────────
     coordinate_rotation: float = 0.0
@@ -302,8 +394,10 @@ class CalibrationParams:
     strain_show_orientation: bool = True  # if False, theta panel is hidden post-render
 
     # ── Q-pixel calibration crystal (structure factors) ──────────────────────
-    cal_crystal: str = DEFAULT_CAL_CRYSTAL           # "Si" | "Au" | "Custom"
+    # Shared with Index BVM (lattice_a). "CIF" uses cif_path via from_CIF.
+    cal_crystal: str = DEFAULT_CAL_CRYSTAL           # "Si" | "Au" | "Custom" | "CIF"
     custom_crystal: dict | None = None               # {a_lat, atom_num, positions}
+    cif_path: str | None = None                      # path to .cif when cal_crystal=="CIF"
 
     # ── Stress: sample material + symmetry (elastic constants) ────────────────
     stress_material: str = DEFAULT_STRESS_MATERIAL   # "Si" | … | "Custom"
@@ -317,7 +411,9 @@ class CalibrationParams:
         return asdict(self)
 
     def cal_crystal_obj(self) -> CalCrystal:
-        """Resolve the Q-pixel calibration crystal (incl. Custom)."""
+        """Resolve the Q-pixel / Index BVM crystal (Si/Au/Custom/CIF)."""
+        if self.cal_crystal == "CIF" and self.cif_path:
+            return load_crystal_from_cif(self.cif_path).cal
         if self.cal_crystal == "Custom" and self.custom_crystal:
             c = self.custom_crystal
             an = c.get("atom_num", 14)
@@ -383,6 +479,7 @@ class Scan:
                                        # pre-<step> baselines so re-testing/re-applying a
                                        # calibration starts from the clean state (no compounding)
     indexing_result: Any = None        # bvm_indexing.IndexingResult from IndexerDialog / index_bvm
+    orientation_peaks_result: Any = None  # orientation_peaks.OrientationPeaksResult (py4DSTEM GUI)
 
     def ensure_state(self) -> Any:
         if self.state is None:
@@ -1649,23 +1746,55 @@ def vc_read_virtual(scan: Scan, key: str):
 
 
 def vc_save_h5(scan: Scan, path: str, *, log: Log = None) -> str:
-    """Save the datacube (with its DP mean/max + ADF/BF tree) to an .h5 — the
-    notebook's ``py4DSTEM.save(path, datacube, tree=None, mode='o')``. Sets
-    ``scan.h5_path`` so the ADF preview / loader pick it up afterwards."""
+    """Save DP mean/max + ADF/BF onto an .h5.
+
+    When the target is the same EMD/HDF5 the cube was loaded from (tutorial /
+    simulation files), append/overwrite only the virtual-image children under
+    the existing DataCube path (``mode='ao'`` + ``emdpath``) so sibling groups
+    (polyAu, vacuum_probe, …) are preserved. New sidecar files for .mib scans
+    still use overwrite (``mode='o'``, ``tree=None``) like the notebook.
+    """
     import py4DSTEM
     st = scan.ensure_state()
     cube = getattr(st, "datacube", None)
     if cube is None:
         raise RuntimeError("No datacube to save.")
-    _log(log, f"[{scan.name}] saving virtual-images h5 → {path}")
-    py4DSTEM.save(path, cube, tree=None, mode="o")
-    scan.h5_path = str(path)
+
+    out = Path(path).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    emd_dp = (
+        getattr(st, "emd_datapath", None)
+        or getattr(cube, "_fast4d_emd_datapath", None)
+        or None
+    )
+    if isinstance(emd_dp, str):
+        emd_dp = emd_dp.strip() or None
+
+    raw = Path(scan.raw_path).expanduser() if scan.raw_path else None
+    same_source = (
+        out.exists()
+        and raw is not None
+        and raw.suffix.lower() in (".h5", ".hdf5", ".emd")
+        and out.resolve() == raw.resolve()
+    )
+    # Also append when writing back into an existing multi-cube EMD we know the path for.
+    append_in_place = bool(emd_dp) and (same_source or (out.exists() and out.suffix.lower() in (".h5", ".hdf5", ".emd")))
+
+    if append_in_place and emd_dp:
+        _log(log, f"[{scan.name}] appending virtual images into {out} @ {emd_dp}")
+        py4DSTEM.save(str(out), cube, tree=None, mode="ao", emdpath=str(emd_dp))
+    else:
+        _log(log, f"[{scan.name}] saving virtual-images h5 → {out}")
+        py4DSTEM.save(str(out), cube, tree=None, mode="o")
+
+    scan.h5_path = str(out)
     try:
-        st.precomputed_h5_path = Path(path)
+        st.precomputed_h5_path = out
     except Exception:
         pass
     _log(log, f"[{scan.name}] virtual-images h5 saved.")
-    return str(path)
+    return str(out)
 
 
 def compute_probe(scan: Scan, *, source: str | None = None, log: Log = None) -> None:
@@ -2127,12 +2256,22 @@ def apply_calibration(scan: Scan, *, log: Log = None) -> None:
 
 
 def _build_crystal(scan: Scan):
-    """Build a py4DSTEM Crystal from the scan's cal_crystal (Si/Au/Custom)."""
+    """Build a py4DSTEM Crystal from the scan's cal_crystal (Si/Au/Custom/CIF)."""
     import py4DSTEM
-    cc = scan.params.cal_crystal_obj()
-    if scan.params.cal_crystal in ("Si", "Au"):
+    p = scan.params
+    if p.cal_crystal == "CIF" and p.cif_path:
+        cif = Path(p.cif_path)
+        if not cif.is_file():
+            raise FileNotFoundError(f"CIF not found: {cif}")
+        return py4DSTEM.process.diffraction.Crystal.from_CIF(
+            str(cif),
+            primitive=False,
+            conventional_standard_structure=True,
+        )
+    cc = p.cal_crystal_obj()
+    if p.cal_crystal in ("Si", "Au"):
         # reuse the proven preset builder (Si=diamond, Au=fcc)
-        return _pipeline()._make_crystal(scan.params.cal_crystal)
+        return _pipeline()._make_crystal(p.cal_crystal)
     # Custom: build directly from the edited a_lat / atom_num / positions.
     # atom_num may be a single Z (all sites) or a per-site list (e.g. zincblende GaAs).
     positions = np.asarray(cc.positions, dtype=float)
@@ -2944,7 +3083,8 @@ def basis_preview(scan: Scan, *, log: Log = None):
     return fig
 
 
-def index_bvm(scan: Scan, *, log: Log = None, make_figure: bool = True):
+def index_bvm(scan: Scan, *, log: Log = None, make_figure: bool = True,
+              image_upsample: int = 1):
     """Prep calibrations through (not including) basis, then run BVM RANSAC+hkl indexing.
 
     Stages QR / basis detection params via ``update_strain_basis_params``, builds the
@@ -2979,13 +3119,14 @@ def index_bvm(scan: Scan, *, log: Log = None, make_figure: bool = True):
     Q_units = str(bp.calibration.get_Q_pixel_units())
     crystal = p.cal_crystal_obj()
     tol = float(p.indexing_tol_px) if p.indexing_tol_px is not None else float(p.max_peak_spacing)
+    orient_mode = str(getattr(p, "indexing_orientation_mode", "unknown") or "unknown")
 
     result = bix.index_bvm(
         bvm_cal, origin,
         Q_pixel=Q,
         Q_units=Q_units,
         lattice_a=float(crystal.a_lat),
-        zone_axis=list(p.zone_axis) or [1, 1, 0],
+        zone_axis=list(p.zone_axis) if p.zone_axis else None,
         real_axis_h=list(p.real_axis_h) or [0, 0, -1],
         real_axis_v=list(p.real_axis_v) or [-1, 1, 0],
         qr_rotation_deg=float(p.qr_rotation),
@@ -2996,9 +3137,13 @@ def index_bvm(scan: Scan, *, log: Log = None, make_figure: bool = True):
         min_absolute_intensity=float(p.min_absolute_intensity),
         max_num_peaks=int(p.max_num_peaks),
         edge_boundary=float(p.edge_boundary),
+        orientation_mode=orient_mode,
+        image_upsample=int(image_upsample),
     )
     scan.indexing_result = result
-    _log(log, f"[{scan.name}] BVM indexing: {result.n_inliers}/{len(result.peaks)} inliers; "
+    _log(log, f"[{scan.name}] BVM indexing ({orient_mode}"
+              f"{', anchored' if result.metrics.get('anchored') else ''}): "
+              f"{result.n_inliers}/{len(result.peaks)} inliers; "
               f"propose origin={result.index_origin} g1={result.index_g1} g2={result.index_g2} "
               f"({result.metrics.get('g1_hkl_str')}/{result.metrics.get('g2_hkl_str')})")
 
@@ -3023,6 +3168,146 @@ def apply_indexing_to_basis_params(scan: Scan, result=None, *, log: Log = None) 
     p.basis_manual_enabled = True
     _log(log, f"[{scan.name}] basis indices from indexing: "
               f"origin={p.index_origin} g1={p.index_g1} g2={p.index_g2}")
+
+
+def run_orientation_peaks(
+    scan: Scan,
+    *,
+    mode: str = "known_generate",
+    k_max: float = 1.2,
+    tol_px: float | None = None,
+    accel_voltage: float = 300_000.0,
+    angle_step_zone_axis: float = 4.0,
+    angle_step_in_plane: float = 4.0,
+    image_upsample: int = 1,
+    make_figure: bool = True,
+    log: Log = None,
+):
+    """py4DSTEM orientation → peaks (separate from Index BVM / strain pipeline).
+
+    ``mode``: ``known_generate`` (Path A) or ``acom_match`` (Path B).
+    Stores ``scan.orientation_peaks_result``. Does not write basis params until
+    :func:`apply_orientation_peaks_to_basis_params`.
+    """
+    import orientation_peaks as op
+
+    pl = _pipeline()
+    st = scan.ensure_state()
+    p = scan.params
+    apply_calibrations_through(scan, "basis", inclusive=False, log=log)
+    pl.update_strain_basis_params(
+        st,
+        min_spacing=int(p.min_spacing),
+        min_absolute_intensity=int(p.min_absolute_intensity),
+        max_num_peaks=int(p.max_num_peaks),
+        edge_boundary=int(p.edge_boundary),
+        vmin=float(p.vis_vmin), vmax=float(p.vis_vmax),
+        qr_rotation=float(p.qr_rotation), qr_flip=bool(p.qr_flip),
+        manual_enabled=False,
+        log=log,
+    )
+    bp = getattr(st, "braggpeaks", None)
+    if bp is None:
+        raise RuntimeError(f"[{scan.name}] no braggpeaks loaded for orientation peaks")
+
+    bvm_cal = np.asarray(bp.histogram(mode="cal", sampling=1).data, dtype=float)
+    origin = np.asarray(bp.calibration.get_origin_mean(), dtype=float)
+    Q = float(bp.calibration.get_Q_pixel_size())
+    Q_units = str(bp.calibration.get_Q_pixel_units())
+    tol = float(tol_px) if tol_px is not None else (
+        float(p.indexing_tol_px) if p.indexing_tol_px is not None else float(p.max_peak_spacing)
+    )
+    crystal = _build_crystal(scan)
+    cal = p.cal_crystal_obj()
+    crystal_name = str(getattr(cal, "name", p.cal_crystal) or p.cal_crystal)
+    crystal_key = (
+        f"CIF:{Path(p.cif_path).resolve()}"
+        if p.cal_crystal == "CIF" and p.cif_path
+        else f"{p.cal_crystal}:{float(cal.a_lat):.6f}"
+    )
+    zone = list(p.zone_axis) if p.zone_axis else [1, 1, 0]
+    proj = list(p.real_axis_h) if p.real_axis_h else [0, 0, -1]
+
+    m = (mode or "known_generate").strip().lower()
+    if m in ("known", "a", "generate", "known_generate"):
+        result = op.run_known_generate(
+            crystal=crystal,
+            crystal_name=crystal_name,
+            bvm=bvm_cal,
+            origin_px=origin,
+            Q_pixel=Q,
+            Q_units=Q_units,
+            zone_axis=zone,
+            proj_x_lattice=proj,
+            k_max=float(k_max),
+            tol_px=tol,
+            accel_voltage=float(accel_voltage),
+            min_spacing=float(p.min_spacing),
+            min_absolute_intensity=float(p.min_absolute_intensity),
+            max_num_peaks=int(p.max_num_peaks),
+            edge_boundary=float(p.edge_boundary),
+            image_upsample=int(image_upsample),
+            log=log,
+        )
+    elif m in ("acom", "b", "match", "acom_match"):
+        result = op.run_acom_match(
+            crystal=crystal,
+            crystal_key=crystal_key,
+            crystal_name=crystal_name,
+            bvm=bvm_cal,
+            origin_px=origin,
+            Q_pixel=Q,
+            Q_units=Q_units,
+            k_max=float(k_max),
+            tol_px=tol,
+            accel_voltage=float(accel_voltage),
+            angle_step_zone_axis=float(angle_step_zone_axis),
+            angle_step_in_plane=float(angle_step_in_plane),
+            min_spacing=float(p.min_spacing),
+            min_absolute_intensity=float(p.min_absolute_intensity),
+            max_num_peaks=int(p.max_num_peaks),
+            edge_boundary=float(p.edge_boundary),
+            image_upsample=int(image_upsample),
+            log=log,
+        )
+    else:
+        raise ValueError(f"mode must be known_generate or acom_match (got {mode!r})")
+
+    scan.orientation_peaks_result = result
+    _log(
+        log,
+        f"[{scan.name}] orientation peaks ({result.mode}): "
+        f"matched {result.n_matched}/{result.n_theoretical}  rms={result.rms_px:.3f} px  "
+        f"propose origin={result.index_origin} g1={result.index_g1} g2={result.index_g2}",
+    )
+    if make_figure:
+        try:
+            fig = op.make_orientation_peaks_figure(
+                result,
+                title=f"{scan.name} — Orient. peaks [{result.mode}]",
+                indexing_result=scan.indexing_result,
+            )
+            register_figure(scan, "orientation_peaks", fig, force=True)
+        except Exception as exc:
+            _log(log, f"[{scan.name}] orientation_peaks figure skipped: {exc}")
+    return result
+
+
+def apply_orientation_peaks_to_basis_params(scan: Scan, result=None, *, log: Log = None) -> None:
+    """Write Orient. peaks proposal into ``scan.params`` (g1/g2 + QR / coord rot)."""
+    result = result if result is not None else scan.orientation_peaks_result
+    if result is None:
+        raise RuntimeError(f"[{scan.name}] no orientation_peaks_result — run Orient. peaks first")
+    apply_indexing_to_basis_params(scan, result, log=log)
+    p = scan.params
+    qr = getattr(result, "suggested_qr_rotation_deg", None)
+    cr = getattr(result, "suggested_coordinate_rotation_deg", None)
+    if qr is not None and np.isfinite(float(qr)):
+        p.qr_rotation = float(qr)
+        _log(log, f"[{scan.name}] qr_rotation ← {p.qr_rotation:.3f}° (from Orient. peaks)")
+    if cr is not None and np.isfinite(float(cr)):
+        p.coordinate_rotation = float(cr)
+        _log(log, f"[{scan.name}] coordinate_rotation ← {p.coordinate_rotation:.3f}° (from Orient. peaks)")
 
 
 def run_calibration_sequence(scan: Scan, *, make_figures: bool = True,

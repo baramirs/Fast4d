@@ -12,6 +12,10 @@ class WorkflowState:
     raw_mib_path: Path | None = None
     precomputed_h5_path: Path | None = None
     vacuum_mib_path: Path | None = None
+    # EMD group path used when loading a multi-cube .h5 (e.g.
+    # ``4DSTEM_simulation/4DSTEM_AuNanoplatelet``). Used to append ADF/BF
+    # back into the same file instead of writing a new sidecar.
+    emd_datapath: str | None = None
 
     datacube: Any = None
     visualcube: Any = None
@@ -159,6 +163,7 @@ class WorkflowState:
         self.visualcube = None
         self.virtual_images.clear()
         self.recommended_q_pixel_A_inv_per_px = None
+        self.emd_datapath = None
 
     def reset_probe_products(self) -> None:
         self.vacuumcube = None

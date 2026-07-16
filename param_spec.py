@@ -63,7 +63,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("ellipse_use_roi", "Use ROI", "bool"),
     ],
     "qpixel": [
-        ParamSpec("cal_crystal", "Crystal", "enum", ("Si", "Au", "Custom")),
+        ParamSpec("cal_crystal", "Crystal", "enum", ("Si", "Au", "Custom", "CIF")),
+        ParamSpec("cif_path", "CIF path", "scan_path", readonly=True),
         ParamSpec("q_refit", "Refit px (off = use guess)", "bool"),
         ParamSpec("q_px", "px_guess (A^-1/px)", "float", decimals=5),
         ParamSpec("q_px_fitted", "px_fitted (A^-1/px)", "fitted", decimals=5, readonly=True),
@@ -87,6 +88,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("zone_axis", "Zone axis [uvw]", "list3"),
         ParamSpec("real_axis_h", "Real axis H (+ry)", "list3"),
         ParamSpec("real_axis_v", "Real axis V (+rx)", "list3"),
+        ParamSpec("indexing_orientation_mode", "Index orientation", "enum",
+                  ("unknown", "known")),
         ParamSpec("indexing_seed", "Indexing RANSAC seed", "int"),
     ],
     "strain": [

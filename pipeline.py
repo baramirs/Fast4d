@@ -225,41 +225,180 @@ def _coerce_loaded_to_datacube(obj: Any, *, source: str):
     )
 
 
+def _discover_emd_datacube_paths(h5_path: Path) -> list[str]:
+    """Find EMD Array groups that look like 4D DataCubes (tutorial / emdfile layout).
+
+    Matches the py4DSTEM tutorial pattern::
+
+        py4DSTEM.read(filepath, datapath='4DSTEM_simulation/4DSTEM_polyAu')
+
+    Legacy Fast4D files use ``datacube_root``; tutorial EMD files use a named root
+    with one or more ``DataCube`` children (no virtual-image tree until computed).
+    """
+    found: list[tuple[str, tuple[int, ...]]] = []
+    try:
+        import h5py
+
+        with h5py.File(h5_path, "r") as h5:
+            def visitor(name: str, obj) -> None:
+                if not isinstance(obj, h5py.Group):
+                    return
+                leaf = name.split("/")[-1]
+                if leaf == "datacube_root":
+                    # Prefer the group itself as a datapath (legacy visualcube/root).
+                    # Shape unknown here — rank later.
+                    found.append((name, (0, 0, 0, 0)))
+                    return
+                py_cls = str(obj.attrs.get("python_class", "") or "")
+                data = obj.get("data", None)
+                if data is None or not isinstance(data, h5py.Dataset):
+                    return
+                shape = tuple(int(s) for s in data.shape)
+                is_cube = (
+                    py_cls == "DataCube"
+                    or (len(shape) == 4 and str(obj.attrs.get("emd_group_type", "")) == "array")
+                )
+                if is_cube and len(shape) == 4:
+                    found.append((name, shape))
+
+            h5.visititems(visitor)
+    except Exception:
+        return []
+
+    # Rank: larger 4D cubes first; keep order stable otherwise.
+    found.sort(key=lambda t: int(np.prod(t[1])) if t[1] != (0, 0, 0, 0) else -1, reverse=True)
+    out: list[str] = []
+    for path, _shape in found:
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def _rank_datapaths_for_file(paths: list[str], h5_path: Path) -> list[str]:
+    """Prefer a cube whose name overlaps the filename (e.g. AuNanoplatelet)."""
+    stem_c = h5_path.stem.lower().replace("-", "").replace("_", "")
+
+    def score(p: str) -> int:
+        leaf = p.split("/")[-1].lower().replace("-", "_")
+        leaf_core = leaf
+        for prefix in ("4dstem_", "datacube_", "dc_"):
+            if leaf_core.startswith(prefix):
+                leaf_core = leaf_core[len(prefix):]
+        leaf_core = leaf_core.replace("_", "")
+        if leaf == "datacube_root":
+            return -1
+        if leaf_core and len(leaf_core) >= 4 and leaf_core in stem_c:
+            return 100 + len(leaf_core)
+        # Partial token hits (e.g. filename has Au + cube is polyAu — weaker)
+        tokens = [t for t in leaf.replace("4dstem", "").split("_") if len(t) >= 4]
+        hits = sum(1 for t in tokens if t.replace("_", "") in stem_c)
+        return hits
+
+    return sorted(paths, key=score, reverse=True)
+
+
+def _candidate_datapaths(h5_path: Path) -> list[str | None]:
+    """Return possible py4DSTEM datapaths without changing the HDF5 file.
+
+    Order: filename-ranked DataCube paths → legacy ``datacube_root`` → ``None``.
+    """
+    discovered = _discover_emd_datacube_paths(h5_path)
+    ranked = _rank_datapaths_for_file(discovered, h5_path) if discovered else []
+
+    candidates: list[str | None] = []
+    for p in ranked:
+        if p not in candidates:
+            candidates.append(p)
+    if "datacube_root" not in candidates:
+        candidates.append("datacube_root")
+    candidates.append(None)
+
+    unique: list[str | None] = []
+    for item in candidates:
+        if item not in unique:
+            unique.append(item)
+    return unique
+
+
 def _load_emd_h5_datacube(
     path: Path,
     *,
     emd_datapath: str | None = None,
     log: Callable[[str], None] | None = None,
 ):
+    """Load a 4D DataCube from EMD/HDF5 (Fast4D ``datacube_root`` or tutorial trees).
+
+    Tutorial files (py4DSTEM basics notebook) store cubes under paths like
+    ``4DSTEM_simulation/4DSTEM_AuNanoplatelet`` and often have no precomputed
+    virtual-image tree. Some cubes fail ``tree=True`` in py4DSTEM/emdfile
+    (``dictionary changed size during iteration``); we fall back to ``tree=False``.
+    """
     import py4DSTEM
 
     paths_to_try: list[str | None] = []
     if emd_datapath is not None:
         paths_to_try.append(emd_datapath)
-    paths_to_try.append(None)
-    paths_to_try.append("datacube_root")
+    # Prefer discovered DataCube groups (tutorial EMD) over blind None / datacube_root.
     for extra in _candidate_datapaths(path):
         if extra not in paths_to_try:
             paths_to_try.append(extra)
 
     last_exc: Exception | None = None
-    for dp in paths_to_try:
-        try:
-            out = py4DSTEM.read(filepath=str(path), datapath=dp, tree=True)
-            if isinstance(out, list):
-                _log(log, f"py4DSTEM.read: multiple EMD roots for datapath={dp!r}; trying each.")
-                for item in out:
-                    try:
-                        return _coerce_loaded_to_datacube(item, source=str(path))
-                    except ValueError:
-                        continue
-                continue
-            return _coerce_loaded_to_datacube(out, source=str(path))
-        except Exception as exc:
-            last_exc = exc
-            continue
+    tried: list[str] = []
 
-    raise RuntimeError(f"Failed to read EMD/HDF5 as a 4D DataCube: {path}. Last error: {last_exc}") from last_exc
+    def _try_coerce(out: Any, *, label: str, tree_flag: bool):
+        if isinstance(out, list):
+            _log(log, f"py4DSTEM.read: multiple EMD roots for datapath={label!r}; trying each.")
+            for item in list(out):
+                try:
+                    cube = _coerce_loaded_to_datacube(item, source=str(path))
+                    _log(
+                        log,
+                        f"Loaded DataCube from datapath={label} "
+                        f"(tree={tree_flag}) shape={getattr(cube, 'shape', None)}",
+                    )
+                    return cube
+                except ValueError:
+                    continue
+            return None
+        cube = _coerce_loaded_to_datacube(out, source=str(path))
+        _log(
+            log,
+            f"Loaded DataCube from datapath={label} "
+            f"(tree={tree_flag}) shape={getattr(cube, 'shape', None)}",
+        )
+        return cube
+
+    for dp in paths_to_try:
+        label = "<root>" if dp is None else str(dp)
+        # tree=True first (legacy Fast4D trees); tree=False for tutorial cubes
+        # that crash emdfile when expanding children.
+        for tree_flag in (True, False):
+            tried.append(f"{label}[tree={tree_flag}]")
+            try:
+                kwargs: dict[str, Any] = {"filepath": str(path), "tree": tree_flag}
+                if dp is not None:
+                    kwargs["datapath"] = dp
+                out = py4DSTEM.read(**kwargs)
+                cube = _try_coerce(out, label=label, tree_flag=tree_flag)
+                if cube is not None:
+                    # Remember the EMD path so Save can append ADF/BF into this file.
+                    if dp is not None:
+                        try:
+                            setattr(cube, "_fast4d_emd_datapath", str(dp))
+                        except Exception:
+                            pass
+                    return cube
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+    raise RuntimeError(
+        f"Failed to read EMD/HDF5 as a 4D DataCube: {path}. "
+        f"Tried datapaths: {tried}. Last error: {last_exc}. "
+        f"Hint: py4DSTEM.print_h5_tree(r'{path}') and pass the DataCube path "
+        f"(e.g. '4DSTEM_simulation/4DSTEM_AuNanoplatelet')."
+    ) from last_exc
 
 
 def _load_npz_datacube(path: Path):
@@ -607,33 +746,9 @@ def _load_datacube_root(h5_path: Path):
     return py4DSTEM.read(filepath=str(h5_path), datapath="datacube_root")
 
 
-def _candidate_datapaths(h5_path: Path) -> list[str | None]:
-    """Return possible py4DSTEM datapaths without changing the HDF5 file."""
-
-    candidates: list[str | None] = ["datacube_root"]
-    try:
-        import h5py
-
-        with h5py.File(h5_path, "r") as h5:
-            def visitor(name: str, obj) -> None:
-                if name.split("/")[-1] == "datacube_root":
-                    candidates.append(name)
-
-            h5.visititems(visitor)
-    except Exception:
-        pass
-
-    candidates.append(None)
-
-    unique: list[str | None] = []
-    for item in candidates:
-        if item not in unique:
-            unique.append(item)
-    return unique
-
-
-def _has_required_virtual_images(obj: Any) -> bool:
-    for key in VIRTUAL_IMAGE_KEYS:
+def _has_required_virtual_images(obj: Any, *, keys: tuple[str, ...] | None = None) -> bool:
+    need = keys if keys is not None else VIRTUAL_IMAGE_KEYS
+    for key in need:
         try:
             _read_tree(obj, key)
         except Exception:
@@ -641,19 +756,47 @@ def _has_required_virtual_images(obj: Any) -> bool:
     return True
 
 
+def _has_any_virtual_image(obj: Any, *, keys: tuple[str, ...] = ("annular_dark_field", "bright_field")) -> bool:
+    return any(_has_required_virtual_images(obj, keys=(k,)) for k in keys)
+
+
 def _load_visualcube_from_h5(h5_path: Path, log: Callable[[str], None] | None = None):
-    """Load the object that owns the precomputed virtual-image tree."""
+    """Load the object that owns the precomputed virtual-image tree.
+
+    Fast4D legacy files use ``datacube_root``. Tutorial / simulation EMDs may
+    store ADF/BF as children of a named DataCube after virtualization is saved
+    back into the same file. Callers should fall back to loading the raw cube
+    when nothing is found.
+    """
 
     import py4DSTEM
 
+    # Prefer legacy root, then discovered DataCube paths (post-append saves).
+    candidates: list[str | None] = ["datacube_root"]
+    for p in _discover_emd_datacube_paths(h5_path):
+        if p not in candidates and p != "datacube_root":
+            candidates.append(p)
+    candidates.append(None)
+
     errors: list[str] = []
-    for datapath in _candidate_datapaths(h5_path):
+    partial: Any = None
+    for datapath in candidates:
         label = "<root>" if datapath is None else datapath
         try:
-            if datapath is None:
-                obj = py4DSTEM.read(filepath=str(h5_path))
-            else:
-                obj = py4DSTEM.read(filepath=str(h5_path), datapath=datapath)
+            kwargs: dict[str, Any] = {"filepath": str(h5_path)}
+            if datapath is not None:
+                kwargs["datapath"] = datapath
+            # Prefer tree=True so child virtual images are attached; fall back.
+            obj = None
+            last_exc: Exception | None = None
+            for tree_flag in (True, False):
+                try:
+                    obj = py4DSTEM.read(**kwargs, tree=tree_flag)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if obj is None:
+                raise last_exc or RuntimeError("read failed")
         except Exception as exc:
             errors.append(f"{label}: read failed ({exc})")
             continue
@@ -661,9 +804,21 @@ def _load_visualcube_from_h5(h5_path: Path, log: Callable[[str], None] | None = 
         if _has_required_virtual_images(obj):
             _log(log, f"Found precomputed virtual-image tree at datapath: {label}")
             return obj
-        errors.append(f"{label}: readable but missing one or more virtual images")
+        if partial is None and _has_any_virtual_image(obj):
+            partial = obj
+            _log(log, f"Found partial virtual images at datapath: {label}")
+            errors.append(f"{label}: partial virtual images (ADF/BF present; not full set)")
+        else:
+            errors.append(f"{label}: readable but missing one or more virtual images")
 
-    raise RuntimeError("No readable datapath with all required virtual images. Tried: " + " | ".join(errors))
+    if partial is not None:
+        return partial
+
+    raise RuntimeError(
+        "No precomputed virtual-image tree in this HDF5 "
+        "(normal for tutorial/simulation EMDs before Save .h5). "
+        "Tried: " + " | ".join(errors)
+    )
 
 
 def _read_tree(obj: Any, key: str):
@@ -741,8 +896,11 @@ def load_data_step(
             _log(log, _shape_message("visualcube", state.visualcube))
         except Exception as exc:
             state.visualcube = None
-            _log(log, f"Warning: .h5 exists but no valid virtual-image tree was loaded: {exc}")
-            _log(log, "Fallback: loading raw scan file.")
+            _log(
+                log,
+                "No precomputed virtual images in .h5 (expected for tutorial/sim EMDs); "
+                f"loading raw DataCube instead. Detail: {exc}",
+            )
     else:
         _log(log, f"Optional .h5 not found: {h5_path}")
         _log(log, "Fallback: loading raw scan file.")
@@ -750,6 +908,10 @@ def load_data_step(
     state.datacube = _load_raw_datacube(raw_path, log=log)
     _log(log, f"Loaded raw data: {raw_path}")
     _log(log, _shape_message("datacube", state.datacube))
+    emd_dp = getattr(state.datacube, "_fast4d_emd_datapath", None)
+    if isinstance(emd_dp, str) and emd_dp.strip():
+        state.emd_datapath = emd_dp.strip()
+        _log(log, f"EMD datapath for this cube: {state.emd_datapath}")
 
     state.recommended_q_pixel_A_inv_per_px = None
     meta_path = raw_path.with_name(f"{raw_path.stem}_meta.json")
@@ -1185,7 +1347,11 @@ def try_load_adf_from_sidecar_h5(
             return None
         return arr
     except Exception as exc:
-        _log(log, f"ADF preview unavailable for {raw.name}: {exc}")
+        _log(
+            log,
+            f"ADF preview skipped for {raw.name} (no precomputed virtual images; "
+            f"compute ADF after loading the cube). Detail: {exc}",
+        )
         return None
 
 

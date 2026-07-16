@@ -154,6 +154,102 @@ class TestIndexBvmSynthetic:
         assert int(np.sum(lat["inliers"])) >= 8
 
 
+def _make_synthetic_bvm(N=128, origin=None, a_px=None, b_px=None):
+    origin = np.asarray(origin if origin is not None else [64.0, 64.0], dtype=float)
+    a_px = np.asarray(a_px if a_px is not None else [12.0, 4.0], dtype=float)
+    b_px = np.asarray(b_px if b_px is not None else [-3.0, 11.0], dtype=float)
+    bvm_img = np.zeros((N, N), dtype=float)
+    for m in range(-3, 4):
+        for n in range(-3, 4):
+            cx = int(round(origin[0] + m * a_px[0] + n * b_px[0]))
+            cy = int(round(origin[1] + m * a_px[1] + n * b_px[1]))
+            if 2 <= cx < N - 2 and 2 <= cy < N - 2:
+                bvm_img[cx, cy] = 500.0 / (1.0 + 0.15 * (abs(m) + abs(n)))
+    return bvm_img, origin
+
+
+class TestOrientationModes:
+    def test_unknown_proposes_without_anchor(self):
+        bvm_img, origin = _make_synthetic_bvm()
+        Q = 0.02
+        result = bvm.index_bvm(
+            bvm_img, origin,
+            Q_pixel=Q,
+            lattice_a=5.4309,
+            zone_axis=None,
+            tol_px=2.5,
+            seed=0,
+            min_spacing=5,
+            min_absolute_intensity=20,
+            max_num_peaks=40,
+            edge_boundary=2,
+            subpixel="pixel",
+            orientation_mode="unknown",
+        )
+        assert result.metrics["orientation_mode"] == "unknown"
+        assert result.metrics["anchored"] is False
+        assert result.index_g1 != result.index_origin
+        assert result.index_g2 != result.index_origin
+        assert result.n_inliers >= 8
+        assert result.qr_sign == 0
+
+    def test_unknown_with_zone_gives_relative_hkl(self):
+        bvm_img, origin = _make_synthetic_bvm()
+        result = bvm.index_bvm(
+            bvm_img, origin,
+            Q_pixel=0.02,
+            lattice_a=5.4309,
+            zone_axis=[1, 1, 0],
+            tol_px=2.5,
+            seed=0,
+            min_spacing=5,
+            min_absolute_intensity=20,
+            max_num_peaks=40,
+            edge_boundary=2,
+            subpixel="pixel",
+            orientation_mode="unknown",
+        )
+        assert result.metrics["anchored"] is False
+        # Relative labels may or may not match ZOLZ depending on magnitudes;
+        # at least the mode flag must be honest.
+        assert result.metrics["orientation_mode"] == "unknown"
+
+    def test_known_inconsistent_qr0_raises_with_hint(self):
+        # Demo-like g vectors need QR≈135°; QR=0 must fail absolute anchoring.
+        g1 = np.array([-26.88, 26.86])
+        g2 = np.array([-18.54, -18.88])
+        Q = 0.01382376
+        mag1 = float(np.hypot(*(g1 * Q)))
+        mag2 = float(np.hypot(*(g2 * Q)))
+        with pytest.raises(RuntimeError, match="Unknown orientation"):
+            bvm.anchor_hkl_with_real_axes(
+                g1, g2, mag1, mag2,
+                zone_axis=[1, 1, 0],
+                real_axis_h=[0, 0, -1],
+                real_axis_v=[-1, 1, 0],
+                qr_rotation_deg=0.0,
+                lattice_a=5.4309,
+            )
+
+    def test_known_happy_path_still_anchors(self):
+        g1 = np.array([-26.88, 26.86])
+        g2 = np.array([-18.54, -18.88])
+        Q = 0.01382376
+        mag1 = float(np.hypot(*(g1 * Q)))
+        mag2 = float(np.hypot(*(g2 * Q)))
+        G1, G2, s = bvm.anchor_hkl_with_real_axes(
+            g1, g2, mag1, mag2,
+            zone_axis=[1, 1, 0],
+            real_axis_h=[0, 0, -1],
+            real_axis_v=[-1, 1, 0],
+            qr_rotation_deg=135.0,
+            lattice_a=5.4309,
+        )
+        assert int(np.dot(G1, [1, 1, 0])) == 0
+        assert int(np.dot(G2, [1, 1, 0])) == 0
+        assert s in (+1, -1)
+
+
 DEMO_BP = Path(r"C:\Users\jtapiaca.ASURITE\Desktop\Demo\256x256_Demo_braggpeaks.h5")
 DEMO_MANIFEST = Path(
     r"C:\Users\jtapiaca.ASURITE\Desktop\Demo\256x256_Demo\data\strain_manifest.json"
@@ -223,6 +319,7 @@ class TestDemoRegression:
             min_absolute_intensity=int(cbv["minAbsoluteIntensity"]),
             max_num_peaks=int(cbv["maxNumPeaks"]),
             edge_boundary=int(cbv["edgeBoundary"]),
+            orientation_mode="known",
         )
 
         g1_ref = np.asarray(sbp["g1_qxy"], dtype=float)

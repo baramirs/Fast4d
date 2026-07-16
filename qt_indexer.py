@@ -1,8 +1,8 @@
-"""qt_indexer — IndexerDialog: BVM RANSAC + hkl indexing before Basis setup.
+"""qt_indexer — IndexerDialog: BVM RANSAC + hkl indexing (Plugin menu).
 
-Modeless dialog opened from the Basis toolbar ("Index BVM…"). Runs
-``engine.index_bvm``, shows overlay + peak table, and on Send writes
-``index_origin/g1/g2`` + ``basis_manual_enabled=True`` into ``scan.params``.
+Modeless dialog opened from **Plugin → Index BVM**. Runs ``engine.index_bvm``,
+shows overlay + peak table, and on Send writes ``index_origin/g1/g2`` +
+``basis_manual_enabled=True`` into ``scan.params``.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def _parse_ivec3(text: str, default: list[int]) -> list[int]:
 class IndexerDialog(QtWidgets.QDialog):
     """BVM indexing tool: Run → table/overlay → Send to Fast4D / Export."""
 
-    def __init__(self, host) -> None:
+    def __init__(self, host, prefer_mode: str | None = None) -> None:
         super().__init__(host)
         _enable_minmax(self)
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -56,23 +56,77 @@ class IndexerDialog(QtWidgets.QDialog):
         panel = QtWidgets.QWidget(); panel.setMaximumWidth(360)
         v = QtWidgets.QVBoxLayout(panel)
         v.addWidget(QtWidgets.QLabel(
-            "<b>Index BVM</b> — RANSAC + hkl (zone axis) before Basis setup"))
+            "<b>Index BVM</b> — Plugin: RANSAC + hkl (before Basis)"))
 
         p = self._sc.params if self._sc else E.CalibrationParams()
-        crystal = p.cal_crystal_obj()
-        v.addWidget(QtWidgets.QLabel(
-            f"Crystal: <b>{crystal.name}</b>  a = {crystal.a_lat:.4f} Å"))
+        self._lbl_crystal = QtWidgets.QLabel("")
+        self._lbl_crystal.setWordWrap(True)
+        self._lbl_cif_warn = QtWidgets.QLabel("")
+        self._lbl_cif_warn.setWordWrap(True)
+        self._lbl_cif_warn.setStyleSheet("color:#E65100; font-size:11px;")
+        v.addWidget(self._lbl_crystal)
+        v.addWidget(self._lbl_cif_warn)
+        btn_cif = QtWidgets.QPushButton("Load CIF…")
+        btn_cif.setToolTip(
+            "Load a crystallographic CIF as the reference crystal "
+            "(shared with Q-pixel when cal_crystal=CIF)."
+        )
+        btn_cif.clicked.connect(self._load_cif)
+        v.addWidget(btn_cif)
+        self._refresh_crystal_label()
 
-        self._ed_zone = self._line_row(v, "Zone axis [uvw]",
-                                       ",".join(str(int(x)) for x in (p.zone_axis or [1, 1, 0])))
-        self._ed_h = self._line_row(v, "Real axis H (+ry)",
-                                    ",".join(str(int(x)) for x in (p.real_axis_h or [0, 0, -1])))
-        self._ed_v = self._line_row(v, "Real axis V (+rx)",
-                                    ",".join(str(int(x)) for x in (p.real_axis_v or [-1, 1, 0])))
+        # Orientation mode: Unknown = lattice + g1/g2 for Basis; Known = absolute hkl
+        mode0 = str(prefer_mode or getattr(p, "indexing_orientation_mode", "unknown") or "unknown").lower()
+        if mode0 not in ("unknown", "known"):
+            mode0 = "unknown"
+        row_mode = QtWidgets.QHBoxLayout()
+        row_mode.addWidget(QtWidgets.QLabel("Orientation"))
+        self._cmb_orient = QtWidgets.QComboBox()
+        self._cmb_orient.addItem("Unknown (lattice → Basis)", "unknown")
+        self._cmb_orient.addItem("Known (zone + real axes + QR)", "known")
+        self._cmb_orient.setCurrentIndex(0 if mode0 == "unknown" else 1)
+        self._cmb_orient.setToolTip(
+            "Unknown: propose origin/g1/g2 without absolute Miller orientation.\n"
+            "Known: require zone axis, real axes H/V, and QR to anchor hkl signs."
+        )
+        self._cmb_orient.currentIndexChanged.connect(self._on_orient_mode)
+        row_mode.addWidget(self._cmb_orient, 1)
+        v.addLayout(row_mode)
+
+        self._ed_zone, self._lbl_zone = self._line_row(
+            v, "Zone axis [uvw]",
+            ",".join(str(int(x)) for x in (p.zone_axis or [1, 1, 0])),
+            return_label=True,
+        )
+        self._ed_zone.setPlaceholderText("optional in Unknown (relative hkl)")
+        self._ed_h, self._lbl_h = self._line_row(
+            v, "Real axis H (+ry)",
+            ",".join(str(int(x)) for x in (p.real_axis_h or [0, 0, -1])),
+            return_label=True,
+        )
+        self._ed_v, self._lbl_v = self._line_row(
+            v, "Real axis V (+rx)",
+            ",".join(str(int(x)) for x in (p.real_axis_v or [-1, 1, 0])),
+            return_label=True,
+        )
+        self._on_orient_mode()
 
         tol0 = float(p.indexing_tol_px) if p.indexing_tol_px is not None else float(p.max_peak_spacing)
         self._sp_tol = self._dspin_row(v, "Tolerance (px)", 0.1, 50.0, tol0, 0.1, 2)
         self._sp_seed = self._ispin_row(v, "RANSAC seed", 0, 99999, int(p.indexing_seed))
+
+        row_up = QtWidgets.QHBoxLayout()
+        row_up.addWidget(QtWidgets.QLabel("Peak sampling"))
+        self._cmb_upsample = QtWidgets.QComboBox()
+        for f in (1, 2, 4):
+            self._cmb_upsample.addItem(f"{f}×", f)
+        self._cmb_upsample.setCurrentIndex(0)
+        self._cmb_upsample.setToolTip(
+            "Spatial upsampling of the BVM before peak detection (sub-pixel). "
+            "1× = default; 2×/4× can refine peak positions."
+        )
+        row_up.addWidget(self._cmb_upsample, 1)
+        v.addLayout(row_up)
 
         for txt, fn, tip in (
             ("Run indexing", self._run, "Prep upstream calibrations + RANSAC + hkl assign."),
@@ -120,11 +174,13 @@ class IndexerDialog(QtWidgets.QDialog):
         lay.addWidget(panel)
 
     # ── widgets ────────────────────────────────────────────────────────────
-    def _line_row(self, layout, label, text):
+    def _line_row(self, layout, label, text, *, return_label: bool = False):
         row = QtWidgets.QHBoxLayout()
         lbl = QtWidgets.QLabel(label); lbl.setMinimumWidth(130)
         ed = QtWidgets.QLineEdit(text)
         row.addWidget(lbl); row.addWidget(ed, 1); layout.addLayout(row)
+        if return_label:
+            return ed, lbl
         return ed
 
     def _ispin_row(self, layout, label, lo, hi, val):
@@ -142,13 +198,98 @@ class IndexerDialog(QtWidgets.QDialog):
         row.addWidget(lbl); row.addWidget(s, 1); layout.addLayout(row)
         return s
 
+    def _orient_mode(self) -> str:
+        data = self._cmb_orient.currentData()
+        return str(data or "unknown")
+
+    def _on_orient_mode(self, *_args) -> None:
+        known = self._orient_mode() == "known"
+        for w in (self._ed_h, self._lbl_h, self._ed_v, self._lbl_v):
+            w.setEnabled(known)
+        self._lbl_zone.setText(
+            "Zone axis [uvw]" if known else "Zone axis [uvw] (opt.)"
+        )
+        tip = (
+            "Required for absolute hkl anchoring."
+            if known else
+            "Optional: enables relative ZOLZ hkl labels (signs not anchored)."
+        )
+        self._ed_zone.setToolTip(tip)
+
+    def _refresh_crystal_label(self) -> None:
+        p = self._sc.params if self._sc else E.CalibrationParams()
+        warn = ""
+        try:
+            if p.cal_crystal == "CIF" and p.cif_path:
+                info = E.load_crystal_from_cif(p.cif_path)
+                crystal = info.cal
+                src = Path(info.path).name
+                if info.warning:
+                    warn = info.warning
+                text = (
+                    f"Crystal: <b>{crystal.name}</b> (CIF)  a = {crystal.a_lat:.4f} Å"
+                    f"<br/><span style='font-size:10px;color:#555;'>{src}</span>"
+                )
+            else:
+                crystal = p.cal_crystal_obj()
+                text = f"Crystal: <b>{crystal.name}</b>  a = {crystal.a_lat:.4f} Å"
+                if p.cal_crystal == "CIF" and not p.cif_path:
+                    warn = "cal_crystal=CIF but no cif_path — using default Si until you Load CIF…"
+        except Exception as exc:
+            crystal = E.CAL_CRYSTALS[E.DEFAULT_CAL_CRYSTAL]
+            text = f"Crystal: <b>{crystal.name}</b>  a = {crystal.a_lat:.4f} Å (CIF load failed)"
+            warn = str(exc)
+        self._lbl_crystal.setText(text)
+        self._lbl_cif_warn.setText(warn)
+        self._lbl_cif_warn.setVisible(bool(warn))
+
+    def _load_cif(self) -> None:
+        if self._sc is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load crystal CIF",
+            str(Path(self._sc.params.cif_path).parent) if self._sc.params.cif_path else "",
+            "CIF files (*.cif);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            info = E.load_crystal_from_cif(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "CIF load failed", str(exc))
+            self._status.setText(f"CIF load failed: {exc}")
+            return
+        self._sc.params.cal_crystal = "CIF"
+        self._sc.params.cif_path = info.path
+        try:
+            self._host._params.reload()
+        except Exception:
+            pass
+        self._refresh_crystal_label()
+        msg = f"Loaded CIF: {Path(info.path).name}  a={info.cal.a_lat:.4f} Å"
+        if info.warning:
+            msg += " — non-cubic warning (see above)."
+        self._status.setText(msg)
+
     def _collect_params(self) -> None:
         p = self._sc.params
-        p.zone_axis = _parse_ivec3(self._ed_zone.text(), [1, 1, 0])
+        mode = self._orient_mode()
+        p.indexing_orientation_mode = mode
+        zone_txt = (self._ed_zone.text() or "").strip()
+        if mode == "unknown" and not zone_txt:
+            p.zone_axis = []
+        else:
+            p.zone_axis = _parse_ivec3(zone_txt, [1, 1, 0])
         p.real_axis_h = _parse_ivec3(self._ed_h.text(), [0, 0, -1])
         p.real_axis_v = _parse_ivec3(self._ed_v.text(), [-1, 1, 0])
         p.indexing_tol_px = float(self._sp_tol.value())
         p.indexing_seed = int(self._sp_seed.value())
+        if mode == "known" and abs(float(p.qr_rotation)) < 1e-9:
+            self._status.setText(
+                "Note: QR_rotation≈0° with Known orientation often fails absolute "
+                "anchoring — set QR in Basis params, or switch to Unknown."
+            )
 
     # ── figure / table ─────────────────────────────────────────────────────
     def _show_fig(self, fig, *, owned: bool = True):
@@ -194,11 +335,14 @@ class IndexerDialog(QtWidgets.QDialog):
                     it.setBackground(QtGui.QColor("#E3F2FD"))
                 self._table.setItem(r, c, it)
         self._table.resizeColumnsToContents()
+        mode = result.metrics.get("orientation_mode", "?")
+        anchored = result.metrics.get("anchored", False)
         self._lbl_propose.setText(
             f"Proposed: origin={result.index_origin}  g1={result.index_g1} "
             f"{result.metrics.get('g1_hkl_str')}  g2={result.index_g2} "
             f"{result.metrics.get('g2_hkl_str')}  "
-            f"inliers={result.n_inliers}/{len(result.peaks)}"
+            f"inliers={result.n_inliers}/{len(result.peaks)}  "
+            f"[{mode}{', anchored' if anchored else ', not anchored'}]"
         )
 
     def _on_row_clicked(self, row: int, _col: int) -> None:
@@ -237,7 +381,10 @@ class IndexerDialog(QtWidgets.QDialog):
         sc = self._sc
 
         def work():
-            return E.index_bvm(sc, log=self._host._console.log, make_figure=False)
+            up = int(self._cmb_upsample.currentData() or 1)
+            return E.index_bvm(
+                sc, log=self._host._console.log, make_figure=False, image_upsample=up
+            )
 
         def on_done(r):
             if isinstance(r, Exception):
@@ -254,8 +401,16 @@ class IndexerDialog(QtWidgets.QDialog):
             except Exception as exc:
                 self._status.setText(f"Indexed, but figure failed: {exc}")
             self._fill_table(r)
+            mode = r.metrics.get("orientation_mode", "?")
+            if r.metrics.get("anchored"):
+                note = "absolute hkl anchored."
+            elif r.metrics.get("relative_hkl"):
+                note = "relative hkl only (signs not anchored)."
+            else:
+                note = "lattice proposal for Basis (no Miller labels)."
             self._status.setText(
-                f"Done: {r.n_inliers}/{len(r.peaks)} inliers — review table, then Send."
+                f"Done ({mode}): {r.n_inliers}/{len(r.peaks)} inliers — {note} "
+                f"Review table, then Send."
             )
 
         self._host._run_async(work, label=f"Index BVM ({sc.name})", on_done=on_done)

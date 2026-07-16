@@ -1,7 +1,7 @@
 # Plan — Crystal from CIF for Index BVM (+ shared Q-pixel)
 
 **Rama / worktree:** `peak-indexer-notebook`  
-**Estado:** PLAN — implementar y testear en chat dedicado (después del commit Report/Tools).  
+**Estado:** IMPLEMENTADO (C0–C4) — tests verdes; commit pendiente (pedir al usuario).  
 **Fecha:** 2026-07-14  
 **Depende de:** Index BVM ya en GUI (`qt_indexer.py`, `bvm_indexing.py`, `engine.index_bvm`).
 
@@ -128,7 +128,7 @@ cif_path: str | None          # ruta al .cif (persistir en session JSON)
 
 ## Kickoff checklist
 
-- [ ] Confirmar pymatgen en `py4dstem-01419`
-- [ ] Elegir CIF de prueba (Si o material del lab)
-- [ ] Decidir: CIF solo Index, o Index+Q-pixel desde el día 1 (recomendado: ambos vía `_build_crystal`)
-- [ ] Usar **codebase-memory** + **graphify** al explorar call graph de `index_bvm` / `_build_crystal`
+- [x] Confirmar pymatgen en `py4dstem-01419`
+- [x] Elegir CIF de prueba (Si o material del lab)
+- [x] Decidir: CIF solo Index, o Index+Q-pixel desde el día 1 (recomendado: ambos vía `_build_crystal`)
+- [x] Usar **codebase-memory** + **graphify** al explorar call graph de `index_bvm` / `_build_crystal`

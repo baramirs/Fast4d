@@ -229,3 +229,87 @@ python tools/validate_bvm_indexer_e2e.py
 - Tests: `tests/test_report_export.py` (PDF/DOCX/PPTX + flags include_*).
 - Dep: `python-docx` en `requirements.txt` (env `py4dstem-01419`).
 
+---
+
+## 14. Crystal from CIF — Index BVM + Q-pixel compartidos — 2026-07-14
+
+### Qué problema resolvía
+Index BVM y Q-pixel usaban solo Si / Au / Custom (editor manual). Queríamos cargar un **CIF** (formato estándar de cristalografía) como única fuente de verdad para lattice + structure factors — reutilizable también desde GPA / 4DSTEM.
+
+### Qué se añadió
+
+| Pieza | Archivo(s) | Qué hace |
+|---|---|---|
+| Loader | `engine.load_crystal_from_cif`, `is_approximately_cubic`, `CifCrystalInfo` | `Crystal.from_CIF` (py4DSTEM + pymatgen); extrae `a_lat` / positions; **warning** si la celda no es cúbica (Index BVM v1 sigue cúbico). |
+| Params | `CalibrationParams.cif_path`, `cal_crystal="CIF"` | Persistido en session JSON vía `to_dict` / `_overlay_params_dict`. |
+| Shared build | `_build_crystal`, `cal_crystal_obj` | Mismo CIF alimenta Index (`lattice_a`) y Q-pixel (`calibrate_pixel_size`). |
+| UI Index | `qt_indexer.py` | Botón **Load CIF…**, label con a + path, aviso naranja si no cúbico. |
+| UI Crystal editor | `qt_main.CrystalEditorDialog` | Mismo **Load CIF…** (parity con Q-pixel). |
+| Params table | `param_spec.py` | Enum Crystal incluye `CIF`; fila readonly `cif_path`. |
+| Fixture + tests | `tests/fixtures/Si.cif`, `tests/test_crystal_cif.py` | Sin red; 9 tests (cúbico, no-cúbico, persistencia, `_build_crystal`). |
+| Dep | `requirements.txt` | `pymatgen` explícito. |
+
+### Flujo
+1. Index BVM… (o Crystal editor) → **Load CIF…** → elige `.cif`.
+2. `cal_crystal=CIF`, `cif_path` guardado.
+3. Run indexing / Q-pixel refit usan el mismo cristal.
+4. Si el CIF no es cúbico: warning en UI; Index usa `a` convencional como métrica efectiva (v1).
+
+### No-objetivos (v1)
+Editor CIF WYSIWYG; indexación no-cúbica completa; descarga automática de CIFs.
+
+---
+
+## 15. Orient. peaks (py4DSTEM) — GUI aparte vs Index BVM — 2026-07-15
+
+### Qué problema resolvía
+Querer usar la orientación (CIF + zone / ACOM) de py4DSTEM para **definir picos**, sin mezclarlo con nuestro Index BVM (RANSAC) ni tocar el pipeline de strain — y poder comparar ambos métodos en la misma sesión.
+
+### Qué se añadió
+
+| Pieza | Archivo(s) | Qué hace |
+|---|---|---|
+| Motor | `orientation_peaks.py` | Path A `generate_diffraction_pattern` + match; Path B `orientation_plan` + `match_single_pattern`; compare; figure; CSV. |
+| Engine | `run_orientation_peaks`, `apply_orientation_peaks_to_basis_params` | Wrappers finos; reusa `_build_crystal` / calibraciones hasta basis. |
+| GUI | `qt_orientation.OrientationPeaksDialog` | Run / Compare vs Index BVM / Send / Export. |
+| Botón | `qt_main` Basis toolbar | **Orient. peaks…** junto a **Index BVM…**. |
+| Tests | `tests/test_orientation_peaks.py` | Matcher unidades + Path A sintético + Path B smoke (Si.cif). |
+| Plan | `docs/superpowers/plans/2026-07-15-orientation-peaks-gui.md` | Road O0–O4. |
+
+### Flujo
+1. Basis → **Orient. peaks…**
+2. CIF + Known (zone/proj) o ACOM → **Run**
+3. Opcional **Compare vs Index BVM** (no escribe params)
+4. Opcional **Send** → mismos `index_origin/g1/g2` + `basis_manual_enabled`
+
+### Notas
+- **No** modifica `pipeline.py` strain steps.
+- Parche NumPy 2 para `astype(np.integer)` en ACOM (`_patch_acom_numpy_integer`).
+- Unidades: teórico en Å⁻¹; BVM en px vía `Q_pixel` (igual que Index BVM).
+
+---
+
+## 16. Indexing plugins — física + menú Plugin — 2026-07-15
+
+### Diferencia física (qué camino elegir)
+
+| Camino | Pregunta | Cristal | Zone / ejes | Cómo |
+|---|---|---|---|---|
+| **Index BVM Unknown** | ¿Qué red 2D forman los spots? | Opcional | No (zone solo → hkl relativo) | RANSAC → g1/g2 |
+| **Index BVM Known** | ¿Miller **absolutos**? | Sí (`a`/CIF) | Zone + ejes H/V + QR | RANSAC + anclaje ±g |
+| **Orient Path A** | ¿Dónde deberían estar los Bragg? | CIF completo | Zone + proj_x | Genera patrón → NN |
+| **Orient Path B** | ¿Qué orientación del CIF encaja? | CIF completo | No (ACOM busca) | ACOM → regenera → NN |
+
+**Index BVM** = medida → red → (opcional) etiquetas.  
+**Orient. peaks** = CIF → orientación (dada o buscada) → picos teóricos → NN.
+
+### Separación Plugin
+
+| Pieza | Archivo(s) | Qué hace |
+|---|---|---|
+| Paquete | `plugins/indexing/` | `peaks` (upsample), `types`, `protocol`, 3 plugins, `registry`, `apply` |
+| Menú | `qt_main` **Plugin** | Index BVM Unknown / Known / Orient. peaks (quitados del toolbar Basis) |
+| Help | Indexing plugins guide… | Árbol “qué sabes” + workflow |
+| Peak sampling | diálogos | 1× / 2× / 4× zoom BVM antes de máximos |
+
+Dependencia cortada: `orientation_peaks` ya **no** importa `bvm_indexing` (ambos usan `plugins.indexing.peaks`).

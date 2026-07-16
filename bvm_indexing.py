@@ -98,25 +98,28 @@ def find_bvm_maxima(
     subpixel: str = "multicorr",
     upsample_factor: int = 16,
     sigma: float = 0,
+    image_upsample: int = 1,
 ) -> np.ndarray:
-    """Detect maxima on a BVM with the same kwargs as py4DSTEM choose_basis_vectors.
+    """Detect maxima on a BVM (delegates to ``plugins.indexing.peaks.find_peaks``).
+
+    ``image_upsample`` (1|2|4) zooms the BVM before detection, then scales
+    coordinates back — distinct from multicorr ``upsample_factor``.
 
     Returns a structured array with fields ``x``, ``y``, ``intensity``, sorted by
     intensity descending — the index order that ``index_origin/g1/g2`` refer to.
     """
-    from py4DSTEM.preprocess.utils import get_maxima_2D
+    from plugins.indexing.peaks import find_peaks
 
-    return get_maxima_2D(
-        np.asarray(bvm, dtype=float),
+    return find_peaks(
+        bvm,
+        min_spacing=min_spacing,
+        min_absolute_intensity=min_absolute_intensity,
+        max_num_peaks=max_num_peaks,
+        edge_boundary=edge_boundary,
         subpixel=subpixel,
-        upsample_factor=int(upsample_factor),
-        sigma=float(sigma),
-        minAbsoluteIntensity=float(min_absolute_intensity),
-        minRelativeIntensity=0,
-        relativeToPeak=0,
-        minSpacing=float(min_spacing),
-        edgeBoundary=int(edge_boundary),
-        maxNumPeaks=int(max_num_peaks),
+        upsample_factor=upsample_factor,
+        sigma=sigma,
+        image_upsample=image_upsample,
     )
 
 
@@ -437,8 +440,12 @@ def anchor_hkl_with_real_axes(
             break
     if solution is None:
         raise RuntimeError(
-            "No QR rotation sign aligns both real axes — check zone/real axes"
-            + (" (QR_flip=True)" if qr_flip else "")
+            "No QR rotation sign aligns both real axes — check zone/real axes "
+            f"(zone={_hkl_str(zone_axis)}, "
+            f"real_H={_hkl_str(real_axis_h)}, real_V={_hkl_str(real_axis_v)}, "
+            f"QR={float(qr_rotation_deg):.3f}°, QR_flip={bool(qr_flip)}). "
+            "If orientation is unknown, run Index BVM in Unknown orientation mode "
+            "(lattice + g1/g2 proposal without absolute hkl)."
         )
 
     s, matches = solution
@@ -529,6 +536,16 @@ def select_orthogonal_g_pair(
 
 # ── Top-level indexing ────────────────────────────────────────────────────────
 
+ORIENTATION_MODES = ("unknown", "known")
+
+
+def _normalize_orientation_mode(mode: str | None) -> str:
+    m = str(mode or "known").strip().lower()
+    if m not in ORIENTATION_MODES:
+        raise ValueError(f"orientation_mode must be one of {ORIENTATION_MODES}, got {mode!r}")
+    return m
+
+
 def index_bvm(
     bvm: np.ndarray,
     origin_px: np.ndarray,
@@ -536,7 +553,7 @@ def index_bvm(
     Q_pixel: float,
     Q_units: str = "A^-1",
     lattice_a: float = 5.4309,
-    zone_axis: Sequence[int] = (1, 1, 0),
+    zone_axis: Sequence[int] | None = (1, 1, 0),
     real_axis_h: Sequence[int] = (0, 0, -1),
     real_axis_v: Sequence[int] = (-1, 1, 0),
     qr_rotation_deg: float = 135.0,
@@ -549,20 +566,31 @@ def index_bvm(
     edge_boundary: float = 40,
     subpixel: str = "multicorr",
     maxima: np.ndarray | None = None,
+    orientation_mode: str = "known",
+    image_upsample: int = 1,
 ) -> IndexingResult:
-    """Run full BVM indexing: maxima → RANSAC → hkl anchor → propose indices.
+    """Run BVM indexing: maxima → RANSAC → (optional) hkl → propose Basis indices.
+
+    ``orientation_mode``:
+      * ``\"known\"`` — absolute hkl via zone + real axes + QR (notebook path).
+      * ``\"unknown\"`` — lattice + g1/g2 proposal only; optional relative hkl if
+        ``zone_axis`` is provided (signs not anchored). Never invents orientation.
 
     ``origin_px`` is the calibrated origin in absolute BVM pixels (qx, qy).
     Physical units come from ``Q_pixel`` (Å⁻¹/px from braggpeaks.calibration).
     """
+    mode = _normalize_orientation_mode(orientation_mode)
     bvm = np.asarray(bvm, dtype=float)
     origin_px = np.asarray(origin_px, dtype=float).ravel()[:2]
-    zone = np.asarray(zone_axis, dtype=int).ravel()[:3]
+    has_zone = zone_axis is not None and len(list(zone_axis)) >= 3
+    zone = np.asarray(zone_axis if has_zone else (0, 0, 0), dtype=int).ravel()[:3]
     rax_h = np.asarray(real_axis_h, dtype=int).ravel()[:3]
     rax_v = np.asarray(real_axis_v, dtype=int).ravel()[:3]
     Q = float(Q_pixel)
     if Q <= 0:
         raise ValueError("Q_pixel must be > 0")
+    if mode == "known" and not has_zone:
+        raise ValueError("Known orientation mode requires zone_axis [uvw]")
 
     if maxima is None:
         maxima = find_bvm_maxima(
@@ -572,6 +600,7 @@ def index_bvm(
             max_num_peaks=max_num_peaks,
             edge_boundary=edge_boundary,
             subpixel=subpixel,
+            image_upsample=int(image_upsample),
         )
     gx_abs = np.asarray(maxima["x"], dtype=float)
     gy_abs = np.asarray(maxima["y"], dtype=float)
@@ -613,65 +642,94 @@ def index_bvm(
     i0_guess = int(np.argmin(np.hypot(qx, qy)))
     ok[i0_guess] = res_px[i0_guess] < float(tol_px)  # allow origin as ok separately
 
-    # Choose orthogonal-ish g1/g2 for strain (like manifest pick), then anchor hkl
+    # Choose orthogonal-ish g1/g2 for strain (like manifest pick), then optional hkl
     g1_cand, g2_cand, M = select_orthogonal_g_pair(a_px, b_px, target_angle_deg=90.0)
     g1_A = g1_cand * Q
     g2_A = g2_cand * Q
     mag1 = float(np.hypot(*g1_A))
     mag2 = float(np.hypot(*g2_A))
 
-    G1_pre, G2_pre, match_cost = match_g1g2_hkl(
-        g1_A, g2_A, zone, float(lattice_a)
-    )
-    G1, G2, qr_sign = anchor_hkl_with_real_axes(
-        g1_cand, g2_cand, mag1, mag2,
-        zone_axis=zone,
-        real_axis_h=rax_h,
-        real_axis_v=rax_v,
-        qr_rotation_deg=float(qr_rotation_deg),
-        qr_flip=bool(qr_flip),
-        lattice_a=float(lattice_a),
-        prelim_g1_hkl=G1_pre,
-        prelim_g2_hkl=G2_pre,
-    )
+    match_cost = float("nan")
+    anchored = False
+    qr_sign = 0
+    G1 = np.zeros(3, dtype=int)
+    G2 = np.zeros(3, dtype=int)
+    A_hkl = np.zeros(3, dtype=int)
+    B_hkl = np.zeros(3, dtype=int)
+    assign_hkl = False
 
-    # Primitive hkl from anchored G1/G2 and M: [A B] = [G1 G2] · M^{-1}
-    Minv = np.linalg.inv(M.astype(float))
-    AB = np.column_stack([G1, G2]).astype(float) @ Minv
-    if not np.allclose(AB, np.round(AB), atol=0.15):
-        # Fall back: assign hkl via primitive match on |a|,|b|
-        A_pre, B_pre, _ = match_g1g2_hkl(a_A, b_A, zone, float(lattice_a))
-        # Re-anchor signs using a/b as meas basis? Prefer integer AB from G1/G2 if close
-        A_hkl = np.round(AB[:, 0]).astype(int)
-        B_hkl = np.round(AB[:, 1]).astype(int)
-        if np.linalg.norm(A_hkl) < 1e-9 or np.linalg.norm(B_hkl) < 1e-9:
-            A_hkl, B_hkl = A_pre.astype(int), B_pre.astype(int)
+    if mode == "known":
+        G1_pre, G2_pre, match_cost = match_g1g2_hkl(
+            g1_A, g2_A, zone, float(lattice_a)
+        )
+        G1, G2, qr_sign = anchor_hkl_with_real_axes(
+            g1_cand, g2_cand, mag1, mag2,
+            zone_axis=zone,
+            real_axis_h=rax_h,
+            real_axis_v=rax_v,
+            qr_rotation_deg=float(qr_rotation_deg),
+            qr_flip=bool(qr_flip),
+            lattice_a=float(lattice_a),
+            prelim_g1_hkl=G1_pre,
+            prelim_g2_hkl=G2_pre,
+        )
+        anchored = True
+        assign_hkl = True
+    elif has_zone:
+        # Unknown: optional relative Miller labels (sign-ambiguous), no absolute anchor
+        try:
+            G1, G2, match_cost = match_g1g2_hkl(
+                g1_A, g2_A, zone, float(lattice_a)
+            )
+            assign_hkl = True
+        except Exception:
+            G1 = np.zeros(3, dtype=int)
+            G2 = np.zeros(3, dtype=int)
+            match_cost = float("nan")
+            assign_hkl = False
+
+    if assign_hkl:
+        # Primitive hkl from G1/G2 and M: [A B] = [G1 G2] · M^{-1}
+        Minv = np.linalg.inv(M.astype(float))
+        AB = np.column_stack([G1, G2]).astype(float) @ Minv
+        if not np.allclose(AB, np.round(AB), atol=0.15):
+            A_pre, B_pre, _ = match_g1g2_hkl(a_A, b_A, zone, float(lattice_a))
+            A_hkl = np.round(AB[:, 0]).astype(int)
+            B_hkl = np.round(AB[:, 1]).astype(int)
+            if np.linalg.norm(A_hkl) < 1e-9 or np.linalg.norm(B_hkl) < 1e-9:
+                A_hkl, B_hkl = A_pre.astype(int), B_pre.astype(int)
+        else:
+            A_hkl = np.round(AB[:, 0]).astype(int)
+            B_hkl = np.round(AB[:, 1]).astype(int)
+        hkl_all = mn @ np.stack([A_hkl, B_hkl])
     else:
-        A_hkl = np.round(AB[:, 0]).astype(int)
-        B_hkl = np.round(AB[:, 1]).astype(int)
+        hkl_all = np.zeros((n_peaks, 3), dtype=int)
 
-    hkl_all = mn @ np.stack([A_hkl, B_hkl])
     # Origin → (0,0,0)
     hkl_all[i0_guess] = (0, 0, 0)
-    zone_law = hkl_all @ zone.astype(int)
 
     g_mag_A = np.hypot(gx_A, gy_A)
     with np.errstate(divide="ignore", invalid="ignore"):
         d_exp = np.where(g_mag_A > 0, 1.0 / g_mag_A, np.inf)
-        norm_hkl = np.linalg.norm(hkl_all.astype(float), axis=1)
-        d_theo = np.where(norm_hkl > 0, float(lattice_a) / norm_hkl, np.inf)
-        dd_pct = np.where(
-            np.isfinite(d_theo) & (d_theo > 0),
-            100.0 * (d_exp - d_theo) / d_theo,
-            np.nan,
-        )
+        if assign_hkl:
+            norm_hkl = np.linalg.norm(hkl_all.astype(float), axis=1)
+            d_theo = np.where(norm_hkl > 0, float(lattice_a) / norm_hkl, np.inf)
+            dd_pct = np.where(
+                np.isfinite(d_theo) & (d_theo > 0),
+                100.0 * (d_exp - d_theo) / d_theo,
+                np.nan,
+            )
+        else:
+            d_theo = np.full(n_peaks, np.inf)
+            dd_pct = np.full(n_peaks, np.nan)
 
     # Origin always ok if closest
     ok_final = ok.copy()
     ok_final[i0_guess] = True
-    # Reject peaks that violate zone law when claimed ok
-    bad_zone = ok_final & (zone_law != 0) & (np.arange(n_peaks) != i0_guess)
-    ok_final[bad_zone] = False
+    if assign_hkl and has_zone:
+        zone_law = hkl_all @ zone.astype(int)
+        bad_zone = ok_final & (zone_law != 0) & (np.arange(n_peaks) != i0_guess)
+        ok_final[bad_zone] = False
 
     index_origin, index_g1, index_g2 = propose_basis_indices(qx, qy, g1_cand, g2_cand)
     # Use actual peak positions as proposed g1/g2 (relative)
@@ -722,14 +780,17 @@ def index_bvm(
         lattice_a=float(lattice_a),
         qr_sign=int(qr_sign),
         metrics={
-            "match_cost": float(match_cost),
+            "match_cost": float(match_cost) if match_cost == match_cost else float("nan"),
             "ransac_score": float(lat["score"]),
             "M": M.tolist(),
             "n_peaks": int(n_peaks),
-            "g1_hkl_str": _hkl_str(G1),
-            "g2_hkl_str": _hkl_str(G2),
-            "a_hkl_str": _hkl_str(A_hkl),
-            "b_hkl_str": _hkl_str(B_hkl),
+            "g1_hkl_str": _hkl_str(G1) if assign_hkl else "—",
+            "g2_hkl_str": _hkl_str(G2) if assign_hkl else "—",
+            "a_hkl_str": _hkl_str(A_hkl) if assign_hkl else "—",
+            "b_hkl_str": _hkl_str(B_hkl) if assign_hkl else "—",
+            "orientation_mode": mode,
+            "anchored": bool(anchored),
+            "relative_hkl": bool(assign_hkl and not anchored),
         },
         bvm=bvm,
     )
@@ -762,17 +823,23 @@ def make_indexing_figure(result: IndexingResult, *, title: str | None = None):
     for p in result.peaks:
         if not p.ok:
             continue
+        if (p.h, p.k, p.l) == (0, 0, 0):
+            continue  # origin or unlabeled (Unknown without relative hkl)
         label = f"({p.h} {p.k} {p.l})"
         ax.annotate(
             label, (p.qy_abs_px, p.qx_abs_px), xytext=(5, -8),
             textcoords="offset points", color="yellow", fontsize=7,
         )
 
+    g1_lab = result.metrics.get("g1_hkl_str") or _hkl_str(result.g1_hkl)
+    g2_lab = result.metrics.get("g2_hkl_str") or _hkl_str(result.g2_hkl)
+    a_lab = result.metrics.get("a_hkl_str") or _hkl_str(result.a_hkl)
+    b_lab = result.metrics.get("b_hkl_str") or _hkl_str(result.b_hkl)
     arrows = (
-        (result.g1_px, f"$g_1$ {_hkl_str(result.g1_hkl)}", "cyan"),
-        (result.g2_px, f"$g_2$ {_hkl_str(result.g2_hkl)}", "orange"),
-        (result.basis_a_px, f"$a$ {_hkl_str(result.a_hkl)}", "magenta"),
-        (result.basis_b_px, f"$b$ {_hkl_str(result.b_hkl)}", "yellow"),
+        (result.g1_px, f"$g_1$ {g1_lab}", "cyan"),
+        (result.g2_px, f"$g_2$ {g2_lab}", "orange"),
+        (result.basis_a_px, f"$a$ {a_lab}", "magenta"),
+        (result.basis_b_px, f"$b$ {b_lab}", "yellow"),
     )
     for gvec, name, color in arrows:
         ax.annotate(
@@ -789,8 +856,12 @@ def make_indexing_figure(result: IndexingResult, *, title: str | None = None):
         )
 
     za = result.zone_axis
+    mode = result.metrics.get("orientation_mode", "known")
+    anchored = result.metrics.get("anchored", False)
+    mode_tag = f" [{mode}" + (", anchored]" if anchored else "]")
     ax.set_title(
-        title or f"BVM indexed (hkl) — zone axis [{int(za[0])}{int(za[1])}{int(za[2])}]"
+        (title or f"BVM indexed (hkl) — zone axis [{int(za[0])}{int(za[1])}{int(za[2])}]")
+        + mode_tag
     )
     ax.set_xlabel("qy (px)")
     ax.set_ylabel("qx (px)")

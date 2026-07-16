@@ -13,6 +13,8 @@ uncertainties
 # --- 4D-STEM ---
 py4DSTEM==0.14.19
 h5py
+# Crystal.from_CIF (Index BVM / Q-pixel CIF mode) — usually pulled in by py4DSTEM
+pymatgen
 
 # --- GUI ---
 PySide6

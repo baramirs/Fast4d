@@ -58,12 +58,13 @@ def _is_visible(dlg) -> bool:
 
 
 # icon strip: (step_key, label, icon stem). Mirrors the workflow order.
+# Analysis / Live tools live in menu Tools — not a workflow step icon.
 STEPS = [
     ("probe", "Probe", "probe"), ("select6", "6 Points", "select_6pts"),
     ("detection", "Detection", "detection"), ("roi", "ROI", "roi"),
     ("origin", "Origin", "origin"), ("ellipse", "Ellipse", "ellipse_cal"),
     ("qpixel", "Q Pixel", "q_pixel"), ("basis", "Basis", "basis"),
-    ("strain", "Strain", "strain"), ("lines", "Analysis", "lines"),
+    ("strain", "Strain", "strain"),
 ]
 
 # Workflow steps that only apply while building braggpeaks (Path B).
@@ -78,7 +79,6 @@ _STEP_TOOLTIPS = {
     "qpixel": "Q-pixel size calibration.",
     "basis": "Basis vectors / QR transform.",
     "strain": "Strain maps (Compute).",
-    "lines": "Stress maps (Hooke's law) + line profiles / area ROI stats for the Report.",
 }
 
 _STATUS_ICON = {"pending": "○", "computed": "◐", "done": "✓", "error": "✗"}
@@ -185,40 +185,33 @@ with a dashed border; reloads on click).</p>
 """
 
 _INDEX_BVM_GUIDE_HTML = """
-<h3>Index BVM — how to use it</h3>
-<p>Use this tool <b>before Basis setup</b> when you want Fast4D to propose lattice
-vectors (<code>g1</code>/<code>g2</code>) from the Bragg Vector Map (BVM) instead of
-typing them by hand.</p>
+<h3>Indexing plugins — how to choose</h3>
+<p>Open from the menu <b>Plugin</b> (also reachable historically from Basis).
+These tools <b>propose</b> <code>g1</code>/<code>g2</code> for Basis; they do
+<b>not</b> run the strain pipeline.</p>
 <hr>
-<p><b>Where to open it</b><br>
-Toolbar step <b>Basis</b> &rarr; button <b>Index BVM&hellip;</b></p>
-<p><b>When to use it</b><br>
-Path A (braggpeaks already loaded) after Origin / Ellipse / Q-pixel are in good
-shape. Indexing needs a calibrated diffraction frame so peak positions match the
-crystal model.</p>
-<hr>
-<p><b>Workflow (3 clicks):</b></p>
+<p><b>What do you know?</b></p>
 <ol>
-<li><b>Check crystal + axes</b> — zone axis <code>[uvw]</code> and real-space axes
-H (+ry) / V (+rx) must match your experiment orientation. Tolerance (px) and
-RANSAC seed fine-tune peak matching.</li>
-<li><b>Run indexing</b> — Fast4D runs RANSAC on BVM maxima, assigns hkl with
-zone-axis anchoring, and shows an overlay + peak table.</li>
-<li><b>Send to Fast4D</b> — writes <code>index_origin</code>, <code>g1</code>,
-<code>g2</code> and enables manual basis. Then open <b>Basis</b> as usual; the
-proposed vectors are already in the parameter table.</li>
+<li><b>No crystal / orientation</b> → <b>Index BVM (Unknown)</b> —
+RANSAC lattice from BVM maxima → propose origin/g1/g2. Optional zone only for
+relative hkl (signs not anchored).</li>
+<li><b>Crystal + zone + real axes H/V + QR</b> → <b>Index BVM (Known)</b> —
+same RANSAC, then absolute Miller indices (breaks ±g / Friedel).</li>
+<li><b>CIF + theory first</b> → <b>Orient. peaks</b><br>
+&nbsp;&nbsp;• Zone + proj_x known → Path A (generate pattern → NN match)<br>
+&nbsp;&nbsp;• Orientation unknown → Path B (ACOM search → regenerate → NN)</li>
 </ol>
 <hr>
-<p><b>Optional controls:</b></p>
-<ul>
-<li><b>Set as g1 / Set as g2</b> — pick a row in the table if you disagree with the
-automatic proposal.</li>
-<li><b>Export CSV/PNG</b> — save the indexed table and overlay into the analysis
-folder for notebooks / papers.</li>
-</ul>
+<p><b>Workflow:</b></p>
+<ol>
+<li>Calibrate Origin / Ellipse / Q-pixel so the BVM is in physical units.</li>
+<li><b>Plugin</b> → pick a method → <b>Run</b> (optional peak <b>sampling</b> 2×/4×).</li>
+<li><b>Send to Fast4D</b> writes <code>index_origin</code>/<code>g1</code>/<code>g2</code>
+and enables manual basis. Then open <b>Basis</b> as usual.</li>
+</ol>
 <p style="background:#E3F2FD; padding:10px; border-radius:6px;">
-<b>Tip:</b> If Send looks wrong, re-check zone axis and real axes first — a wrong
-orientation flips hkl signs more often than RANSAC failing.
+<b>Tip:</b> Index BVM = measure→lattice. Orient. peaks = CIF→theory→match.
+Compare them side-by-side; only Send commits indices.
 </p>
 """
 
@@ -1936,7 +1929,9 @@ class CrystalEditorDialog(QtWidgets.QDialog):
         b_gen = QtWidgets.QPushButton("Generate / preview"); b_gen.clicked.connect(self._generate)
         b_use = QtWidgets.QPushButton("Apply (file)"); b_use.clicked.connect(lambda: self._use(False))
         b_all = QtWidgets.QPushButton("Apply (all)"); b_all.clicked.connect(lambda: self._use(True))
-        for b in (b_gen, b_use, b_all):
+        b_cif = QtWidgets.QPushButton("Load CIF…"); b_cif.clicked.connect(self._load_cif)
+        b_cif.setToolTip("Use a CIF file as the calibration crystal (same source as Index BVM).")
+        for b in (b_gen, b_use, b_all, b_cif):
             brow.addWidget(b)
         v.addLayout(brow)
         self._preview = QtWidgets.QPlainTextEdit(); self._preview.setReadOnly(True)
@@ -2010,6 +2005,36 @@ class CrystalEditorDialog(QtWidgets.QDialog):
             s.params.custom_crystal = dict(cc)
         self._host._params.reload()
         self._status.setText(f"Applied to {len(targets)} file(s) (cal_crystal=Custom).")
+
+    def _load_cif(self):
+        if self._sc is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load crystal CIF", "", "CIF files (*.cif);;All files (*.*)")
+        if not path:
+            return
+        try:
+            info = E.load_crystal_from_cif(path)
+        except Exception as exc:
+            self._status.setText(f"CIF load failed: {exc}")
+            return
+        self._sc.params.cal_crystal = "CIF"
+        self._sc.params.cif_path = info.path
+        self._host._params.reload()
+        lines = [
+            f"CIF = {info.path}",
+            f"name = {info.cal.name}",
+            f"a_lat = {info.cal.a_lat:.4f} Å",
+            f"sites = {len(info.cal.positions)}",
+            f"cubic = {info.is_cubic}",
+        ]
+        if info.warning:
+            lines.append(f"WARNING: {info.warning}")
+        self._preview.setPlainText("\n".join(lines))
+        self._status.setText(
+            f"Applied CIF to this file (cal_crystal=CIF, a={info.cal.a_lat:.4f} Å)."
+            + (" Non-cubic — Index BVM uses effective a." if info.warning else "")
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2431,14 +2456,45 @@ class VirtualizationDialog(QtWidgets.QDialog):
         if self._sc is None or self._host._busy:
             return
         sc = self._sc
+        from pathlib import Path as _P
         default = ""
-        if sc.raw_path:
-            from pathlib import Path as _P
-            default = str(_P(sc.raw_path).with_suffix(".h5"))
-        p, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save virtual-images .h5", default, "HDF5 (*.h5);;All (*)")
-        if not p:
-            return
+        # Prefer the loaded EMD/HDF5 itself so ADF/BF hang on the same file
+        # (no new sidecar). Fall back to <raw>.h5 for .mib/.dm4 scans.
+        if sc.h5_path and _P(sc.h5_path).suffix.lower() in (".h5", ".hdf5", ".emd"):
+            default = sc.h5_path
+        elif sc.raw_path:
+            rp = _P(sc.raw_path)
+            if rp.suffix.lower() in (".h5", ".hdf5", ".emd"):
+                default = str(rp)
+            else:
+                default = str(rp.with_suffix(".h5"))
+        st = sc.ensure_state() if hasattr(sc, "ensure_state") else None
+        emd_dp = getattr(st, "emd_datapath", None) if st is not None else None
+        same_h5 = bool(default) and sc.raw_path and (
+            _P(default).resolve() == _P(sc.raw_path).resolve()
+            if _P(sc.raw_path).suffix.lower() in (".h5", ".hdf5", ".emd")
+            else False
+        )
+        if same_h5 and emd_dp:
+            # Confirm overwrite-append into the open file (preserves sibling groups).
+            ans = QtWidgets.QMessageBox.question(
+                self,
+                "Save virtual images",
+                f"Append ADF / BF / DP into the same file?\n\n{default}\n"
+                f"(EMD path: {emd_dp})\n\n"
+                "Other datasets in this HDF5 (e.g. polyAu, vacuum_probe) are kept.",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            p = default
+        else:
+            p, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save virtual-images .h5", default, "HDF5 (*.h5);;All (*)")
+            if not p:
+                return
 
         def work():
             E.vc_save_h5(sc, p, log=self._dialog_log)
@@ -4322,6 +4378,25 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act_an_all.triggered.connect(lambda: self._on_analysis())
         tools.addAction(act_an_all)
 
+        plugin_m = mb.addMenu("&Plugin")
+        act_idx_unk = QtGui.QAction("Index BVM (Unknown)…", self)
+        act_idx_unk.setToolTip(
+            "RANSAC lattice from BVM maxima → propose g1/g2 (no absolute orientation).")
+        act_idx_unk.triggered.connect(
+            lambda: self._open_bvm_indexer(prefer_mode="unknown"))
+        plugin_m.addAction(act_idx_unk)
+        act_idx_kn = QtGui.QAction("Index BVM (Known)…", self)
+        act_idx_kn.setToolTip(
+            "RANSAC + absolute hkl via zone + real axes H/V + QR.")
+        act_idx_kn.triggered.connect(
+            lambda: self._open_bvm_indexer(prefer_mode="known"))
+        plugin_m.addAction(act_idx_kn)
+        act_orient = QtGui.QAction("Orient. peaks…", self)
+        act_orient.setToolTip(
+            "py4DSTEM Crystal: Known generate or ACOM → NN-match BVM peaks.")
+        act_orient.triggered.connect(self._open_orientation_peaks)
+        plugin_m.addAction(act_orient)
+
         settings_m = mb.addMenu("&Settings")
         act_mem = QtGui.QAction("Resident data (RAM)…", self)
         act_mem.setToolTip(
@@ -4351,8 +4426,9 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act_guide.setToolTip("Workflow help: overlays, RAM, Compute fit/apply, step jumps.")
         act_guide.triggered.connect(self._show_calib_guide)
         help_m.addAction(act_guide)
-        act_bvm = QtGui.QAction("Index BVM guide…", self)
-        act_bvm.setToolTip("How to index Bragg Vector Map peaks and send g1/g2 to Basis.")
+        act_bvm = QtGui.QAction("Indexing plugins guide…", self)
+        act_bvm.setToolTip(
+            "Choose Index BVM Unknown/Known vs Orient. peaks; Send g1/g2 to Basis.")
         act_bvm.triggered.connect(self._show_index_bvm_guide)
         help_m.addAction(act_bvm)
 
@@ -4430,7 +4506,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
 
     def _show_index_bvm_guide(self) -> None:
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Index BVM guide — fast4d")
+        dlg.setWindowTitle("Indexing plugins guide — fast4d")
         dlg.resize(560, 520)
         lay = QtWidgets.QVBoxLayout(dlg)
         browser = QtWidgets.QTextBrowser()
@@ -4609,12 +4685,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             act.triggered.connect(lambda _c=False, k=key: self._select_step(k))
             tb.addAction(act)
             self._step_actions_group[key] = act
-        # box the Analysis step — Strain is a mandatory step,
-        # so it stays a normal (blue) icon; the orange box marks the post-compute tools.
-        for k in ("lines",):
-            w = tb.widgetForAction(self._step_actions_group.get(k))
-            if w is not None:
-                w.setObjectName("boxed")
         tb.style().unpolish(tb); tb.style().polish(tb)
 
     def _build_step_toolbar(self) -> None:
@@ -4645,8 +4715,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                 continue
             if dim:
                 w.setStyleSheet("opacity:0.40; color:#78909C; font-size:9px;")
-            elif key == "lines":
-                w.setStyleSheet("")   # orange box comes from toolbar #boxed rule
             else:
                 w.setStyleSheet("")
 
@@ -4754,21 +4822,8 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                  "Edit the Q-pixel calibration crystal (element, structure, a)."),
             ])
         elif key == "basis":
-            add_setting_bar("basis", extra=[
-                ("Index BVM…", self._open_bvm_indexer,
-                 "RANSAC + hkl indexing on the calibrated BVM (before Basis setup). "
-                 "Send proposed index_origin/g1/g2 into the parameter table."),
-            ])
-        elif key == "lines":
-            # Analysis tools live in menu bar → Tools (View · Tools · Settings · Help).
-            lbl = QtWidgets.QLabel(
-                "  Analysis tools moved to menu  Tools  "
-                "(Live Line / Live ROI / Set up / Analyse).  ")
-            lbl.setStyleSheet("color:#1565C0; font-size:10px;")
-            lbl.setToolTip(
-                "Use the Tools menu: Live Line Profile, Live ROI Profile, "
-                "Set up Lines & ROI, Analyse (file), Analysis (all).")
-            tb.addWidget(lbl)
+            add_setting_bar("basis")
+            # Index BVM / Orient. peaks live under menu Plugin (decoupled from Basis toolbar)
         elif key == "strain":
             add("Apply", self._apply_strain_params, tip="Commit strain parameters from the table.")
             add("Compute (file)", self._compute_active)
@@ -5696,13 +5751,21 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             return
         self._show_tool(BasisDialog(self))
 
-    def _open_bvm_indexer(self) -> None:
-        """BVM RANSAC + hkl indexer (runs before basis setup; Send writes index_*)."""
+    def _open_bvm_indexer(self, prefer_mode: str | None = None) -> None:
+        """BVM RANSAC + hkl indexer (Plugin menu; Send writes index_*)."""
         sc = self._need_active()
         if sc is None:
             return
         from qt_indexer import IndexerDialog
-        self._show_tool(IndexerDialog(self))
+        self._show_tool(IndexerDialog(self, prefer_mode=prefer_mode))
+
+    def _open_orientation_peaks(self) -> None:
+        """py4DSTEM orientation → peaks (Plugin menu; Path A/B; optional Send)."""
+        sc = self._need_active()
+        if sc is None:
+            return
+        from qt_orientation import OrientationPeaksDialog
+        self._show_tool(OrientationPeaksDialog(self))
 
     def _open_virtualization(self) -> None:
         """Open the virtual-images generator (raw datacube → ADF/BF/DP → .h5). The
