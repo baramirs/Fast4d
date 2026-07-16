@@ -117,8 +117,7 @@ _PAGES = [
             <td style="padding:4px 8px;"><b>Basis</b></td>
             <td style="padding:4px 8px; color:#1565C0;"><b>All paths</b></td>
             <td style="padding:4px 8px;">Define the crystal lattice vectors
-            (optional: <b>Index BVM&hellip;</b> proposes g1/g2 from the BVM —
-            see <i>Help &rarr; Index BVM guide</i>)</td>
+            (g1/g2) for strain reference</td>
           </tr>
           <tr style="background:#F7FBFF;">
             <td style="padding:4px 8px;"><b>Strain</b></td>
@@ -184,10 +183,6 @@ _PAGES = [
           <li>
             <b>Calibration Guide</b> (Help menu) &mdash; quick reference for
             the fit vs apply modes, figure modes, and toolbar verbs.
-          </li>
-          <li>
-            <b>Index BVM Guide</b> (Help menu) &mdash; RANSAC + hkl indexing
-            to propose Basis vectors before manual setup.
           </li>
           <li>
             <b>Parameter Table</b> &mdash; hover over any row label to see what
