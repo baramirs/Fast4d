@@ -43,22 +43,6 @@ from qt_widgets import (AdfGallery, AdfView, CalStateStrip, ConsoleWidget,
 _ICONS = ICONS_DIR
 
 
-def _indexing_ui_enabled() -> bool:
-    """Expose Index BVM / Orient. peaks in the GUI (Plugin menu + Help guide).
-
-    **Off by default** for public GitHub installs — indexing code stays in the
-    tree but is not reachable from the UI. Enable locally with::
-
-        set FAST4D_ENABLE_INDEXING_UI=1
-
-    (``FAST4D_ENABLE_PLUGIN_MENU=1`` is accepted as an alias.)
-    """
-    for key in ("FAST4D_ENABLE_INDEXING_UI", "FAST4D_ENABLE_PLUGIN_MENU"):
-        if os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on"):
-            return True
-    return False
-
-
 def _enable_minmax(dlg) -> None:
     """Give a dialog the standard title-bar buttons: minimize / maximize / close
     (Qt dialogs show only Close by default)."""
@@ -199,39 +183,6 @@ with a dashed border; reloads on click).</p>
 <p><b>Store…</b> — choose which figure types are kept when mode = report.</p>
 <p><b>View DPI</b> — resolution for spilled / temp PNG sidecars (GUI thumbnails; lower = smaller files).<br>
 <b>Save DPI</b> — resolution for <code>figures/</code> export on Compute / Save (raise for publication).</p>
-"""
-
-_INDEX_BVM_GUIDE_HTML = """
-<h3>BVM indexing — how to choose</h3>
-<p>Open from the <b>Basis</b> toolbar (<b>Index BVM&hellip;</b> /
-<b>Orient. peaks&hellip;</b>), or from the <b>Plugin</b> menu when that menu
-is enabled (<code>FAST4D_ENABLE_PLUGIN_MENU=1</code>).
-These tools <b>propose</b> <code>g1</code>/<code>g2</code> for Basis; they do
-<b>not</b> run the strain pipeline.</p>
-<hr>
-<p><b>What do you know?</b></p>
-<ol>
-<li><b>No crystal / orientation</b> → <b>Index BVM (Unknown)</b> —
-RANSAC lattice from BVM maxima → propose origin/g1/g2. Optional zone only for
-relative hkl (signs not anchored).</li>
-<li><b>Crystal + zone + real axes H/V + QR</b> → <b>Index BVM (Known)</b> —
-same RANSAC, then absolute Miller indices (breaks ±g / Friedel).</li>
-<li><b>CIF + theory first</b> → <b>Orient. peaks</b><br>
-&nbsp;&nbsp;• Zone + proj_x known → Path A (generate pattern → NN match)<br>
-&nbsp;&nbsp;• Orientation unknown → Path B (ACOM search → regenerate → NN)</li>
-</ol>
-<hr>
-<p><b>Workflow:</b></p>
-<ol>
-<li>Calibrate Origin / Ellipse / Q-pixel so the BVM is in physical units.</li>
-<li>Open an indexer → <b>Run</b> (optional peak <b>sampling</b> 2×/4×).</li>
-<li><b>Send to Fast4D</b> writes <code>index_origin</code>/<code>g1</code>/<code>g2</code>
-and enables manual basis. Then open <b>Basis</b> as usual.</li>
-</ol>
-<p style="background:#E3F2FD; padding:10px; border-radius:6px;">
-<b>Tip:</b> Index BVM = measure→lattice. Orient. peaks = CIF→theory→match.
-Compare them side-by-side; only Send commits indices.
-</p>
 """
 
 # Calibration steps: prep key for apply_calibrations_through, dialog opener.
@@ -4397,26 +4348,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act_an_all.triggered.connect(lambda: self._on_analysis())
         tools.addAction(act_an_all)
 
-        if _indexing_ui_enabled():
-            plugin_m = mb.addMenu("&Plugin")
-            act_idx_unk = QtGui.QAction("Index BVM (Unknown)…", self)
-            act_idx_unk.setToolTip(
-                "RANSAC lattice from BVM maxima → propose g1/g2 (no absolute orientation).")
-            act_idx_unk.triggered.connect(
-                lambda: self._open_bvm_indexer(prefer_mode="unknown"))
-            plugin_m.addAction(act_idx_unk)
-            act_idx_kn = QtGui.QAction("Index BVM (Known)…", self)
-            act_idx_kn.setToolTip(
-                "RANSAC + absolute hkl via zone + real axes H/V + QR.")
-            act_idx_kn.triggered.connect(
-                lambda: self._open_bvm_indexer(prefer_mode="known"))
-            plugin_m.addAction(act_idx_kn)
-            act_orient = QtGui.QAction("Orient. peaks…", self)
-            act_orient.setToolTip(
-                "py4DSTEM Crystal: Known generate or ACOM → NN-match BVM peaks.")
-            act_orient.triggered.connect(self._open_orientation_peaks)
-            plugin_m.addAction(act_orient)
-
         settings_m = mb.addMenu("&Settings")
         act_mem = QtGui.QAction("Resident data (RAM)…", self)
         act_mem.setToolTip(
@@ -4446,12 +4377,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         act_guide.setToolTip("Workflow help: overlays, RAM, Compute fit/apply, step jumps.")
         act_guide.triggered.connect(self._show_calib_guide)
         help_m.addAction(act_guide)
-        if _indexing_ui_enabled():
-            act_bvm = QtGui.QAction("Indexing plugins guide…", self)
-            act_bvm.setToolTip(
-                "Choose Index BVM Unknown/Known vs Orient. peaks; Send g1/g2 to Basis.")
-            act_bvm.triggered.connect(self._show_index_bvm_guide)
-            help_m.addAction(act_bvm)
 
     def _sync_figure_policy(self) -> None:
         kw = dict(
@@ -4518,20 +4443,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(dlg)
         browser = QtWidgets.QTextBrowser()
         browser.setHtml(_CALIB_GUIDE_HTML)
-        browser.setOpenExternalLinks(True)
-        lay.addWidget(browser, 1)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
-        bb.rejected.connect(dlg.accept)
-        lay.addWidget(bb)
-        dlg.exec()
-
-    def _show_index_bvm_guide(self) -> None:
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Indexing plugins guide — fast4d")
-        dlg.resize(560, 520)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        browser = QtWidgets.QTextBrowser()
-        browser.setHtml(_INDEX_BVM_GUIDE_HTML)
         browser.setOpenExternalLinks(True)
         lay.addWidget(browser, 1)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
@@ -4843,7 +4754,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                  "Edit the Q-pixel calibration crystal (element, structure, a)."),
             ])
         elif key == "basis":
-            # Index BVM / Orient. peaks: only when FAST4D_ENABLE_INDEXING_UI=1 (Plugin menu)
             add_setting_bar("basis")
         elif key == "strain":
             add("Apply", self._apply_strain_params, tip="Commit strain parameters from the table.")
@@ -5771,22 +5681,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if sc is None:
             return
         self._show_tool(BasisDialog(self))
-
-    def _open_bvm_indexer(self, prefer_mode: str | None = None) -> None:
-        """BVM RANSAC + hkl indexer (Plugin menu; Send writes index_*)."""
-        sc = self._need_active()
-        if sc is None:
-            return
-        from qt_indexer import IndexerDialog
-        self._show_tool(IndexerDialog(self, prefer_mode=prefer_mode))
-
-    def _open_orientation_peaks(self) -> None:
-        """py4DSTEM orientation → peaks (Plugin menu; Path A/B; optional Send)."""
-        sc = self._need_active()
-        if sc is None:
-            return
-        from qt_orientation import OrientationPeaksDialog
-        self._show_tool(OrientationPeaksDialog(self))
 
     def _open_virtualization(self) -> None:
         """Open the virtual-images generator (raw datacube → ADF/BF/DP → .h5). The

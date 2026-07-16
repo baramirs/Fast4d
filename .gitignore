@@ -45,7 +45,11 @@ graphify-out/
 !ForGITHUB-Updates.md
 !CHANGELOG_*.md
 !MEMORY_ARCHITECTURE_REPORT.md
-!docs/**/*.md
+!SECURITY.md
+!LICENSE*
+
+# Agent / internal plan docs (keep out of public tree)
+docs/superpowers/
 
 # Raw / heavy microscopy data
 data/
