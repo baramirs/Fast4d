@@ -65,6 +65,11 @@ def _batch():
     return fast_batch
 
 
+def _session_scope():
+    import session_scope
+    return session_scope
+
+
 def _new_state():
     from state import WorkflowState
     return WorkflowState()
@@ -6151,6 +6156,8 @@ def save_session_json(scans: list[Scan], path: str, *, log: Log = None) -> str:
             }
             for sc in scans
         ],
+        # files the Report's Session analysis acts on (session_scope)
+        "session_analysis": _session_scope().current().to_json(),
     }
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -6437,4 +6444,6 @@ def load_session_json(path: str) -> list[Scan]:
         )
         sc.results_dir = sd.get("results_dir", "")
         out.append(sc)
+    _session_scope().current().load(data.get("session_analysis"),
+                                    [s.name for s in out])
     return out
