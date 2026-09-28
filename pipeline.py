@@ -5095,6 +5095,10 @@ def _sanitize_strain_raw(
         invalid = ~np.isfinite(S3).all(axis=-1)
         invalid |= np.any(np.abs(S3) > _STRAIN_SENTINEL_ABS_MAX, axis=-1)
         invalid |= np.any(np.abs(S3) >= _STRAIN_FRACTION_UNPHYSICAL_ABS, axis=-1)
+        if work.shape[-1] >= 5:
+            # py4DSTEM fit mask (STRAIN_RAW_CHANNELS[4]): failed fits have g = 0, so
+            # e = 1, which the rotated tensor turns into 0.99999... (< the rule above)
+            invalid |= ~(np.nan_to_num(work[..., 4]) > 0.5)
         if void is not None:
             invalid |= void
         work = np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
@@ -5113,6 +5117,10 @@ def _sanitize_strain_raw(
         invalid = ~np.isfinite(S3).all(axis=0)
         invalid |= np.any(np.abs(S3) > _STRAIN_SENTINEL_ABS_MAX, axis=0)
         invalid |= np.any(np.abs(S3) >= _STRAIN_FRACTION_UNPHYSICAL_ABS, axis=0)
+        if work.shape[0] >= 5:
+            # py4DSTEM fit mask (STRAIN_RAW_CHANNELS[4]): failed fits have g = 0, so
+            # e = 1, which the rotated tensor turns into 0.99999... (< the rule above)
+            invalid |= ~(np.nan_to_num(work[4]) > 0.5)
         if void is not None:
             invalid |= void
         work = np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
