@@ -5796,23 +5796,8 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._save_dpi.valueChanged.connect(lambda _v: self._sync_figure_policy())
         store_top.addWidget(self._save_dpi)
         g_store_v.addLayout(store_top)
-        analysis_scope_row = hrow()
-        self._cb_shared_stats = QtWidgets.QCheckBox("Repro. exp. (share stats across files)")
-        self._cb_shared_stats.setChecked(E.get_analysis_scope().shared_stats)
-        self._cb_shared_stats.setToolTip(
-            "OFF (default): each file's line/ROI/strain results stay independent — "
-            "the Report's cross-file views ('…across files', and the cross-scan "
-            "distribution/box/PCA/stress/stats views) only show the currently "
-            "active file, so two unrelated scans never get silently averaged or "
-            "compared just because they share a line/ROI id like 'L1'.\n"
-            "ON: treat every currently loaded file as repeated measurements of "
-            "the SAME sample/line (a reproducibility experiment) — cross-file "
-            "views combine all of them, as before.")
-        self._cb_shared_stats.toggled.connect(
-            lambda on: E.set_analysis_scope(shared_stats=on))
-        analysis_scope_row.addWidget(self._cb_shared_stats)
-        analysis_scope_row.addStretch(1)
-        g_store_v.addLayout(analysis_scope_row)
+        # Which files the Report's Session analysis uses is chosen there
+        # (Session analysis > Files + Refresh), not by a global checkbox.
         store_bottom = hrow()
         store_bottom.addStretch(1)
         b_store = QtWidgets.QPushButton("Store…")

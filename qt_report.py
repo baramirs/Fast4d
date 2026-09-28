@@ -15,6 +15,7 @@ from __future__ import annotations
 from PySide6 import QtCore, QtWidgets
 
 import engine as E
+import session_scope as SS
 
 # ── figure key taxonomy ───────────────────────────────────────────────────────
 FIG_LABELS = {
@@ -55,19 +56,19 @@ _LEGACY_DERIVED = {
     "roi_distribution", "lines",
 }
 
-# Session analysis actions (not per-scan leaves)
+# Session analysis actions (not per-scan leaves). They act only on the files
+# ticked under Session analysis > Files and applied with Refresh (session_scope).
+# Box/violin and PCA live in the reproducibility plugin; pixel-wise difference
+# and repeatability were dropped (scans are not of the same area in general).
 _SESSION_ACTIONS = [
     ("Strain distribution", "dist"),
-    ("Box / Violin by channel", "box"),
-    ("Channel correlation (active scan)", "corr"),
-    ("PCA of scans", "pca"),
-    ("Stress summary (table)", "stress"),
+    ("Channel correlation", "corr"),
     ("Strain stats (table)", "stats"),
+    ("Stress summary (table)", "stress"),
     ("Calibration values (plot)", "calib_plot"),
     ("Calibration values (table)", "calib_table"),
-    ("Pixel-wise difference", "pixdiff"),
-    ("Repeatability metrics (table)", "pixdiff_table"),
 ]
+_NO_FILES_MSG = "Tick files under Session analysis > Files and press Refresh."
 
 _ROLE = QtCore.Qt.ItemDataRole.UserRole
 
@@ -174,7 +175,26 @@ class ReportPanel(QtWidgets.QWidget):
         self._tree.setUniformRowHeights(True)
         self._tree.setAnimated(True)
         self._tree.itemSelectionChanged.connect(self._on_tree_selection)
+        self._tree.itemChanged.connect(self._on_item_changed)
         left_l.addWidget(self._tree, 1)
+
+        # Session analysis > Files: which files the session analyses act on
+        files_bar = QtWidgets.QHBoxLayout()
+        self._files_label = QtWidgets.QLabel("")
+        self._files_label.setStyleSheet("font-size:10px;")
+        files_bar.addWidget(self._files_label, 1)
+        for txt, fn, tip in (
+            ("All", lambda: self._tick_session_files(
+                [s.name for s in (self._get_scans() or [])]), "Tick every file."),
+            ("None", lambda: self._tick_session_files([]), "Untick every file."),
+            ("Refresh", self._refresh_session_files,
+             "Apply the ticked files to Session analysis and re-show."),
+        ):
+            b = QtWidgets.QPushButton(txt)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            files_bar.addWidget(b)
+        left_l.addLayout(files_bar)
 
         # session options (channel / map label) — used when a Session leaf is selected
         sess = QtWidgets.QHBoxLayout()
@@ -436,16 +456,88 @@ class ReportPanel(QtWidgets.QWidget):
             font.setBold(True)
             sess.setFont(0, font)
             self._tree.addTopLevelItem(sess)
+            sel = SS.current()
+            names = [s.name for s in scans]
+            sel.set_checked([n for n in sel.checked if n in names])
+            files = QtWidgets.QTreeWidgetItem(["Files"])
+            files.setData(0, _ROLE, {"kind": "session_files"})
+            sess.addChild(files)
+            ticked = set(sel.checked)
+            for n in names:
+                it = QtWidgets.QTreeWidgetItem([n])
+                it.setData(0, _ROLE, {"kind": "session_file", "name": n})
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(0, QtCore.Qt.CheckState.Checked if n in ticked
+                                 else QtCore.Qt.CheckState.Unchecked)
+                files.addChild(it)
+            files.setExpanded(True)
             for title, action in _SESSION_ACTIONS:
                 if needle and needle not in title.lower():
                     continue
                 leaf = QtWidgets.QTreeWidgetItem([title])
                 leaf.setData(0, _ROLE, {"kind": "session", "action": action})
                 sess.addChild(leaf)
-            sess.setExpanded(False)
+            sess.setExpanded(True)
 
+        self._update_files_label()
         if prev:
             self._restore_payload(prev)
+
+    # ── Session analysis > Files ──────────────────────────────────────────────
+    def _file_items(self):
+        root = self._tree.invisibleRootItem()
+        out = []
+
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if (ch.data(0, _ROLE) or {}).get("kind") == "session_file":
+                    out.append(ch)
+                walk(ch)
+
+        walk(root)
+        return out
+
+    def _update_files_label(self) -> None:
+        sel = SS.current()
+        n = len(self._get_scans() or [])
+        txt = f"Files ({len(sel.checked)} of {n})"
+        if sel.pending:
+            txt += "  (pending: press Refresh)"
+        self._files_label.setText(txt)
+        self._files_label.setStyleSheet(
+            "font-size:10px;" + (" color:#C62828;" if sel.pending else ""))
+
+    def _on_item_changed(self, item, _col) -> None:
+        if self._suppress or (item.data(0, _ROLE) or {}).get("kind") != "session_file":
+            return
+        SS.current().set_checked([
+            (it.data(0, _ROLE) or {}).get("name") for it in self._file_items()
+            if it.checkState(0) == QtCore.Qt.CheckState.Checked])
+        self._update_files_label()
+
+    def _tick_session_files(self, names) -> None:
+        """Set the tick boxes (does not change what the analyses show)."""
+        keep = set(names)
+        was = self._suppress
+        self._suppress = True
+        try:
+            for it in self._file_items():
+                on = (it.data(0, _ROLE) or {}).get("name") in keep
+                it.setCheckState(0, QtCore.Qt.CheckState.Checked if on
+                                 else QtCore.Qt.CheckState.Unchecked)
+        finally:
+            self._suppress = was
+        avail = [s.name for s in (self._get_scans() or [])]
+        SS.current().set_checked([n for n in avail if n in keep])
+        self._update_files_label()
+
+    def _refresh_session_files(self) -> None:
+        """Apply the ticked files and re-show the current session leaf."""
+        SS.current().refresh()
+        self._update_files_label()
+        if (self._current_payload() or {}).get("kind") == "session":
+            self._show_current()
 
     def _find_leaf(self, parent: QtWidgets.QTreeWidgetItem, key: str):
         for i in range(parent.childCount()):
@@ -530,7 +622,8 @@ class ReportPanel(QtWidgets.QWidget):
     def _show_current(self) -> None:
         scans = self._get_scans() or []
         payload = self._current_payload()
-        if not payload or payload.get("kind") in ("scan", "branch", "session_root"):
+        if not payload or payload.get("kind") in (
+                "scan", "branch", "session_root", "session_files", "session_file"):
             return
         if payload.get("kind") == "figure":
             self._show_figure(scans, payload.get("scan_idx", -1), payload.get("key"))
@@ -614,15 +707,13 @@ class ReportPanel(QtWidgets.QWidget):
         if not scans:
             self._status.setText("No scans loaded.")
             return
+        scans = SS.current().applied_scans(scans)
+        if not scans:
+            self._set_figure(None)
+            self._status.setText(_NO_FILES_MSG)
+            return
         label = self._sess_label.currentData() or "without_roi"
         channel = self._sess_channel.currentData()
-        restricted = False
-        grouped = action in ("dist", "box", "pca", "stress", "stats", "calib_plot", "calib_table")
-        if grouped and not E.get_analysis_scope().shared_stats:
-            active = self._get_active_scan() if self._get_active_scan else None
-            if active is not None:
-                scans = [active]
-                restricted = True
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
             import analysis as A
@@ -630,13 +721,8 @@ class ReportPanel(QtWidgets.QWidget):
             if action == "dist":
                 ch = channel if channel in ("eyy", "exx", "exy") else "eyy"
                 self._set_figure(A.distribution_figure(scans, channel=ch, label=label))
-            elif action == "box":
-                self._set_figure(A.boxplot_figure(scans, label=label, kind="violin"))
             elif action == "corr":
-                active = self._get_active_scan() if self._get_active_scan else scans[0]
-                self._set_figure(A.correlation_figure(active, label))
-            elif action == "pca":
-                self._set_figure(A.pca_figure(scans, label))
+                self._set_figure(A.pooled_correlation_figure(scans, label))
             elif action == "stress":
                 c11, c12, c44 = scans[0].params.stress_constants_gpa()
                 self._set_table(A.stress_summary_table(
@@ -649,20 +735,10 @@ class ReportPanel(QtWidgets.QWidget):
                 self._set_figure(E.build_calibration_value_figure(scans, value))
             elif action == "calib_table":
                 self._set_table(E.calibration_values_table(scans))
-            elif action == "pixdiff":
-                if len(scans) < 2:
-                    self._status.setText("Need ≥2 scans for pixel difference.")
-                    return
-                self._set_figure(E.build_pixel_difference_figure(
-                    scans[0], scans[1], channel, label, drift_correct=False))
-            elif action == "pixdiff_table":
-                self._set_table(E.pixel_difference_table(
-                    scans, channel, label, reference_idx=0, drift_correct=False))
             else:
                 self._status.setText(f"Unknown session action: {action}")
                 return
-            note = " — active file only" if restricted else ""
-            self._status.setText(f"Session · {action}{note}")
+            self._status.setText(f"Session · {action} · {len(scans)} file(s)")
         except Exception as exc:
             self._status.setText(f"Error: {exc}")
         finally:
