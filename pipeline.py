@@ -4694,6 +4694,19 @@ def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, lab
         _log(log, f"Crystal frame [{label}]: x || [{CF.hkl_str(spec['x_hkl'])}] from "
                   f"{efr['n_planes']} indexed BVM planes -> {true_angle:.3f} deg. "
                   f"Credibility: {efr['credibility']}")
+        # py4DSTEM's basis must be a primitive pair of the indexed lattice (warning only)
+        try:
+            try:
+                from . import bvm_indexing as BI
+            except ImportError:
+                import bvm_indexing as BI
+            chk = BI.check_basis_vectors(_res, strainmap.g1, strainmap.g2,
+                                         tol_px=float(spec.get("index_tol_px") or 2.0))
+            ext_info["basis_check"] = chk
+            if not chk["ok"]:
+                _log(log, f"WARNING basis [{label}]: {chk['text']}")
+        except Exception as exc:
+            _log(log, f"Note: basis check skipped ({exc})")
         if abs(d) > 2.0:
             _log(log, f"WARNING crystal frame [{label}]: the g1/g2-label angle "
                       f"({g1g2_angle:.2f} deg) differs by {d:+.2f} deg (mod 180) from the "

@@ -886,7 +886,50 @@ def make_indexing_figure(result: IndexingResult, *, title: str | None = None):
 #: (strain is a few %, a wrong lattice is tens-thousands of %)
 MAX_CREDIBLE_DD_PCT = 20.0
 
-def frame_from_indexing(result: IndexingResult, x_hkl, y_hkl, B=None) -> dict[str, Any]:
+def check_basis_vectors(result: IndexingResult, g1_px, g2_px, tol_px: float | None = None) -> dict[str, Any]:
+    """Are py4DSTEM's basis vectors g1, g2 (BVM px, origin-relative) a PRIMITIVE pair of
+    the externally indexed lattice? Warning only -- nothing is changed.
+
+    Each g is written in the RANSAC primitive basis (a, b); it is a lattice vector
+    when the integer combination lands within ``tol_px`` of it, and the pair is
+    primitive when det of the integer coefficients is +-1. A non-lattice vector (the
+    automatic choice picked a spurious maximum, e.g. Scan01 with the origin 1 px off
+    in qy) or a sub-lattice pair (e.g. {220}/{002}) mis-indexes the peaks of every
+    pattern and ruins the strain (RMS 10-16 % on PARA TEST)."""
+    tol = float(result.tol_px if tol_px is None else tol_px)
+    M = np.column_stack([np.asarray(result.basis_a_px, float), np.asarray(result.basis_b_px, float)])
+    out: dict[str, Any] = {}
+    ns, res_px = [], []
+    ah, bh = np.asarray(result.a_hkl, int), np.asarray(result.b_hkl, int)
+    for name, g in (("g1", g1_px), ("g2", g2_px)):
+        gv = np.asarray(g, float).ravel()[:2]
+        n = np.round(np.linalg.solve(M, gv)).astype(int)
+        r = float(np.linalg.norm(M @ n - gv))
+        ns.append(n)
+        res_px.append(r)
+        out[f"{name}_mn"] = [int(v) for v in n]
+        out[f"{name}_residual_px"] = r
+        out[f"{name}_hkl"] = [int(v) for v in (n[0] * ah + n[1] * bh)] if (ah.any() or bh.any()) else None
+    det = int(ns[0][0] * ns[1][1] - ns[0][1] * ns[1][0])
+    lattice_ok = all(r <= tol for r in res_px)
+    primitive = lattice_ok and abs(det) == 1
+    out.update(lattice_ok=bool(lattice_ok), primitive=bool(primitive), det=det,
+               ok=bool(lattice_ok and primitive), tol_px=tol)
+    if not lattice_ok:
+        bad = [n for n, r in (("g1", res_px[0]), ("g2", res_px[1])) if r > tol]
+        out["text"] = (f"{', '.join(bad)} not a lattice vector of the indexed crystal "
+                       f"(residual {max(res_px):.2f} px > {tol:.2f} px): py4DSTEM picked a spurious "
+                       f"BVM maximum -- the strain is unreliable; fix the basis indices")
+    elif not primitive:
+        out["text"] = (f"g1 {out['g1_hkl']}, g2 {out['g2_hkl']} are lattice vectors but not primitive "
+                       f"(|det| = {abs(det)}): part of the peaks are mis-indexed -- choose a primitive pair")
+    else:
+        out["text"] = f"g1 {out['g1_hkl']}, g2 {out['g2_hkl']}: primitive lattice pair"
+    return out
+
+
+def frame_from_indexing(result: IndexingResult, x_hkl, y_hkl, B=None, *,
+                        strict: bool = True) -> dict[str, Any]:
     """Where x_hkl and y_hkl point in the (qx, qy) plane of the BVM, from ALL the
     indexed peaks -- not from py4DSTEM's g1, g2.
 
@@ -908,7 +951,8 @@ def frame_from_indexing(result: IndexingResult, x_hkl, y_hkl, B=None) -> dict[st
     dd_all = np.array([p.dd_pct for p in rows], dtype=float)
     dd_all = dd_all[np.isfinite(dd_all)]
     med_dd = float(np.median(np.abs(dd_all))) if dd_all.size else float("inf")
-    if len(rows) < 0.5 * n_all or med_dd > MAX_CREDIBLE_DD_PCT:
+    credible = not (len(rows) < 0.5 * n_all or med_dd > MAX_CREDIBLE_DD_PCT)
+    if strict and not credible:
         raise RuntimeError(
             f"indexing not credible: {len(rows)}/{n_all} peaks indexed, median "
             f"|d_exp - d_theo| {med_dd:.1f} % (limits: half the peaks, "
@@ -942,7 +986,7 @@ def frame_from_indexing(result: IndexingResult, x_hkl, y_hkl, B=None) -> dict[st
         else float(np.linalg.norm(g3(x_hkl)))
     x_meas = float(np.linalg.norm(xq)) * float(result.Q_pixel)
     return dict(
-        angle_deg=ang, y_sign=int(y_sign),
+        angle_deg=ang, y_sign=int(y_sign), credible=bool(credible),
         x_qxy=[float(xq[0]), float(xq[1])], y_qxy=[float(yq[0]), float(yq[1])],
         ortho_err_deg=ortho_err, n_planes=int(len(rows)), n_peaks=int(len(result.peaks)),
         rms_px=rms_px, rms_pct=rms_pct,

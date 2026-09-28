@@ -371,3 +371,29 @@ def test_frame_from_indexing_rejects_a_non_credible_indexing():
     res.peaks, res.lattice_a, res.Q_pixel = rows, 5.431, 0.02
     with pytest.raises(RuntimeError, match="not credible"):
         bvm.frame_from_indexing(res, [-1, 1, 0], [0, 0, 1])
+
+
+def _fake_result(a, b, a_hkl=(-1, 1, 1), b_hkl=(-1, 1, -1)):
+    res = bvm.IndexingResult.__new__(bvm.IndexingResult)
+    res.basis_a_px, res.basis_b_px = np.array(a, float), np.array(b, float)
+    res.a_hkl, res.b_hkl = np.array(a_hkl), np.array(b_hkl)
+    res.tol_px = 2.0
+    return res
+
+
+def test_basis_check_accepts_a_primitive_lattice_pair():
+    res = _fake_result([14.8, 0.0], [4.9, 13.95])
+    chk = bvm.check_basis_vectors(res, [14.8, 0.0], [4.9 - 14.8, 13.95])     # a, b - a
+    assert chk["ok"] and chk["lattice_ok"] and chk["primitive"]
+    assert chk["g1_hkl"] == [-1, 1, 1] and chk["g2_hkl"] == [0, 0, -2]
+
+
+def test_basis_check_flags_non_lattice_and_non_primitive_pairs():
+    res = _fake_result([14.8, 0.0], [4.9, 13.95])
+    # Scan01 with the origin 1 px off in qy: the chosen maxima sat 3.5-6.4 px off the
+    # lattice (real {111} basis vectors: 0.03-0.12 px)
+    off = bvm.check_basis_vectors(res, [11.0, 3.5], [4.9, 13.95])
+    assert not off["ok"] and not off["lattice_ok"] and "not a lattice vector" in off["text"]
+    sub = bvm.check_basis_vectors(res, [29.6, 0.0], [4.9, 13.95])           # 2a, b: index-2 sublattice
+    assert sub["lattice_ok"] and not sub["primitive"] and not sub["ok"]
+    assert "not primitive" in sub["text"]
