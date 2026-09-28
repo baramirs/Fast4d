@@ -2606,6 +2606,27 @@ def compute_ellipse_bvm_step(
     return state.ellipse_bvm
 
 
+def ellipse_fit_center(center, bvm, log: Callable[[str], None] | None = None):
+    """Annulus centre for fit_ellipse_1D: ``center`` (y, x in BVM px) when it is a real
+    point inside the BVM, else ``bvm.origin``. [0, 0] (how "no centre" is stored in
+    older .h5 files) or a point outside the map would make the fit return its seed."""
+    origin = tuple(float(v) for v in bvm.origin)
+    if center is None:
+        return origin
+    try:
+        c = tuple(float(v) for v in center)[:2]
+    except (TypeError, ValueError):
+        c = ()
+    shape = np.asarray(getattr(bvm, "data", bvm)).shape
+    ok = (len(c) == 2 and all(np.isfinite(c)) and not (abs(c[0]) < 1e-9 and abs(c[1]) < 1e-9)
+          and 0.0 <= c[0] < shape[0] and 0.0 <= c[1] < shape[1])
+    if not ok:
+        _log(log, f"Ellipse centre {center} is unset / outside the BVM {shape[:2]}: "
+                  f"using the calibrated origin {tuple(round(v, 3) for v in origin)}.")
+        return origin
+    return c
+
+
 def fit_ellipse_step(
     state: WorkflowState,
     q_range: tuple[int, int],
@@ -2627,7 +2648,7 @@ def fit_ellipse_step(
         raise ValueError("Ellipse q_range must satisfy 0 <= r0 < r1.")
     state.ellipse_q_range = (r0, r1)
     bvm = compute_ellipse_bvm_step(state, sampling=sampling, use_roi=use_roi, log=log)
-    fit_center = tuple(map(float, center)) if center is not None else bvm.origin
+    fit_center = ellipse_fit_center(center, bvm, log=log)
     state.p_ellipse = py4DSTEM.process.calibration.fit_ellipse_1D(
         bvm,
         center=fit_center,

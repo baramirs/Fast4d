@@ -352,7 +352,7 @@ class CalibrationParams:
     ellipse_sampling: int = 1
     ellipse_use_roi: bool = True
     ellipse_center: list | None = None  # (y, x) BVM-px override for fit center;
-                                         # None = use bvm.origin (legacy default)
+                                         # None / [0, 0] / off-map = use bvm.origin
 
     # ── Q pixel size (cell 37) — always fits: px_guess in → fitted px out ──────
     q_px: float = 0.0137          # px_guess (editable INPUT; never overwritten)
@@ -2641,8 +2641,7 @@ def calibrate_ellipse(scan: Scan, *, make_figure: bool = True, log: Log = None) 
     pl = _pipeline()
     st = scan.ensure_state()
     r0, r1 = sorted(int(v) for v in p.ellipse_q_range)
-    center = (tuple(map(float, p.ellipse_center))
-              if getattr(p, "ellipse_center", None) else None)
+    center = getattr(p, "ellipse_center", None) or None   # [0, 0] / off-map: fit_ellipse_step
     res = pl.fit_ellipse_step(st, (r0, r1), sampling=int(p.ellipse_sampling),
                               use_roi=bool(p.ellipse_use_roi),
                               center=center, log=log)
@@ -2699,7 +2698,7 @@ def fit_ellipse_preview(scan: Scan, r0, r1, *, sampling: int = 1,
         origin = (tuple(map(float, origin)) if origin is not None
                   else (img.shape[0] / 2.0, img.shape[1] / 2.0))
     r0, r1 = sorted((int(r0), int(r1)))
-    fit_center = tuple(map(float, center)) if center is not None else bvm.origin
+    fit_center = _pipeline().ellipse_fit_center(center, bvm, log=log)
     try:
         p_fit = py4DSTEM.process.calibration.fit_ellipse_1D(
             bvm, center=fit_center, fitradii=(r0, r1))
