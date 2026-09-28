@@ -5085,37 +5085,6 @@ def _is_tensor_strain_field_name(name: str) -> bool:
     return any(x in n for x in ("exx", "eyy", "exy", "e_xx", "e_yy", "e_xy", "eps_xx", "eps_yy", "eps_xy"))
 
 
-def _scan_void_mask_from_virtual_image(state: WorkflowState, shape_hw: tuple[int, int]) -> np.ndarray | None:
-    """ADF low-intensity pixels (same shape as strain) approximate vacuum / no sample."""
-    H, W = int(shape_hw[0]), int(shape_hw[1])
-    vis = getattr(state, "virtual_images", None)
-    if not vis:
-        return None
-    # ADF: vacuum is dark. Avoid BF (often inverted) and DP mean (can be misleading).
-    for key in ("annular_dark_field",):
-        obj = vis.get(key)
-        if obj is None:
-            continue
-        try:
-            arr = np.asarray(getattr(obj, "data", obj), dtype=float)
-        except Exception:
-            continue
-        if arr.ndim != 2:
-            continue
-        if arr.shape[0] != H or arr.shape[1] != W:
-            continue
-        flat = np.nan_to_num(arr.ravel(), nan=0.0, posinf=0.0, neginf=0.0)
-        if flat.size == 0 or float(np.nanmax(flat)) <= 0:
-            continue
-        lo = float(np.percentile(flat, 15.0))
-        hi = float(np.percentile(flat, 99.5))
-        scale = max(hi - lo, hi * 1e-6, 1e-12)
-        n = np.clip((arr - lo) / scale, 0.0, 1.0)
-        dark = np.asarray(n < 0.06, dtype=bool)
-        return dark | ~np.isfinite(arr)
-    return None
-
-
 def _sanitize_strain_raw(
     raw: Any,
     state: WorkflowState,
@@ -5127,8 +5096,10 @@ def _sanitize_strain_raw(
 
     Strain ROI is only for reference fitting (``gvects``); do not blank exterior pixels here.
 
-    Also zeros tensor strain ε where |ε|≥1 (100% artefacts from vacío/div0) or on low-intensity
-    scan pixels (ADF/BF void mask when shapes match virtual images).
+    Also zeros tensor strain ε where |ε|≥1 (100% artefacts from vacío/div0) and where
+    py4DSTEM's lattice fit failed (fit mask, channel 4): that is what marks vacuum.
+    No ADF-based "void" rule: a relative ADF threshold always cut the darkest part of
+    the image and blanked real crystal in fields with no vacuum.
     """
     if raw is None:
         return None
@@ -5148,7 +5119,6 @@ def _sanitize_strain_raw(
             return raw
         H, W = refs[0].shape
         invalid = np.zeros((H, W), dtype=bool)
-        void = _scan_void_mask_from_virtual_image(state, (H, W))
         for key in arr.dtype.names:
             sl = np.asarray(arr[key], dtype=np.float64)
             if sl.ndim != 2 or sl.shape != (H, W):
@@ -5156,7 +5126,7 @@ def _sanitize_strain_raw(
             invalid |= ~np.isfinite(sl)
             invalid |= np.abs(sl) > _STRAIN_SENTINEL_ABS_MAX
 
-        mask_base = invalid if void is None else (invalid | void)
+        mask_base = invalid
         for key in arr.dtype.names:
             sl = np.asarray(arr[key], dtype=np.float64)
             if sl.ndim != 2 or sl.shape != (H, W):
@@ -5187,7 +5157,6 @@ def _sanitize_strain_raw(
         if work.shape[-1] < 3:
             return raw
         H, W = int(work.shape[0]), int(work.shape[1])
-        void = _scan_void_mask_from_virtual_image(state, (H, W))
         S3 = work[..., :3]
         invalid = ~np.isfinite(S3).all(axis=-1)
         invalid |= np.any(np.abs(S3) > _STRAIN_SENTINEL_ABS_MAX, axis=-1)
@@ -5196,8 +5165,6 @@ def _sanitize_strain_raw(
             # py4DSTEM fit mask (STRAIN_RAW_CHANNELS[4]): failed fits have g = 0, so
             # e = 1, which the rotated tensor turns into 0.99999... (< the rule above)
             invalid |= ~(np.nan_to_num(work[..., 4]) > 0.5)
-        if void is not None:
-            invalid |= void
         work = np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
         work[invalid] = 0.0
         try:
@@ -5209,7 +5176,6 @@ def _sanitize_strain_raw(
 
     if ch_first and work.shape[0] >= 3:
         H, W = int(work.shape[1]), int(work.shape[2])
-        void = _scan_void_mask_from_virtual_image(state, (H, W))
         S3 = work[:3, ...]
         invalid = ~np.isfinite(S3).all(axis=0)
         invalid |= np.any(np.abs(S3) > _STRAIN_SENTINEL_ABS_MAX, axis=0)
@@ -5218,8 +5184,6 @@ def _sanitize_strain_raw(
             # py4DSTEM fit mask (STRAIN_RAW_CHANNELS[4]): failed fits have g = 0, so
             # e = 1, which the rotated tensor turns into 0.99999... (< the rule above)
             invalid |= ~(np.nan_to_num(work[4]) > 0.5)
-        if void is not None:
-            invalid |= void
         work = np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
         work[:, invalid] = 0.0
         try:
