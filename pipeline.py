@@ -4208,6 +4208,10 @@ def _apply_show_orientation_to_figures(
         _log(log, f"Hid orientation (theta) panel on {n_hidden} strain figure(s).")
 
 
+#: Fewest fitted ROI pixels accepted for a strain reference (same floor as _sanitize_gvects).
+MIN_REFERENCE_PIXELS = 25
+
+
 def capture_reference_g12_from_strainmap(
     strainmap: Any,
     roi_mask: np.ndarray,
@@ -4218,6 +4222,10 @@ def capture_reference_g12_from_strainmap(
     (after ``fit_basis_vectors`` / ``get_strain``). Use on a **reference** scan
     (e.g. naked Si), then pass the returned pair as ``gvects`` when computing
     strain on other scans with the **same** basis / calibration convention.
+
+    Same rule as py4DSTEM ``get_strain(gvects=ROI)``: the median runs over
+    ``ROI AND StrainMap.mask``. Pixels without a lattice fit have g1 = g2 = 0 in
+    ``g1g2_map`` and would pull the reference (and shift the whole map).
     """
     if strainmap is None:
         raise RuntimeError("StrainMap is missing: run full strain on the reference scan first.")
@@ -4233,7 +4241,19 @@ def capture_reference_g12_from_strainmap(
         raise RuntimeError("ROI mask is empty.")
     if not hasattr(strainmap, "get_reference_g1g2"):
         raise RuntimeError("This py4DSTEM StrainMap has no get_reference_g1g2; update py4DSTEM?")
-    g1, g2 = strainmap.get_reference_g1g2(mask)
+    fit = getattr(strainmap, "mask", None)
+    fitted = mask if fit is None else np.logical_and(mask, np.asarray(fit, dtype=bool))
+    n_roi, n_ok = int(mask.sum()), int(fitted.sum())
+    if n_ok < MIN_REFERENCE_PIXELS:
+        raise RuntimeError(
+            f"With-ROI reference: only {n_ok} of {n_roi} ROI pixels have a lattice fit "
+            f"(need >= {MIN_REFERENCE_PIXELS}); the rest is vacuum / failed fit. "
+            f"Move the ROI onto crystal.")
+    if n_ok < n_roi:
+        _log(log, f"WARNING with-ROI reference: {n_roi - n_ok} of {n_roi} ROI pixels have no "
+                  f"lattice fit (vacuum / failed fit) and were left out; median over the "
+                  f"remaining {n_ok} (py4DSTEM rule: ROI AND fit mask).")
+    g1, g2 = strainmap.get_reference_g1g2(fitted)
     a1 = np.asarray(g1, dtype=np.float64).ravel()
     a2 = np.asarray(g2, dtype=np.float64).ravel()
     if a1.size < 2 or a2.size < 2:
