@@ -87,8 +87,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("vis_vmin", "vis vmin", "float", decimals=3),
         ParamSpec("vis_vmax", "vis vmax", "float", decimals=3),
         # real_axis_h/v, indexing_orientation_mode, indexing_seed belonged to the BVM
-        # indexer (not in this tree): kept on CalibrationParams for old sessions, not
-        # shown. The indexing that IS used (zone + hkl labels) lives in the Strain tab.
+        # indexer: kept on CalibrationParams for old sessions, not shown. The frame is
+        # oriented by the external BVM indexing (bvm_indexing) from the Strain tab rows.
     ],
     "strain": [
         ParamSpec("frame_mode", "Tensor frame (crystal = auto angle)", "enum",
@@ -96,8 +96,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("zone_axis", "Zone axis [uvw]", "list3"),
         ParamSpec("frame_x_hkl", "Frame x || [hkl]", "list3"),
         ParamSpec("frame_y_hkl", "Frame y || [hkl]", "list3"),
-        ParamSpec("frame_g1_hkl", "g1 label (hkl)", "list3"),
-        ParamSpec("frame_g2_hkl", "g2 label (hkl)", "list3"),
+        # frame_g1_hkl / frame_g2_hkl are not shown: x, y come from the indexed BVM
+        # planes; those labels only feed the g1/g2 cross-check in the log.
         ParamSpec("coordinate_rotation", "coordinate_rotation (deg; output if crystal)",
                   "float", decimals=2),
         ParamSpec("max_peak_spacing", "max_peak_spacing", "float", decimals=2),

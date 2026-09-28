@@ -100,6 +100,10 @@ class WorkflowState:
     # CalibrationParams, and one frame card per computed label (written to the manifest).
     crystal_frame_spec: dict[str, Any] | None = None
     crystal_frame_cards: dict[str, Any] = field(default_factory=dict)
+    # External BVM indexing (bvm_indexing.py: RANSAC + hkl) that orients the frame;
+    # (strainmap, (IndexingResult, frame dict) | None) cache for the two labels.
+    bvm_indexing: Any = None
+    bvm_frame_cache: Any = None
     line_profiles_px: dict[str, Any] = field(default_factory=dict)  # label -> {1:(p0,p1), 2:(p0,p1)}
     fixed_line_profiles_px: dict[int, tuple[tuple[float, float], tuple[float, float]]] | None = None
     # Step 14 reference ROI on εxx map: pixel box x0,x1,y0,y1 with x1/y1 exclusive (numpy slice semantics).

@@ -3394,6 +3394,11 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
         if probs:
             raise RuntimeError("Crystal frame spec is not valid: " + "; ".join(probs)
                                + " (Strain tab: frame_* rows, or set frame mode = manual)")
+    # external BVM indexing (orients the frame): theoretical crystal + tolerance
+    spec["lattice_a"] = float(p.cal_crystal_obj().a_lat)
+    spec["index_tol_px"] = float(p.indexing_tol_px if p.indexing_tol_px is not None
+                                 else p.max_peak_spacing)
+    spec["index_seed"] = int(p.indexing_seed)
     st.crystal_frame_spec = spec
 
     # use_roi=False here on purpose: we pass the reference via gvects, keeping the
@@ -3404,6 +3409,16 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     if card and card.get("mode") == "crystal":
         # coordinate_rotation is an output in crystal mode: show what was used
         p.coordinate_rotation = round(float(card["x_angle_applied_deg"]), 3)
+    idx = getattr(st, "bvm_indexing", None)
+    if idx is not None and getattr(scan, "indexing_result", None) is not idx:
+        scan.indexing_result = idx                    # Report > Calibrations > BVM indexing
+        try:
+            import bvm_indexing as bix
+            register_figure(scan, "indexing",
+                            bix.make_indexing_figure(idx, title=f"{scan.name} - BVM indexing"),
+                            force=True)
+        except Exception as exc:
+            _log(log, f"[{scan.name}] BVM indexing figure skipped: {exc}")
 
     # keep figures for later save
     if not getattr(st, "strain_figures", None):

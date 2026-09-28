@@ -4614,6 +4614,41 @@ def _reference_g12_for_frame(strainmap: Any, gv: Any) -> tuple[np.ndarray, np.nd
                 np.asarray(strainmap.g2, float).ravel()[:2], "basis g1,g2 (fallback)")
 
 
+def _external_frame(state: WorkflowState, strainmap: Any, spec: dict,
+                    log: Callable[[str], None] | None = None):
+    """(IndexingResult, frame) from the EXTERNAL indexing of the BVM that
+    choose_basis_vectors uses (bvm_indexing: RANSAC lattice + ZOLZ hkl of the
+    theoretical crystal), or None. Only orients the frame; py4DSTEM's g1, g2 are
+    not touched. Cached per StrainMap (the with/without ROI passes share it)."""
+    cache = getattr(state, "bvm_frame_cache", None)
+    if cache is not None and cache[0] is strainmap:     # identity, not id(): ids get reused
+        return cache[1]
+    out = None
+    if spec.get("lattice_a"):
+        try:
+            try:
+                from . import bvm_indexing as BI
+            except ImportError:
+                import bvm_indexing as BI
+            bvm = np.asarray(strainmap.bvm.data, dtype=float)
+            origin = np.asarray(strainmap.origin, dtype=float).ravel()[:2]
+            Q = float(strainmap.braggvectors.calibration.get_Q_pixel_size())
+            mp = (getattr(state, "strain_basis_params", {}) or {}).get("choose_basis_vectors") or {}
+            res, fr = BI.orient_from_bvm(
+                bvm, origin, Q_pixel=Q, lattice_a=float(spec["lattice_a"]),
+                zone_axis=spec["zone"], x_hkl=spec["x_hkl"], y_hkl=spec["y_hkl"],
+                tol_px=float(spec.get("index_tol_px") or 2.0),
+                seed=int(spec.get("index_seed") or 0), maxima_params=mp)
+            fr["credibility"] = BI.credibility_text(fr)
+            out = (res, fr)
+            state.bvm_indexing = res
+        except Exception as exc:
+            _log(log, f"WARNING crystal frame: external BVM indexing failed ({exc}); "
+                      f"falling back to the g1/g2 labels")
+    state.bvm_frame_cache = (strainmap, out)
+    return out
+
+
 def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, label: str,
                          log: Callable[[str], None] | None = None) -> dict | None:
     """Crystal-frame standard (crystal_frame.py). In mode 'crystal' the x axis of
@@ -4641,27 +4676,50 @@ def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, lab
         _log(log, f"Crystal frame: could not evaluate ({exc}); keeping the typed "
                   f"coordinate_rotation = {kwargs.get('coordinate_rotation', 0.0)}")
         return None
+    # The frame comes from the externally indexed BVM planes (all of them, RANSAC +
+    # theoretical crystal); the g1/g2-label angle above is kept only as a check.
+    ext = _external_frame(state, strainmap, spec, log)
+    g1g2_angle = float(fr["angle_deg"])
+    source = "g1,g2 labels"
+    true_angle = g1g2_angle
+    if ext is not None:
+        _res, efr = ext
+        true_angle, source = float(efr["angle_deg"]), "BVM indexing (RANSAC + hkl)"
+        d = CF._line_diff(true_angle, g1g2_angle)
+        ext_info = dict(frame_source=source, g1g2_angle_deg=g1g2_angle,
+                        g1g2_vs_indexing_deg=float(d),
+                        bvm_indexing={k: v for k, v in efr.items()
+                                      if k not in ("x_qxy", "y_qxy")},
+                        x_qxy_indexing=efr["x_qxy"], y_qxy_indexing=efr["y_qxy"])
+        _log(log, f"Crystal frame [{label}]: x || [{CF.hkl_str(spec['x_hkl'])}] from "
+                  f"{efr['n_planes']} indexed BVM planes -> {true_angle:.3f} deg. "
+                  f"Credibility: {efr['credibility']}")
+        if abs(d) > 2.0:
+            _log(log, f"WARNING crystal frame [{label}]: the g1/g2-label angle "
+                      f"({g1g2_angle:.2f} deg) differs by {d:+.2f} deg (mod 180) from the "
+                      f"indexed planes -- the indexing is used")
+    else:
+        ext_info = dict(frame_source=source)
     typed = float(kwargs.get("coordinate_rotation", 0.0) or 0.0)
     if manual:
         applied = typed
     else:
-        applied = float(fr["angle_deg"])
+        applied = true_angle
         kwargs["coordinate_rotation"] = applied
         try:
             state.strain_params.setdefault("get_strain", {})["coordinate_rotation"] = applied
         except Exception:
             pass
-        _log(log, f"Crystal frame [{label}]: x || [{CF.hkl_str(spec['x_hkl'])}] = "
-                  f"{CF.combo_label(fr['x_combo'])}  ->  coordinate_rotation = {applied:.3f} deg "
-                  f"(typed value {typed:.3f} ignored)")
-    if not fr["label_ok"]:
+        _log(log, f"Crystal frame [{label}]: coordinate_rotation = {applied:.3f} deg "
+                  f"({source}; typed value {typed:.3f} ignored)")
+    if ext is None and not fr["label_ok"]:
         _log(log, f"WARNING crystal frame [{label}]: g1^g2 measured {fr['g_angle_meas_deg']:.2f} deg "
                   f"but the hkl labels predict {fr['g_angle_pred_deg']:.2f} deg -- check "
                   f"g1_hkl / g2_hkl, x may not be [{CF.hkl_str(spec['x_hkl'])}]")
     sbp = getattr(state, "strain_basis_params", {}) or {}
     card = CF.make_card(
         "Fast4D", spec, "calibrated q (qx, qy), py4DSTEM get_strain",
-        fr["angle_deg"], applied, 1,
+        true_angle, applied, 1,
         x_def=CF.combo_label(fr["x_combo"]), y_def=CF.combo_label(fr["y_combo"]),
         y_sign=fr["y_sign"], ortho_err_deg=fr["ortho_err_deg"],
         g1_ref_qxy=[float(v) for v in g1], g2_ref_qxy=[float(v) for v in g2],
@@ -4670,11 +4728,11 @@ def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, lab
         label_err_deg=fr["label_err_deg"], label_ok=fr["label_ok"],
         qr_rotation=sbp.get("qr_rotation"), qr_flip=sbp.get("qr_flip"),
         label_resolution=lab["text"],
-        assumptions=assumptions)
+        assumptions=assumptions, **ext_info)
     if manual and abs(card["residual_rotation_deg"]) > CF.ANGLE_TOL_DEG:
         _log(log, f"Crystal frame [{label}] (manual): coordinate_rotation {typed:.2f} deg is "
                   f"{card['residual_rotation_deg']:+.2f} deg away from [{CF.hkl_str(spec['x_hkl'])}] "
-                  f"({fr['angle_deg']:.2f} deg). Set the frame mode to 'crystal' to fix it.")
+                  f"({true_angle:.2f} deg). Set the frame mode to 'crystal' to fix it.")
     try:
         state.crystal_frame_cards[str(label)] = card
     except Exception:
