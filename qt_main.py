@@ -7228,7 +7228,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                 E.flush_deferred_qpixel_figures([sc], log=self._console.log)
             except Exception as exc:
                 self._console.log(f"[{sc.name}] deferred Q-pixel figure skipped: {exc}")
-            self._flush_figure_saves()
             try:
                 i = self._scans.index(sc)
                 n = max(1, len(self._scans))
@@ -7246,19 +7245,9 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._params.report_refresh()
 
     @QtCore.Slot(object)
-    def _flush_figure_saves(self) -> None:
-        """Write figure PNGs the worker queued (figsave): savefig must run on this
-        thread, or a concurrent GUI redraw sizes the figure for the save dpi."""
-        try:
-            import figsave
-            figsave.flush(log=self._console.log)
-        except Exception as exc:
-            self._console.log(f"[warn] queued figure saves failed: {exc}")
-
     def _on_finished(self, result) -> None:
         self._set_busy(False)
         self._progress.setValue(100)
-        self._flush_figure_saves()
         n_qfig = E.flush_deferred_qpixel_figures(self._scans, log=self._console.log)
         if n_qfig:
             self._console.log(f"Built {n_qfig} deferred Q-pixel FIT figure(s) on GUI thread.")
@@ -7311,7 +7300,6 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                     self._console.log(f"[{label}] background result discarded (cancelled).")
                     return
                 self._set_busy(False, label)
-                self._flush_figure_saves()
                 if on_done is not None:
                     on_done(r)
                 self._maybe_tidy_figures()
