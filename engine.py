@@ -509,6 +509,8 @@ class Scan:
                                        # state resets (a heavy datacube load clears
                                        # state.virtual_images; this keeps pickers fed)
     lines: dict = field(default_factory=dict)   # {line_id: [[x0,y0],[x1,y1]]} placed on THIS scan
+                                                # (first point = START; profiles measure from it)
+    line_widths: dict = field(default_factory=dict)  # {line_id: integration width px} (Line/ROI tool)
     # NOTE: area_roi / area_rois are ANALYSIS measurement ROIs (line-profile extraction),
     # NOT the calibration ROI (that lives in params.roi_bounds and feeds ellipse/Q-pixel).
     # area_roi is the legacy single-ROI kept for back-compat JSON loading only;
@@ -998,6 +1000,8 @@ def apply_workspace_params_json(scans: list["Scan"], json_path: str | Path, *,
                                                  scan_name=sc.name)
         if getattr(src, "lines", None):
             sc.lines = dict(src.lines)
+        if getattr(src, "line_widths", None):
+            sc.line_widths = dict(src.line_widths)
         if getattr(src, "area_roi", None):
             sc.area_roi = list(src.area_roi)
         if getattr(src, "area_rois", None):
@@ -6374,6 +6378,8 @@ def _scan_metadata_dict(scan: "Scan") -> dict:
         "lines": {str(lid): [[float(s[0][0]), float(s[0][1])],
                              [float(s[1][0]), float(s[1][1])]]
                   for lid, s in (getattr(scan, "lines", None) or {}).items()},
+        "line_widths": {str(k): int(v) for k, v in
+                        (getattr(scan, "line_widths", None) or {}).items()},
         "area_roi": list(getattr(scan, "area_roi", None) or []),
         "area_rois": {str(rid): [float(b) for b in bounds]
                       for rid, bounds in scan_area_rois(scan).items()},
@@ -6456,6 +6462,12 @@ def apply_metadata_to_scan(scan: "Scan", meta: dict) -> bool:
                 pass
         if out:
             scan.lines = out
+    lw = meta.get("line_widths")
+    if isinstance(lw, dict) and lw:
+        try:
+            scan.line_widths = {str(k): clamp_line_width(v) for k, v in lw.items()}
+        except Exception:
+            pass
     if meta.get("area_roi"):
         scan.area_roi = list(meta["area_roi"])
     rois = meta.get("area_rois")
