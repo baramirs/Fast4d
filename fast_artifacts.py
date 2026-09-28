@@ -13,7 +13,8 @@ Layout written per scan (xarray/napari-ready for Phase 2)::
 
     gui_results_fast/<scan_stem>/
         data/
-            strain_raw_without_roi.npz     # (H,W,3) fraction, channels [eyy,exx,exy]
+            strain_raw_without_roi.npz     # strain (H,W,3) fraction [eyy,exx,exy]
+                                           # + theta (H,W) rad, valid (H,W) bool
             strain_raw_with_roi.npz        # same format (only if a W/ ROI pass exists)
             adf_realspace.npz              # (H,W) ADF for overlay / post-analysis
             strain_manifest.json           # calibration + provenance (Capa A snapshot)
@@ -44,8 +45,15 @@ import numpy as np
 
 FAST_GUI_RESULTS_DIR = "gui_results_fast"
 
-#: Channel order of the persisted ``(H,W,3)`` strain stack (py4DSTEM / notebook).
+#: Channel order of the persisted ``(H,W,3)`` strain stack. Components are in the
+#: frame get_strain used (exx along x at coordinate_rotation; see the crystal
+#: frame card in the manifest).
 CHANNEL_ORDER = ("eyy", "exx", "exy")
+
+#: Where the tensor comes from (written to the manifest). Artifacts older than
+#: version 2 stored py4DSTEM's UNROTATED ``strainmap_g1g2`` with its e_xx under
+#: the name "eyy" (exx / eyy swapped, coordinate_rotation not applied).
+TENSOR_SOURCE = "py4DSTEM StrainMap.data (rotated by coordinate_rotation)"
 
 #: Map-array labels we persist as full ``(H,W,3)`` tensors.
 STRAIN_MAP_LABELS = ("without_roi", "with_roi")
@@ -54,7 +62,7 @@ _MANIFEST_NAME = "strain_manifest.json"
 _SESSION_NAME = "analysis_session.json"
 _INVALIDATION_NAME = "INVALIDATION.md"
 _ADF_NAME = "adf_realspace.npz"
-_ARTIFACT_VERSION = 1
+_ARTIFACT_VERSION = 2   # 2: rotated tensor, correct exx/eyy names, theta + valid saved
 
 
 INVALIDATION_MD = """\
@@ -208,6 +216,34 @@ def _as_hw3(arr: Any) -> np.ndarray | None:
     return np.ascontiguousarray(chan_last[..., :3], dtype=np.float32)
 
 
+def _theta_valid(arr: Any) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """``(theta, valid)`` from a raw strain entry with >= 5 channels
+    [eyy, exx, exy, theta, mask] (see ``pipeline.STRAIN_RAW_CHANNELS``).
+
+    theta: lattice rotation in rad (H,W) float32. valid: (H,W) bool, True where
+    py4DSTEM fitted the lattice AND the sanitiser kept the pixel (vacuum,
+    non-finite and |e| >= 1 are zeroed in every channel, mask included). Lets a
+    reader tell a masked pixel from a real zero strain. (None, None) otherwise.
+    """
+    if arr is None:
+        return None, None
+    try:
+        S = np.squeeze(np.asarray(arr))
+    except Exception:
+        return None, None
+    if S.dtype.names or S.ndim != 3:
+        return None, None
+    if 5 <= S.shape[-1] <= 8:
+        chan_last = S
+    elif 5 <= S.shape[0] <= 8:
+        chan_last = np.moveaxis(S, 0, -1)
+    else:
+        return None, None
+    theta = np.ascontiguousarray(chan_last[..., 3], dtype=np.float32)
+    valid = np.asarray(chan_last[..., 4], dtype=np.float64) > 0.5
+    return theta, valid
+
+
 def _adf_from_state(state: Any) -> np.ndarray | None:
     vis = getattr(state, "virtual_images", None) or {}
     for key in ("annular_dark_field", "ADF", "adf"):
@@ -287,14 +323,23 @@ def build_manifest(state: Any) -> dict[str, Any]:
         "braggpeaks_path": str(bragg) if bragg is not None else None,
         "braggpeaks_mtime": _file_mtime(bragg),
         "channel_order": list(CHANNEL_ORDER),
-        "units": {"strain": "fraction", "stress": "Pa"},
+        "tensor_source": TENSOR_SOURCE,
+        # coordinate_rotation actually applied to the saved tensor, per label
+        "coordinate_rotation_applied_deg": {
+            str(k): (c or {}).get("x_angle_applied_deg")
+            for k, c in (getattr(state, "crystal_frame_cards", {}) or {}).items()},
+        "npz_arrays": {"strain": "(H,W,3) float32 fraction, channels = channel_order",
+                       "theta": "(H,W) float32 lattice rotation, rad",
+                       "valid": "(H,W) bool, lattice fitted and pixel kept by the "
+                                "sanitiser; strain is 0 where valid is False"},
+        "units": {"strain": "fraction", "theta": "rad", "stress": "Pa"},
         "timestamps": {"compute": _now_iso()},
         # xarray-ready schema hint for Phase 2 (napari / xarray.Dataset(dim=scan)).
         "layout": {
             "dims": ["y", "x"],
             "strain_vars": {"eyy": 0, "exx": 1, "exy": 2},
             "stress_vars": ["sigma_xx", "sigma_yy", "sigma_xy"],
-            "extra_vars": ["adf"],
+            "extra_vars": ["adf", "theta", "valid"],
         },
     }
     return manifest
@@ -333,10 +378,16 @@ def save_fast_artifacts(
         if S is None:
             continue
         path = data_dir / f"strain_raw_{label}.npz"
-        np.savez_compressed(path, strain=S, channel_order=np.asarray(CHANNEL_ORDER))
+        extra = {}
+        theta, valid = _theta_valid(strain_raw.get(label))
+        if theta is not None:
+            extra = {"theta": theta, "valid": valid}
+        np.savez_compressed(path, strain=S, channel_order=np.asarray(CHANNEL_ORDER),
+                            artifact_version=np.asarray(_ARTIFACT_VERSION), **extra)
         written.append(path)
         n_tensors += 1
-        _log(log, f"  saved {path.name}  shape={S.shape} (channels {CHANNEL_ORDER})")
+        _log(log, f"  saved {path.name}  shape={S.shape} (channels {CHANNEL_ORDER}"
+                  + (", + theta, valid" if extra else "") + ")")
     if n_tensors == 0:
         _log(log, "  WARNING: no strain_raw tensors to save — compute strain first.")
 
@@ -496,6 +547,10 @@ def load_fast_artifacts(
 
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     _log(log, f"Loading Fast Analysis workspace from {data_dir}")
+    if int(manifest.get("artifact_version", 1) or 1) < 2:
+        _log(log, "  WARNING: workspace written before artifact_version 2: its strain is "
+                  "py4DSTEM's UNROTATED tensor with exx / eyy swapped (coordinate_rotation "
+                  "was not applied). Recompute strain from the braggpeaks for correct maps.")
 
     # --- strain tensors ---------------------------------------------------- #
     if not hasattr(state, "strain_raw") or state.strain_raw is None:
@@ -507,6 +562,10 @@ def load_fast_artifacts(
             continue
         with np.load(npz, allow_pickle=False) as d:
             arr = np.asarray(d["strain"], dtype=np.float32)
+            if "theta" in d.files and "valid" in d.files:
+                # back to [eyy, exx, exy, theta, mask] so theta panels / validity survive a reload
+                arr = np.concatenate([arr, np.asarray(d["theta"], np.float32)[..., None],
+                                      np.asarray(d["valid"], np.float32)[..., None]], axis=-1)
         state.strain_raw[label] = arr
         n += 1
         _log(log, f"  loaded strain_raw[{label!r}] shape={arr.shape}")

@@ -254,9 +254,15 @@ def _get_map(scan: Any, key: str, label: str = "without_roi") -> np.ndarray | No
             hw3 = next(iter(sr.values()), None) if sr else None
         if hw3 is None:
             return None
-        arr = np.asarray(hw3, dtype=np.float64)
-        if arr.ndim == 3 and arr.shape[2] >= 3:
-            return arr[:, :, ch_idx]
+        # live state holds (5,H,W) channels-first, a reloaded workspace (H,W,3|5):
+        # _as_hw3 normalises both (indexing [:, :, idx] on (5,H,W) read a wrong slice)
+        try:
+            from fast_artifacts import _as_hw3
+        except ImportError:
+            from .fast_artifacts import _as_hw3
+        arr = _as_hw3(hw3)
+        if arr is not None:
+            return np.asarray(arr[:, :, ch_idx], dtype=np.float64)
         return None
 
     return None

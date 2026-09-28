@@ -4744,7 +4744,7 @@ def compute_strain_map_step(
         target_nums = sorted(after)
     figures = [plt.figure(n) for n in target_nums]
     fig = figures[-1] if figures else None
-    raw = _extract_strainmap_g1g2_data(strainmap)
+    raw = _strain_raw_from_strainmap(strainmap, log=log)
     raw = _sanitize_strain_raw(raw, state, label, log=log)
     _sync_pyplot_strain_figures_from_raw(target_nums, raw)
     _apply_get_strain_vrange_to_figures(state, target_nums, raw_tensor=raw, log=log)
@@ -4934,11 +4934,46 @@ def _sanitize_gvects(strainmap, gvects):
 
 
 def _extract_strainmap_g1g2_data(strainmap):
+    """UNROTATED tensor (py4DSTEM ``strainmap_g1g2``: axes of calibrated qx, qy).
+
+    Do not use this as the strain result: ``get_strain(coordinate_rotation=...)``
+    stores the rotated tensor in ``StrainMap.data``. Kept for diagnostics only;
+    the result comes from :func:`_strain_raw_from_strainmap`.
+    """
     for name in ("strainmap_g1g2", "strainmap", "strain_map"):
         if hasattr(strainmap, name):
             obj = getattr(strainmap, name)
             return getattr(obj, "data", obj)
     return None
+
+
+#: Channels of ``state.strain_raw[label]`` (channels-first), Fast4D convention.
+#: Components are named in the frame get_strain used: exx along the x axis at
+#: ``coordinate_rotation`` (in crystal mode, x || frame_x_hkl), eyy along y.
+STRAIN_RAW_CHANNELS = ("eyy", "exx", "exy", "theta", "mask")
+
+
+def _strain_raw_from_strainmap(strainmap, log: Callable[[str], None] | None = None) -> np.ndarray:
+    """ROTATED strain tensor from a StrainMap after ``get_strain``, as a new
+    ``(5, H, W)`` float64 array in :data:`STRAIN_RAW_CHANNELS` order.
+
+    py4DSTEM keeps the tensor in the frame set by ``coordinate_rotation`` in
+    ``StrainMap.data`` (slices e_xx, e_yy, e_xy, theta, mask, error) and the
+    UNROTATED one in ``strainmap_g1g2``. Before this fix Fast4D stored the
+    unrotated tensor with py4DSTEM's e_xx under the name "eyy": the rotation was
+    lost and exx / eyy came out swapped. Slices are read by label, not position,
+    and copied, so later sanitising never writes into the StrainMap itself.
+    """
+    def _sl(name: str) -> np.ndarray:
+        return np.array(strainmap.get_slice(name).data, dtype=np.float64, copy=True)
+
+    if getattr(strainmap, "coordinate_rotation_degrees", None) is None:
+        raise RuntimeError("StrainMap has no coordinate_rotation: get_strain has not run.")
+    out = np.stack([_sl("e_yy"), _sl("e_xx"), _sl("e_xy"), _sl("theta"), _sl("mask")])
+    _log(log, f"Strain tensor taken from StrainMap.data (rotated by "
+              f"{float(strainmap.coordinate_rotation_degrees):.3f} deg), channels "
+              f"{list(STRAIN_RAW_CHANNELS)}.")
+    return out
 
 
 _STRAIN_SENTINEL_ABS_MAX = 1e12
