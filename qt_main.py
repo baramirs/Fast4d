@@ -3347,6 +3347,11 @@ class ReproducibilityDialog(QtWidgets.QDialog):
         self._tbl_q = self._table(); rd.addWidget(QtWidgets.QLabel("<b>Fit quality</b>")); rd.addWidget(self._tbl_q, 1)
         vd.addLayout(rd, 1)
         self._tabs.addTab(wd, "Drift and fit quality")
+        # per-scan distributions and PCA (moved here from Report > Session analysis)
+        wb = QtWidgets.QWidget(); self._box_host = QtWidgets.QVBoxLayout(wb)
+        self._tabs.addTab(wb, "Distributions (box / violin)")
+        wp = QtWidgets.QWidget(); self._pca_host = QtWidgets.QVBoxLayout(wp)
+        self._tabs.addTab(wp, "PCA of scans")
         right.addWidget(self._tabs, 1)
         self._notes = QtWidgets.QLabel(""); self._notes.setWordWrap(True)
         self._notes.setStyleSheet("color:#8a4b00;")
@@ -3512,8 +3517,20 @@ class ReproducibilityDialog(QtWidgets.QDialog):
         self._fill(self._tbl_drift, RP.drift_table(res))
         self._fill(self._tbl_q, RP.quality_table(res))
         self._set_fig(self._drift_host, RP.drift_figure(res))
+        self._show_scan_views(res.label)
         self._notes.setText("  ".join(res.notes))
         self._btn_exp.setEnabled(True); self._btn_rep.setEnabled(True)
+
+    def _show_scan_views(self, label):
+        """Box/violin by channel and PCA of the scans used in the run."""
+        import analysis as A
+        for host, make in ((self._box_host,
+                            lambda: A.boxplot_figure(self._run_scans, label=label, kind="violin")),
+                           (self._pca_host, lambda: A.pca_figure(self._run_scans, label))):
+            try:
+                self._set_fig(host, make())
+            except Exception as exc:
+                self._host._console.log(f"[Repro] {exc}")
 
     def _show_line(self, *_):
         import pandas as pd
