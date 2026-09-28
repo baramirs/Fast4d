@@ -3780,18 +3780,20 @@ def _strain_colorbar_associates_theta(cb: Any) -> bool:
     return False
 
 
-def _reference_strain_scale_exx_fractional(raw_tensor) -> float:
-    """Typical |ε_xx| (fraction) from strainmap_g1g2 raw for percent vs fraction clim choice."""
-    if raw_tensor is None:
-        return 0.0
-    try:
-        S = np.squeeze(np.asarray(raw_tensor))
-        if S.ndim != 3:
-            return 0.0
-        exx = np.asarray(_strain_channel(S, 1), dtype=float)
-        return float(np.nanmax(np.abs(exx)) or 0.0)
-    except Exception:
-        return 0.0
+def _reference_strain_scale_fractional(raw_tensor, key: str | None = None) -> float:
+    """max|ε| (fraction) of the tensor channel shown in a panel (``key`` = exx / eyy /
+    exy), or of all three when the panel is unknown -- for the percent vs fraction clim
+    choice. Comparing every panel with ε_xx alone blanked the ε_yy panel of a uniaxial
+    field (ε_xx ~ 0): its fraction data looked like percent and got vrange +-5."""
+    maps = _strain_maps_dict_from_raw(raw_tensor) if raw_tensor is not None else {}
+    keys = [key] if key in ("exx", "eyy", "exy") and key in maps else ["exx", "eyy", "exy"]
+    vals = []
+    for k in keys:
+        a = np.asarray(maps.get(k, np.zeros(0)), dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size:
+            vals.append(float(np.max(np.abs(a))))
+    return max(vals) if vals else 0.0
 
 
 def _effective_orientation_clims(
@@ -4099,7 +4101,7 @@ def _apply_get_strain_vrange_to_figures(
 
     tmin_o, tmax_o = _effective_orientation_clims(tmin, tmax, raw_tensor)
 
-    ref_frac = _reference_strain_scale_exx_fractional(raw_tensor)
+    ref_frac = _reference_strain_scale_fractional(raw_tensor)
     maps_for_theta = _strain_maps_dict_from_raw(raw_tensor)
     th_ref = maps_for_theta.get("theta")
 
@@ -4115,6 +4117,8 @@ def _apply_get_strain_vrange_to_figures(
             theta_ax = _axis_title_suggests_theta(ax) or _heatmap_on_ax_matches_reference_array(
                 ax, th_ref
             )
+            panel_ref = _reference_strain_scale_fractional(
+                raw_tensor, _panel_key_from_axes_title(ax.get_title()))
             for mappable, amax_display in _iter_strain_heatmap_mappables(ax):
                 clims = _strain_panel_clims(
                     vmin_p,
@@ -4123,7 +4127,7 @@ def _apply_get_strain_vrange_to_figures(
                     tmax_o,
                     theta_ax=theta_ax,
                     amax_display=amax_display,
-                    ref_frac=ref_frac,
+                    ref_frac=panel_ref or ref_frac,
                 )
                 if clims is None:
                     continue
@@ -4145,7 +4149,7 @@ def _apply_get_strain_vrange_to_figures(
         _log(
             log,
             f"Applied strain color limits to {n_updated} map layer(s) "
-            f"(ε display ≈ {vmin_p}..{vmax_p} %, θ clim ≈ {tmin_o}..{tmax_o} (GUI θ {tmin}..{tmax}); ref|εxx|≈{ref_frac:.4g}).",
+            f"(ε display ≈ {vmin_p}..{vmax_p} %, θ clim ≈ {tmin_o}..{tmax_o} (GUI θ {tmin}..{tmax}); ref max|ε| ≈ {ref_frac:.4g}, per panel).",
         )
     elif figure_nums:
         _log(
