@@ -23,6 +23,7 @@ FIG_LABELS = {
     "origin": "Origin (+ residuals)", "ellipse": "Ellipse",
     "q_pixel": "Q-pixel calibration (Update / current)", "basis": "Basis vectors",
     "indexing": "BVM indexing",
+    "bvm_hkl": "BVM - indexed planes (hkl)", "bvm_axes": "BVM - planes + g1, g2, x, y",
     "strain_without_roi": "Strain map", "strain_with_roi": "Strain map",
     "stress_without_roi": "Stress map", "stress_with_roi": "Stress map",
     "line_profiles": "Line profiles (legacy)", "maps_with_lines": "Maps with lines (legacy)",
@@ -45,7 +46,7 @@ _STRESS_CHANNELS = (
 
 _CALIB_KEYS = (
     "probe", "select6", "detection", "roi", "origin", "ellipse",
-    "q_pixel", "basis", "indexing",
+    "q_pixel", "basis", "indexing", "bvm_hkl", "bvm_axes",
 )
 _MAP_WITHOUT = ("strain_without_roi", "stress_without_roi")
 _MAP_WITH = ("strain_with_roi", "stress_with_roi")

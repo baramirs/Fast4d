@@ -30,13 +30,14 @@ GROUP_FIGURE_KEY = {
     "detection": "detection", "roi": None, "origin": "origin",
     "ellipse": "ellipse", "qpixel": "q_pixel",
     "basis": ["basis", "indexing"],
-    "strain": ["strain_without_roi", "strain_with_roi"],
+    "strain": ["strain_without_roi", "strain_with_roi", "bvm_hkl", "bvm_axes"],
     "tools": ["stress_without_roi", "stress_with_roi"],
 }
 # Row labels for the figure rows (the vertical-header text).
 FIG_ROW_LABEL = {
     "detection": "Detection", "origin": "Origin (+res)", "ellipse": "Ellipse",
     "q_pixel": "Q-pixel", "basis": "Basis", "indexing": "BVM indexing",
+    "bvm_hkl": "BVM hkl", "bvm_axes": "BVM axes",
     "strain_without_roi": "Strain — Theoretical",
     "strain_with_roi": "Strain — Experimental",
     "stress_without_roi": "Stress — Theoretical",

@@ -1091,6 +1091,8 @@ DEFAULT_STORE_FIGURE: dict[str, bool] = {
     "q_pixel": True,
     "basis": True,
     "indexing": True,
+    "bvm_hkl": True,
+    "bvm_axes": True,
     "strain_without_roi": True,
     "strain_with_roi": True,
     "stress_without_roi": True,
@@ -1110,6 +1112,8 @@ STORE_FIGURE_LABELS: dict[str, str] = {
     "q_pixel": "Q-pixel",
     "basis": "Basis",
     "indexing": "BVM indexing",
+    "bvm_hkl": "BVM - indexed planes (hkl)",
+    "bvm_axes": "BVM - planes + g1, g2, x, y",
     "strain_without_roi": "Strain — Theoretical reference (without ROI)",
     "strain_with_roi": "Strain — Experimental reference (with ROI)",
     "stress_without_roi": "Stress — Theoretical reference (without ROI)",
@@ -1471,6 +1475,7 @@ def tidy_figure_memory(scans: list | None = None, *, log: Log = None) -> dict:
 FIGURE_ORDER = (
     "probe", "select6", "detection",
     "roi", "origin", "ellipse", "q_pixel", "basis", "indexing",
+    "bvm_hkl", "bvm_axes",
     "strain_without_roi", "strain_with_roi",
     "stress_without_roi", "stress_with_roi",
 )
@@ -3381,8 +3386,122 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     # primary strain figure also goes into scan.figures for the Report
     if figs:
         _store_fig(scan, f"strain_{label}", figs[-1])
+    # BVM with the indexed planes, and with g1, g2, x, y (from the theoretical pass,
+    # or from this one when it is the only pass)
+    if label == "without_roi" or "bvm_axes" not in scan.figures:
+        try:
+            fh, fa = build_bvm_frame_figures(scan, label=label)
+            _store_fig(scan, "bvm_hkl", fh)
+            _store_fig(scan, "bvm_axes", fa)
+        except Exception as exc:
+            _log(log, f"[{scan.name}] BVM hkl/axes figures skipped: {exc}")
     _log(log, f"[{scan.name}] strain computed ({label})")
     return result
+
+
+def _hkl_text(hkl) -> str:
+    """'(-1 1 1)' -- plain hyphen, spaces between indices."""
+    return "(" + " ".join(str(int(round(v))) for v in hkl) + ")"
+
+
+def build_bvm_frame_figures(scan: Scan, *, label: str = "without_roi"):
+    """Two figures of the calibrated Bragg vector map after strain:
+
+    * ``bvm_hkl``  -- every lattice point used by the fit, labelled with its hkl
+      = i*g1_hkl + j*g2_hkl, where (i, j) are py4DSTEM's lattice indices from
+      choose_basis_vectors and g1_hkl / g2_hkl are the crystal-frame labels
+      (Strain tab: frame_g1_hkl, frame_g2_hkl).
+    * ``bvm_axes`` -- the same, plus the reference g1, g2 of this strain pass and
+      the tensor axes x || frame_x_hkl, y || frame_y_hkl exactly as
+      crystal_frame computed them for get_strain.
+
+    Coordinates are calibrated BVM pixels (origin-centred, QR rotation applied).
+    Returns ``(fig_hkl, fig_axes)``.
+    """
+    from matplotlib.figure import Figure
+    try:
+        import crystal_frame as CF
+    except ImportError:
+        from . import crystal_frame as CF
+    st = scan.ensure_state()
+    sm = getattr(st, "strainmap_full", None) if label == "without_roi" else getattr(st, "strainmap_roi", None)
+    sm = sm if sm is not None else getattr(st, "strainmap_full", None)
+    if sm is None or getattr(sm, "braggdirections", None) is None:
+        raise RuntimeError("no StrainMap with basis directions (compute strain first)")
+    img = np.asarray(getattr(sm.bvm, "data", sm.bvm), dtype=float)
+    oy, ox = (float(v) for v in sm.origin)
+    bd = sm.braggdirections
+    bdd = getattr(bd, "data", bd)
+    qx = np.asarray(bdd["qx"], float); qy = np.asarray(bdd["qy"], float)
+    i1 = np.asarray(bdd["g1_ind"], int); i2 = np.asarray(bdd["g2_ind"], int)
+    spec = scan.params.crystal_frame_spec()
+    g1_hkl = np.asarray(spec["g1_hkl"], float); g2_hkl = np.asarray(spec["g2_hkl"], float)
+
+    card = (getattr(st, "crystal_frame_cards", {}) or {}).get(label) or {}
+    if card.get("g1_ref_qxy") is not None:
+        g1 = np.asarray(card["g1_ref_qxy"], float); g2 = np.asarray(card["g2_ref_qxy"], float)
+        g_src = card.get("reference", "reference g1, g2")
+    else:
+        g1 = np.asarray(sm.g1, float).ravel()[:2]; g2 = np.asarray(sm.g2, float).ravel()[:2]
+        g_src = "basis g1, g2"
+    fr = CF.frame_from_g(g1, g2, spec)
+
+    # log scale: the BVM spans orders of magnitude between (000) and the outer spots
+    shown = np.log1p(np.clip(img, 0, None))
+    top = float(np.percentile(shown[shown > 0], 99.9)) if np.any(shown > 0) else 1.0
+    shown = np.clip(shown / max(top, 1e-12), 0, 1)
+
+    def _base(title):
+        fig = Figure(figsize=(6.4, 6.4), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        ax.imshow(shown, cmap="gray", origin="upper")
+        ax.scatter(qy + ox, qx + oy, s=90, facecolors="none", edgecolors="#ffb300", linewidths=1.0)
+        for a, b, x_, y_ in zip(i1, i2, qy + ox, qx + oy):
+            hkl = a * g1_hkl + b * g2_hkl
+            ax.text(x_, y_ - 4.5, _hkl_text(hkl), color="#ffe082", fontsize=6.5,
+                    ha="center", va="bottom")
+        span = float(np.max(np.hypot(qx, qy))) + 12.0 if qx.size else min(img.shape) / 2
+        ax.set_xlim(ox - span, ox + span); ax.set_ylim(oy + span, oy - span)
+        ax.set_xlabel("qy (BVM px)"); ax.set_ylabel("qx (BVM px)")
+        ax.set_title(title, fontsize=9)
+        return fig, ax
+
+    zone = _hkl_text(spec["zone"]).replace("(", "[").replace(")", "]")
+    fig_hkl, _ = _base(f"{scan.name} - BVM, planes indexed from g1 {_hkl_text(g1_hkl)}, "
+                       f"g2 {_hkl_text(g2_hkl)} - zone {zone}")
+
+    fig_axes, ax = _base(f"{scan.name} - BVM with g1, g2 and tensor axes ({label})")
+
+    def _arrow(vec_qxy, color, text, length=None, lw=1.8, ls="-"):
+        """Arrow from (000) along vec (qx, qy); ``length`` rescales it (axes are
+        directions, drawn long so they read as axes, not as lattice vectors)."""
+        d = np.array([float(vec_qxy[1]), float(vec_qxy[0])])   # (qx, qy) -> (col, row)
+        if length is not None:
+            d = d / max(np.hypot(*d), 1e-12) * float(length)
+        ax.annotate("", xy=(ox + d[0], oy + d[1]), xytext=(ox, oy),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=lw, ls=ls))
+        tip = d * (1.0 + 7.0 / max(np.hypot(*d), 1e-12))            # 7 px past the tip
+        ax.text(ox + tip[0], oy + tip[1], text, color=color, fontsize=8, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(facecolor="black", alpha=0.7, edgecolor=color, pad=1.5))
+
+    x_hkl = _hkl_text(spec["x_hkl"]).replace("(", "[").replace(")", "]")
+    y_hkl = _hkl_text(spec["y_hkl"]).replace("(", "[").replace(")", "]")
+    axis_len = 3.2 * max(np.hypot(*g1), np.hypot(*g2))
+    _arrow(fr["x_qxy"], "#26c6da", f"x || {x_hkl}", length=axis_len, lw=1.4, ls="--")
+    _arrow(fr["y_qxy"], "#9ccc65", f"y || {y_hkl}", length=axis_len, lw=1.4, ls="--")
+    _arrow(g1, "#ef5350", f"g1 {_hkl_text(g1_hkl)}", lw=2.2)
+    _arrow(g2, "#ff9800", f"g2 {_hkl_text(g2_hkl)}", lw=2.2)
+    info = [f"g from: {g_src}",
+            f"x = {CF.combo_label(fr['x_combo'])},  y = {CF.combo_label(fr['y_combo'])}",
+            f"coordinate_rotation = {fr['angle_deg']:.2f} deg",
+            f"g1^g2 measured {fr['g_angle_meas_deg']:.2f} deg / predicted "
+            f"{fr['g_angle_pred_deg']:.2f} deg ({'labels OK' if fr['label_ok'] else 'LABELS DO NOT FIT'})",
+            f"QR rotation {scan.params.qr_rotation:g} deg, flip {bool(scan.params.qr_flip)}"]
+    ax.text(0.01, 0.01, "\n".join(info), transform=ax.transAxes, fontsize=7, color="white",
+            va="bottom", ha="left", family="monospace",
+            bbox=dict(facecolor="black", alpha=0.55, edgecolor="none"))
+    return fig_hkl, fig_axes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
