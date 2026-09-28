@@ -2326,7 +2326,11 @@ def _params_to_batch_scan_cfg(scan: Scan):
         center_guess=list(p.center_guess),
         step10={"sampling": int(p.origin_sampling)},
         step11={
-            "px_guess": float(p.q_px),
+            # the value APPLIED (fast_batch uses it directly): the fitted px when the
+            # q-pixel was refit, else the guess -- applying the guess put |g| 3.8 %
+            # off on PARA TEST (0.0224 vs 0.02157 A^-1/px)
+            "px_guess": float(p.q_px_fitted if (p.q_refit and p.q_px_fitted)
+                              else p.q_px),
             "kmax":     float(p.q_kmax),
             "kpow":     float(p.q_kpow),
             "use_roi":  bool(p.q_use_roi),
