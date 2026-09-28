@@ -377,6 +377,50 @@ def correlation_figure(scan: Any, label: str = "without_roi", roi_mask=None):
     return fig
 
 
+def pooled_channel_correlation(scans: list, label: str = "without_roi"):
+    """Pearson correlation of eyy/exx/exy over the valid pixels of ALL scans together.
+
+    Valid = finite in the three channels and not all three exactly 0 (Fast4D
+    writes 0 where the lattice fit failed). ``attrs["n_pixels"]`` = pixels used."""
+    import pandas as pd
+    blocks = []
+    for sc in scans or []:
+        hw3 = _strain_of(sc, label)
+        if hw3 is None:
+            continue
+        v = np.asarray(hw3, dtype=float).reshape(-1, 3)
+        ok = np.all(np.isfinite(v), axis=1) & ~np.all(v == 0.0, axis=1)
+        blocks.append(v[ok])
+    if not blocks or sum(len(b) for b in blocks) < 3:
+        return pd.DataFrame()
+    mat = np.vstack(blocks)[:, [CH_INDEX[c] for c in CHANNELS]].T
+    df = pd.DataFrame(np.corrcoef(mat), index=list(CHANNELS), columns=list(CHANNELS))
+    df.attrs["n_pixels"] = int(mat.shape[1])
+    return df
+
+
+def pooled_correlation_figure(scans: list, label: str = "without_roi"):
+    """Heatmap of :func:`pooled_channel_correlation` for the selected files."""
+    from matplotlib.figure import Figure
+    corr = pooled_channel_correlation(scans, label)
+    fig = Figure(figsize=(4, 3.6), constrained_layout=True)
+    ax = fig.add_subplot(111)
+    if corr.empty:
+        ax.text(0.5, 0.5, "no valid pixels", ha="center", va="center"); ax.axis("off")
+        return fig
+    im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    labs = [CH_LABEL[c] for c in CHANNELS]
+    ax.set_xticks(range(3)); ax.set_yticks(range(3))
+    ax.set_xticklabels(labs); ax.set_yticklabels(labs)
+    for i in range(3):
+        for j in range(3):
+            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.046)
+    ax.set_title(f"Channel correlation - {len(scans)} file(s), "
+                 f"{corr.attrs['n_pixels']} valid px", fontsize=9)
+    return fig
+
+
 def pca_figure(scans: list, label: str = "without_roi", roi_mask=None):
     """Scatter of scans in PC1–PC2 space (clustering of experiments)."""
     from matplotlib.figure import Figure
