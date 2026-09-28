@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -4805,7 +4806,8 @@ def apply_r_pixel_from_params(scan: "Scan", *, log: Log = None) -> None:
 
 def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
     """Sample a 2D array along a segment (bilinear, averaged over ``width`` parallel
-    offsets). Returns (dist_px, values)."""
+    offsets). Returns (dist_px, values). NaN pixels (no lattice fit) are left out:
+    each sample is the weighted mean of its finite neighbours, NaN if it has none."""
     from scipy.ndimage import map_coordinates
     (x0, y0), (x1, y1) = seg
     L = float(np.hypot(x1 - x0, y1 - y0))
@@ -4822,20 +4824,31 @@ def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
     offs = np.arange(w) - (w - 1) / 2.0
     acc = np.zeros(npts, dtype=float)
     arr = np.asarray(arr2d, dtype=float)
+    ok = np.isfinite(arr)
+    if ok.all():
+        for o in offs:
+            acc += map_coordinates(arr, [ys + o * py, xs + o * px], order=1, mode="nearest")
+        return t * L, acc / len(offs)
+    filled = np.where(ok, arr, 0.0)
+    weight = ok.astype(float)
+    wsum = np.zeros(npts, dtype=float)
     for o in offs:
-        acc += map_coordinates(arr, [ys + o * py, xs + o * px], order=1, mode="nearest")
-    return t * L, acc / len(offs)
+        coords = [ys + o * py, xs + o * px]
+        acc += map_coordinates(filled, coords, order=1, mode="nearest")
+        wsum += map_coordinates(weight, coords, order=1, mode="nearest")
+    out = np.full(npts, np.nan)
+    has = wsum > 1e-9
+    out[has] = acc[has] / wsum[has]
+    return t * L, out
 
 
 def line_profiles(scan: "Scan", label: str = "without_roi", *, width: int = 3) -> dict:
-    """{line_id: {dist, eyy, exx, exy, adf}} resampled along ``scan.lines`` from the
-    saved strain map (``label``, channels in %) and the ADF. Each line uses its own
-    width from ``scan.line_widths`` (Line / ROI tool) when stored, else ``width``."""
-    from fast_artifacts import _as_hw3
-    st = scan.ensure_state()
-    hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
-    stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
-    sdiv, _u = _stress_scale(scan)
+    """{line_id: {dist, eyy, exx, exy, adf, n_valid}} resampled along ``scan.lines``
+    from the saved strain map (``label``, channels in %) and the ADF. Each line uses
+    its own width from ``scan.line_widths`` (Line / ROI tool) when stored, else
+    ``width``. Pixels without a lattice fit are left out (a sample with none is NaN);
+    ``n_valid`` counts the finite strain samples."""
+    maps = {ch: channel_map_2d(scan, ch, label) for ch in (*_CH_IDX, *_STRESS_KEY)}
     adf = cached_adf(scan)
     widths = getattr(scan, "line_widths", None) or {}
     default_width = width
@@ -4843,18 +4856,13 @@ def line_profiles(scan: "Scan", label: str = "without_roi", *, width: int = 3) -
     for lid, seg in (getattr(scan, "lines", None) or {}).items():
         width = widths.get(lid, default_width)
         d: dict = {}
-        if hw3 is not None:
-            for ch, idx in _CH_IDX.items():
-                dist, v = _line_samples(hw3[..., idx], seg, width=width)
-                d["dist"] = dist
-                d[ch] = v * 100.0
-        if stress:                                   # stress maps too (σ in GPa/MPa)
-            for ch, key in _STRESS_KEY.items():
-                arr = stress.get(key)
-                if arr is not None:
-                    dist, v = _line_samples(np.asarray(arr, dtype=float), seg, width=width)
-                    d.setdefault("dist", dist)
-                    d[ch] = v / sdiv
+        for ch, m in maps.items():                   # strain (%) and stress (GPa/MPa)
+            if m is not None:
+                dist, v = _line_samples(m, seg, width=width)
+                d.setdefault("dist", dist)
+                d[ch] = v
+        if "eyy" in d:
+            d["n_valid"] = int(np.isfinite(d["eyy"]).sum())
         if adf is not None:
             dist, v = _line_samples(adf, seg, width=width)
             d.setdefault("dist", dist)
@@ -4870,20 +4878,11 @@ def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
     """Top: the chosen map (strain channel or ADF) with the lines overlaid.
     Bottom: that channel's profile vs distance (nm if R is set, else px)."""
     from matplotlib.figure import Figure
-    from fast_artifacts import _as_hw3
     prof = line_profiles(scan, label, width=width)
-    st = scan.ensure_state()
-    hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
-    stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
-    sdiv, _u = _stress_scale(scan)
-    adf = cached_adf(scan)
     if channel == "adf":
-        base = adf
-    elif channel in _CH_IDX:
-        base = hw3[..., _CH_IDX[channel]] * 100.0 if hw3 is not None else None
-    elif channel in _STRESS_KEY:
-        base = (np.asarray(stress[_STRESS_KEY[channel]], dtype=float) / sdiv
-                if (stress and _STRESS_KEY[channel] in stress) else None)
+        base = cached_adf(scan)
+    elif channel in _CH_IDX or channel in _STRESS_KEY:
+        base = channel_map_2d(scan, channel, label)    # NaN (blank) where no fit
     else:
         base = None
     ylab = _channel_label(scan, channel)
@@ -4937,13 +4936,18 @@ def grouped_line_profiles(scans: list, line_id: str, channel: str = "eyy",
     common_dist = series[0][1][:m]
     stack = np.vstack([v[:m] for _n, _d, v in series])
     res["common_dist"] = common_dist
-    res["mean_curve"] = stack.mean(axis=0)
-    res["std_curve"] = stack.std(axis=0, ddof=1) if stack.shape[0] > 1 else np.zeros(m)
-    per = [float(np.mean(v)) for _n, _d, v in series]
+    # NaN samples (no lattice fit) are skipped, never averaged in as 0
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        res["mean_curve"] = np.nanmean(stack, axis=0)
+        res["std_curve"] = (np.nanstd(stack, axis=0, ddof=1) if stack.shape[0] > 1
+                            else np.zeros(m))
+        per = [float(np.nanmean(v)) for _n, _d, v in series]
+        res["per_file_std"] = [float(np.nanstd(v[:m], ddof=1)) if m > 1 else 0.0
+                               for _n, _d, v in series]
     res["per_file_mean"] = per
-    res["per_file_std"] = [float(np.std(v[:m], ddof=1)) if m > 1 else 0.0
-                           for _n, _d, v in series]
-    res["pooled"] = np.concatenate([v[:m] for _n, _d, v in series])
+    pooled = np.concatenate([v[:m] for _n, _d, v in series])
+    res["pooled"] = pooled[np.isfinite(pooled)]
     res["summary"] = _summary_stats(np.asarray(per))
     return res
 
@@ -5067,17 +5071,31 @@ def grouped_line_table(scans: list, line_id: str, channel: str = "eyy",
 #   Δε_yy(x,y) = ε_yy^B(x,y) − ε_yy^A(x,y)  →  MAE, RMSE, bias, std(Δ), correlation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _nan_where_no_fit(arr, raw):
+    """``arr`` with NaN where py4DSTEM's lattice fit failed (channel 4 of ``raw``):
+    sanitizing stores those pixels as 0.0, which is not a strain value."""
+    from fast_artifacts import _theta_valid
+    a = np.array(arr, dtype=float)
+    _theta, valid = _theta_valid(raw)
+    if valid is not None and valid.shape == a.shape:
+        a[~valid] = np.nan
+    return a
+
+
 def channel_map_2d(scan: "Scan", channel: str = "eyy", label: str = "without_roi"):
     """A 2-D map for one channel: strain εyy/εxx/εxy in %, orientation θ in degrees,
-    stress σxx/σyy/σxy in the display units, or the ADF. Returns None when unavailable."""
+    stress σxx/σyy/σxy in the display units, or the ADF. Returns None when unavailable.
+    Strain, θ and stress are NaN where the lattice fit failed (vacuum / no fit)."""
     from fast_artifacts import _as_hw3
     st = scan.ensure_state()
     ch = str(channel).lower()
+    raw_label = (getattr(st, "strain_raw", {}) or {}).get(label)
     if ch in _CH_IDX:
-        hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
+        hw3 = _as_hw3(raw_label)
         if hw3 is None:
             return None
-        return np.asarray(hw3[..., _CH_IDX[ch]], dtype=float) * 100.0
+        return _nan_where_no_fit(np.asarray(hw3[..., _CH_IDX[ch]], dtype=float) * 100.0,
+                                 raw_label)
     if ch in _ORIENT_CH:
         from pipeline import _strain_maps_dict_from_raw
         raw = (getattr(st, "strain_raw", {}) or {}).get(label)
@@ -5092,7 +5110,7 @@ def channel_map_2d(scan: "Scan", channel: str = "eyy", label: str = "without_roi
             p99 = float(np.nanpercentile(np.abs(finite), 99))
             if mx <= float(np.pi) + 0.08 and p99 <= float(np.pi) + 0.08:
                 a = np.rad2deg(a)
-        return a
+        return _nan_where_no_fit(a, raw_label)
     if ch in _STRESS_KEY:
         stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
         if not stress:
@@ -5100,7 +5118,8 @@ def channel_map_2d(scan: "Scan", channel: str = "eyy", label: str = "without_roi
         arr = stress.get(_STRESS_KEY[ch])
         if arr is None:
             return None
-        return np.asarray(arr, dtype=float) / _stress_scale(scan)[0]
+        return _nan_where_no_fit(np.asarray(arr, dtype=float) / _stress_scale(scan)[0],
+                                 raw_label)
     if ch == "adf":
         return cached_adf(scan)
     return None
@@ -5372,24 +5391,16 @@ def roi_profiles(scan: "Scan", label: str = "without_roi") -> dict:
     """{roi_id: {channel: {values, mean, std, n}}} — per-ROI pixel statistics from the
     saved strain map (``label``, channels in %), stress maps (display units) and ADF.
     The ROI analog of ``line_profiles`` (a rectangle has no distance axis, so each
-    ROI reduces to a sample/mean per channel)."""
-    from fast_artifacts import _as_hw3
-    st = scan.ensure_state()
-    hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
-    stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
-    sdiv, _u = _stress_scale(scan)
+    ROI reduces to a sample/mean per channel). Only pixels with a lattice fit enter
+    the strain / stress statistics; ``n`` is how many there were."""
+    maps = {ch: channel_map_2d(scan, ch, label) for ch in (*_CH_IDX, *_STRESS_KEY)}
     adf = cached_adf(scan)
     out: dict = {}
     for rid, bounds in scan_area_rois(scan).items():
         d: dict = {}
-        if hw3 is not None:
-            for ch, idx in _CH_IDX.items():
-                d[ch] = _roi_stat(_roi_region_values(hw3[..., idx], bounds) * 100.0)
-        if stress:
-            for ch, key in _STRESS_KEY.items():
-                arr = stress.get(key)
-                if arr is not None:
-                    d[ch] = _roi_stat(_roi_region_values(np.asarray(arr, dtype=float), bounds) / sdiv)
+        for ch, m in maps.items():                   # NaN (no fit) dropped by _roi_region_values
+            if m is not None:
+                d[ch] = _roi_stat(_roi_region_values(m, bounds))
         if adf is not None:
             d["adf"] = _roi_stat(_roi_region_values(adf, bounds))
         if d:

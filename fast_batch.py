@@ -320,13 +320,26 @@ def _extract_line_profiles(strain_raw: dict, adf: "np.ndarray | None",
     }
     """
     try:
-        from fast_artifacts import _as_hw3
+        from fast_artifacts import _as_hw3, _theta_valid
     except ImportError:
-        from .fast_artifacts import _as_hw3
+        from .fast_artifacts import _as_hw3, _theta_valid
 
     def _profile_1d(arr2d: np.ndarray, x0: float, y0: float,
-                    x1: float, y1: float) -> tuple[np.ndarray, np.ndarray]:
-        """Returns (dist_px, values) or (empty, empty) on failure."""
+                    x1: float, y1: float, valid: np.ndarray | None = None
+                    ) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (dist_px, values) or (empty, empty) on failure. With ``valid``
+        (lattice-fit mask) the pixels without a fit are left out: each sample is
+        the weighted mean of its valid neighbours, NaN if it has none."""
+        if valid is not None and not np.all(valid):
+            w = np.asarray(valid, dtype=float)
+            dist, num = _profile_1d(np.where(valid, arr2d, 0.0), x0, y0, x1, y1)
+            _d, den = _profile_1d(w, x0, y0, x1, y1)
+            if not dist.size:
+                return dist, num
+            out = np.full(num.shape, np.nan)
+            has = den > 1e-9
+            out[has] = num[has] / den[has]
+            return dist, out
         try:
             from skimage.measure import profile_line
             prof = profile_line(arr2d, (y0, x0), (y1, x1),
@@ -357,6 +370,9 @@ def _extract_line_profiles(strain_raw: dict, adf: "np.ndarray | None",
         hw3 = _as_hw3(raw)
         if hw3 is None:
             continue
+        _theta, valid = _theta_valid(raw)
+        if valid is not None and valid.shape != hw3.shape[:2]:
+            valid = None
         results[label] = {}
         for line_id, ldef in lines.items():
             coords = _parse_coords(ldef)
@@ -365,7 +381,7 @@ def _extract_line_profiles(strain_raw: dict, adf: "np.ndarray | None",
             x0, y0, x1, y1 = coords
             entry: dict = {}
             for ch_i, ch in enumerate(("eyy", "exx", "exy")):
-                dist, prof = _profile_1d(hw3[..., ch_i], x0, y0, x1, y1)
+                dist, prof = _profile_1d(hw3[..., ch_i], x0, y0, x1, y1, valid)
                 if dist.size:
                     entry[ch] = prof
                     entry["dist_px"] = dist
