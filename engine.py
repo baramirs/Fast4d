@@ -353,6 +353,8 @@ class CalibrationParams:
     ellipse_use_roi: bool = True
     ellipse_center: list | None = None  # (y, x) BVM-px override for fit center;
                                          # None / [0, 0] / off-map = use bvm.origin
+    ellipse_p_fitted: list | None = None  # fitted OUTPUT [a, b, theta_rad] actually applied
+                                          # ('apply' mode re-applies it; None = no fit)
 
     # ── Q pixel size (cell 37) — always fits: px_guess in → fitted px out ──────
     q_px: float = 0.0137          # px_guess (editable INPUT; never overwritten)
@@ -2325,7 +2327,10 @@ def _params_to_batch_scan_cfg(scan: Scan):
         braggpeaks_path=scan.braggpeaks_path,
         roi_bounds=list(p.roi_bounds) if p.roi_bounds else [],
         center_guess=list(p.center_guess),
-        step10={"sampling": int(p.origin_sampling)},
+        step10={"sampling": int(p.origin_sampling),
+                # the ellipse 'fit' applied ([a, b, theta]); None = no ellipse
+                "p_ellipse": (list(p.ellipse_p_fitted)
+                              if (p.ellipse_enabled and p.ellipse_p_fitted) else None)},
         step11={
             # the value APPLIED (fast_batch uses it directly): the fitted px when the
             # q-pixel was refit, else the guess -- applying the guess put |g| 3.8 %
@@ -2370,12 +2375,20 @@ def _params_to_batch_scan_cfg(scan: Scan):
 
 
 def apply_calibration(scan: Scan, *, log: Log = None) -> None:
-    """Bulk-apply pre-fitted calibration *values* (no refit, no ellipse).
+    """Bulk-apply pre-fitted calibration *values* (no refit).
 
     Fast path for re-applying known params to a fresh state (e.g. template /
-    multi where braggpeaks already carry origin+ellipse). For a from-scratch
-    calibration that runs each fit in order, use ``run_calibration_sequence``.
+    multi). The ellipse, when enabled, is the one 'fit' applied
+    (``params.ellipse_p_fitted``), set before the Q pixel as in the fit sequence.
+    For a from-scratch calibration that runs each fit in order, use
+    ``run_calibration_sequence``.
     """
+    p = scan.params
+    if p.ellipse_enabled and not p.ellipse_p_fitted:
+        raise RuntimeError(
+            f"[{scan.name}] 'apply' calibration: the ellipse is enabled but no fitted "
+            f"ellipse is stored -- run the 'fit' calibration (or the Ellipse tool) first, "
+            f"or turn the ellipse off.")
     st = scan.ensure_state()
     sc_cfg = _params_to_batch_scan_cfg(scan)
     _batch()._apply_calibration(st, sc_cfg, log)
@@ -2664,6 +2677,7 @@ def calibrate_ellipse(scan: Scan, *, make_figure: bool = True, log: Log = None) 
             + f". p = {tuple(round(float(v), 3) for v in res['p_ellipse'])}. Check the ring "
             f"radii / ROI, or turn the ellipse off.")
     pl.apply_ellipse_step(st, log=log)
+    p.ellipse_p_fitted = [float(v) for v in res["p_ellipse"][2:5]]
     if make_figure:
         try:
             _store_fig(scan, "ellipse", _ellipse_figure(res, st))
@@ -2755,6 +2769,7 @@ def apply_ellipse_fit(scan: Scan, p_ellipse, *, r_range=None,
     bp.calibration.set_p_ellipse(p)
     bp.setcal()
     scan.params.ellipse_enabled = True
+    scan.params.ellipse_p_fitted = [p[2], p[3], p[4]]      # what 'apply' mode re-applies
     if r_range:
         scan.params.ellipse_q_range = [int(min(r_range)), int(max(r_range))]
     _log(log, f"[{scan.name}] ellipse applied p={tuple(round(v, 3) for v in p)}")

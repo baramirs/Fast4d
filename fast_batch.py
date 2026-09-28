@@ -182,6 +182,21 @@ def _apply_calibration(state: Any, scan: FastBatchScanConfig, log=None) -> None:
         except Exception as e:
             _L(log, f"  [warn] center guess: {e}")
 
+    # Ellipse ([a, b, theta] that 'fit' applied): before the Q pixel, as in the fit
+    # sequence (origin -> ellipse -> Q); py4DSTEM only uses b / a and theta
+    p_ell = (scan.step10 or {}).get("p_ellipse")
+    if p_ell:
+        try:
+            from pipeline import require_braggpeaks
+        except ImportError:
+            from .pipeline import require_braggpeaks
+        bp = require_braggpeaks(state)
+        a, b, theta = (float(v) for v in p_ell)
+        bp.calibration.set_p_ellipse((0.0, 0.0, a, b, theta))   # does not touch the origin
+        bp.setcal()
+        state.p_ellipse = (0.0, 0.0, a, b, theta)
+        _L(log, f"  ellipse applied: a={a:.4g} b={b:.4g} theta={np.degrees(theta):.3f} deg")
+
     # Q pixel size (direct value in Å⁻¹/px)
     s11 = scan.step11
     if s11:
