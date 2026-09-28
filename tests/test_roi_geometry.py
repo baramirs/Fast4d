@@ -85,3 +85,26 @@ def test_line_width_clamped_to_200():
     assert E.clamp_line_width(500) == 200
     assert E.clamp_line_width(0) == 1
     assert E.clamp_line_width(7.4) == 7
+
+
+def test_reproducibility_roi_mean_uses_the_shared_mask():
+    import reproducibility as RP
+    a = np.arange(40 * 30, dtype=float).reshape(40, 30)
+    for roi in ([3, 10, 5, 9], [3, 10, 5, 9, 35.0]):
+        m, n = RP._roi_mean(a, roi, 2.0, -1.0)
+        shifted = [roi[0] + 2, roi[1] + 2, roi[2] - 1, roi[3] - 1] + list(roi[4:])
+        mask = E.roi_mask(a.shape, shifted)
+        assert n == int(mask.sum()) and np.isclose(m, a[mask].mean())
+    assert RP._roi_mean(a, [3, 10, 5, 9], 500.0, 0.0)[1] == 0
+
+
+def test_line_profiles_use_each_line_width():
+    s = E.Scan(name="a")
+    arr = np.zeros((40, 50, 3))
+    arr[20, :, 0] = 1.0                                    # one bright row in eyy
+    s.ensure_state().strain_raw = {"without_roi": arr}
+    s.lines = {"L1": [[5, 20], [40, 20]], "L2": [[5, 20], [40, 20]]}
+    s.line_widths = {"L2": 5}
+    p = E.line_profiles(s, "without_roi", width=1)
+    assert np.isclose(p["L1"]["eyy"][10], 100.0)            # width 1: only the row
+    assert np.isclose(p["L2"]["eyy"][10], 20.0)             # width 5: row averaged over 5

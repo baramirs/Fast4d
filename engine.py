@@ -4782,15 +4782,19 @@ def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
 
 def line_profiles(scan: "Scan", label: str = "without_roi", *, width: int = 3) -> dict:
     """{line_id: {dist, eyy, exx, exy, adf}} resampled along ``scan.lines`` from the
-    saved strain map (``label``, channels in %) and the ADF."""
+    saved strain map (``label``, channels in %) and the ADF. Each line uses its own
+    width from ``scan.line_widths`` (Line / ROI tool) when stored, else ``width``."""
     from fast_artifacts import _as_hw3
     st = scan.ensure_state()
     hw3 = _as_hw3((getattr(st, "strain_raw", {}) or {}).get(label))
     stress = (getattr(st, "stress_tensors_pa", {}) or {}).get(label)
     sdiv, _u = _stress_scale(scan)
     adf = cached_adf(scan)
+    widths = getattr(scan, "line_widths", None) or {}
+    default_width = width
     out: dict = {}
     for lid, seg in (getattr(scan, "lines", None) or {}).items():
+        width = widths.get(lid, default_width)
         d: dict = {}
         if hw3 is not None:
             for ch, idx in _CH_IDX.items():

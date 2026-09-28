@@ -153,20 +153,16 @@ def shift_segment(seg, dx, dy):
 
 
 def _roi_mean(arr, bounds, dx=0.0, dy=0.0):
-    if len(bounds) >= 5 and float(bounds[4]):          # rotated ROI → the shared mask
-        import engine as _E
-        x0, x1, y0, y1, ang = [float(b) for b in bounds[:5]]
-        v = arr[_E.roi_mask(arr.shape, [x0 + dx, x1 + dx, y0 + dy, y1 + dy, ang])]
-        v = v[np.isfinite(v)]
-        return (float(v.mean()) if v.size else float("nan")), int(v.size)
+    """Mean and pixel count inside the ROI shifted by (dx, dy). Same pixel
+    definition as the rest of Fast4D (engine.roi_mask: inclusive edges, rotation)."""
+    import engine as _E
     x0, x1, y0, y1 = [float(b) for b in bounds[:4]]
     H, W = arr.shape
-    xa, xb = sorted((x0 + dx, x1 + dx)); ya, yb = sorted((y0 + dy, y1 + dy))
-    xa, ya = max(0, int(round(xa))), max(0, int(round(ya)))
-    xb, yb = min(W, int(round(xb))), min(H, int(round(yb)))
-    if xb <= xa or yb <= ya:
-        return float("nan"), 0
-    v = arr[ya:yb, xa:xb]
+    xs, ys = sorted((x0 + dx, x1 + dx)), sorted((y0 + dy, y1 + dy))
+    if xs[1] < -0.5 or ys[1] < -0.5 or xs[0] > W - 0.5 or ys[0] > H - 0.5:
+        return float("nan"), 0                          # shifted fully off the map
+    roi = [x0 + dx, x1 + dx, y0 + dy, y1 + dy, _E.roi_angle(bounds)]
+    v = arr[_E.roi_mask(arr.shape, roi)]
     v = v[np.isfinite(v)]
     return (float(v.mean()) if v.size else float("nan")), int(v.size)
 
