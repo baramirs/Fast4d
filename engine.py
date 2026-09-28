@@ -384,6 +384,16 @@ class CalibrationParams:
 
     # ── Strain mapping (cell 41) ──────────────────────────────────────────────
     coordinate_rotation: float = 0.0
+    # Crystal frame of the tensor (crystal_frame.py). "crystal": the x axis of
+    # get_strain is computed from the reference g1,g2 so that exx || frame_x_hkl
+    # (coordinate_rotation is then an OUTPUT). "manual": the typed
+    # coordinate_rotation is used and the card reports its offset from frame_x_hkl.
+    # Zone = zone_axis. g1/g2 hkl = labels of the basis vectors chosen in Basis.
+    frame_mode: str = "crystal"
+    frame_x_hkl: list = field(default_factory=lambda: [-1, 1, 0])
+    frame_y_hkl: list = field(default_factory=lambda: [0, 0, 1])
+    frame_g1_hkl: list = field(default_factory=lambda: [-1, 1, 1])
+    frame_g2_hkl: list = field(default_factory=lambda: [1, -1, 1])
     max_peak_spacing: float = 2.0
     vrange: list = field(default_factory=lambda: [-5.0, 5.0])
     vrange_theta: list = field(default_factory=lambda: [-5.0, 5.0])
@@ -405,10 +415,20 @@ class CalibrationParams:
     custom_stress: dict | None = None                # {c11_gpa, c12_gpa, c44_gpa}
     stress_units: str = "MPa"                        # stress-map display units: "GPa" | "MPa"
     stress_vmax: float = 0.0                          # symmetric colour range ±vmax (display units); 0 = auto
+    r_px_pm: float = 0.0                              # STEM scan step from Velox EMD (pm/px); 0 = distances in px
 
     # convenience -------------------------------------------------------------
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def crystal_frame_spec(self) -> dict:
+        """Spec for crystal_frame.frame_from_g (see crystal_frame.py)."""
+        return dict(mode=str(self.frame_mode or "crystal"),
+                    zone=[int(v) for v in self.zone_axis],
+                    x_hkl=[int(v) for v in self.frame_x_hkl],
+                    y_hkl=[int(v) for v in self.frame_y_hkl],
+                    g1_hkl=[int(v) for v in self.frame_g1_hkl],
+                    g2_hkl=[int(v) for v in self.frame_g2_hkl])
 
     def cal_crystal_obj(self) -> CalCrystal:
         """Resolve the Q-pixel / Index BVM crystal (Si/Au/Custom/CIF)."""
@@ -443,6 +463,22 @@ class CalibrationParams:
         if self.stress_symmetry == "isotropic":
             c44 = (c11 - c12) / 2.0
         return c11, c12, c44
+
+
+# Path-B detection fields copied when queuing several files after tuning one.
+DETECTION_SETTING_ATTRS: tuple[str, ...] = (
+    "probe_source",
+    "probe_vacuum_roi_bounds",
+    "detect_min_absolute_intensity",
+    "detect_min_relative_intensity",
+    "detect_min_peak_spacing",
+    "detect_edge_boundary",
+    "detect_sigma",
+    "detect_max_num_peaks",
+    "detect_subpixel",
+    "detect_corr_power",
+    "detect_cuda",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1692,16 +1728,29 @@ def vc_compute_dp_probe(scan: Scan, *, mode: str = "both", log: Log = None) -> d
     qmax = float(min(qshape) / 2.0) if qshape else 256.0
     return {"dp_mean": (np.asarray(dp_mean.data, dtype=np.float32) if dp_mean is not None else None),
             "dp_max": (np.asarray(dp_max.data, dtype=np.float32) if dp_max is not None else None),
-            "alpha": float(alpha), "qx0": float(qx0), "qy0": float(qy0), "qmax": qmax}
+            "alpha": float(alpha), "qx0": float(qx0), "qy0": float(qy0), "qmax": qmax,
+            "qshape": (tuple(int(v) for v in qshape) if qshape else None)}
 
 
 def vc_compute_virtual_images(scan: Scan, *, which: str, center_yx, adf_radii,
-                              bf_radius: float, log: Log = None) -> None:
+                              bf_radius: float, log: Log = None,
+                              detector_meta: dict | None = None) -> None:
     """Compute the ADF (annular) and/or BF (circle) virtual images on the datacube
     tree (``get_virtual_image``). ``center_yx`` = (row, col); ``adf_radii`` = (inner,
-    outer). ``which`` ∈ {'adf','bf','both'}."""
+    outer). ``which`` ∈ {'adf','bf','both'}. ``detector_meta`` (alpha source,
+    ratios, mrad…) is kept on the state and written next to the .h5 on save."""
     import gc
     st = scan.ensure_state()
+    meta = dict(detector_meta or {})
+    meta.update({"center_yx_px": [float(center_yx[0]), float(center_yx[1])],
+                 "which": str(which)})
+    if (which or "both").lower() in ("adf", "both"):
+        meta["adf_radii_px"] = [float(adf_radii[0]), float(adf_radii[1])]
+    if (which or "both").lower() in ("bf", "both"):
+        meta["bf_radius_px"] = float(bf_radius)
+    prev = dict(getattr(st, "virtual_detectors", None) or {})
+    prev.update(meta)
+    st.virtual_detectors = prev
     cube = getattr(st, "datacube", None)
     if cube is None:
         raise RuntimeError("Load the datacube first (vc_compute_dp_probe).")
@@ -1723,6 +1772,56 @@ def vc_compute_virtual_images(scan: Scan, *, which: str, center_yx, adf_radii,
                                name="bright_field")
         gc.collect()
     _log(log, f"[{scan.name}] virtual images computed ({w}).")
+
+
+# Default STEM detector geometry, as multiples of the probe semi-angle alpha taken
+# from the VACUUM probe (the "kernel"): BF = alpha, HAADF = 2 alpha .. 8 alpha.
+# (e.g. alpha = 25 mrad -> BF 25, HAADF 50-200 mrad). Defaults only: the GUI lets
+# the user change the ratios or drag the rings.
+DETECTOR_RATIOS = {"bf": 1.0, "adf_inner": 2.0, "adf_outer": 8.0}
+
+
+def detector_radii_from_alpha(alpha: float, *, center_yx=None, qshape=None,
+                              bf: float = DETECTOR_RATIOS["bf"],
+                              adf_inner: float = DETECTOR_RATIOS["adf_inner"],
+                              adf_outer: float = DETECTOR_RATIOS["adf_outer"],
+                              clamp: bool = True) -> dict:
+    """Radii (px) = ratio x alpha. With ``clamp`` the ADF outer radius is limited to
+    the largest full circle that fits on the detector around ``center_yx``
+    (a ring cut by the detector edge is not azimuthally complete)."""
+    a = float(alpha)
+    if not (a > 0):
+        raise ValueError("alpha must be > 0")
+    out = {"bf": bf * a, "adf_inner": adf_inner * a, "adf_outer": adf_outer * a,
+           "alpha": a, "ratios": (float(bf), float(adf_inner), float(adf_outer)),
+           "clamped": False, "r_edge": None}
+    if qshape is not None and center_yx is not None:
+        cy, cx = float(center_yx[0]), float(center_yx[1])
+        ny, nx = int(qshape[0]), int(qshape[1])
+        r_edge = min(cy, cx, ny - 1 - cy, nx - 1 - cx)
+        out["r_edge"] = float(r_edge)
+        if clamp and out["adf_outer"] > r_edge:
+            out["adf_outer"] = float(r_edge)
+            out["clamped"] = True
+    return out
+
+
+def vacuum_probe_params(vacuum_path: str, *, log: Log = None) -> dict:
+    """alpha / center of a vacuum file's probe (cached: memory -> disk -> compute)."""
+    e = _pipeline().get_vacuum_probe(vacuum_path, log=log)
+    return {"alpha": e["alpha"], "qx0": e["qx0"], "qy0": e["qy0"],
+            "origin": e["origin"], "path": e["path"],
+            "probe": np.asarray(getattr(e["probe"], "probe", None), dtype=np.float32)}
+
+
+def vacuum_probe_cached(vacuum_path: str) -> bool:
+    """True if this vacuum's probe is already in memory or on the disk cache."""
+    pl = _pipeline()
+    try:
+        key = pl._vacuum_cache_key(vacuum_path)
+    except Exception:
+        return False
+    return key in pl._VACUUM_PROBE_CACHE or pl._probe_disk_cache_file(key).is_file()
 
 
 def vc_read_virtual(scan: Scan, key: str):
@@ -1789,6 +1888,15 @@ def vc_save_h5(scan: Scan, path: str, *, log: Log = None) -> str:
         py4DSTEM.save(str(out), cube, tree=None, mode="o")
 
     scan.h5_path = str(out)
+    det = getattr(st, "virtual_detectors", None)
+    if det:
+        try:
+            import json as _json
+            side = out.with_name(out.stem + ".detectors.json")
+            side.write_text(_json.dumps(det, indent=2, default=str), encoding="utf-8")
+            _log(log, f"[{scan.name}] detector geometry → {side.name}")
+        except Exception as exc:
+            _log(log, f"[{scan.name}] detector sidecar not written: {exc}")
     try:
         st.precomputed_h5_path = out
     except Exception:
@@ -2252,6 +2360,7 @@ def apply_calibration(scan: Scan, *, log: Log = None) -> None:
     st = scan.ensure_state()
     sc_cfg = _params_to_batch_scan_cfg(scan)
     _batch()._apply_calibration(st, sc_cfg, log)
+    apply_r_pixel_from_params(scan, log=log)
     _log(log, f"[{scan.name}] calibration values applied (bulk)")
 
 
@@ -3234,10 +3343,27 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
         g1, g2 = pl.capture_reference_g12_from_strainmap(sm, mask, log=log)
         gvects = (g1, g2)
 
+    # crystal frame: validated here so a bad spec fails before the heavy step
+    spec = p.crystal_frame_spec()
+    if spec["mode"] == "crystal":
+        try:
+            import crystal_frame as CF
+        except ImportError:
+            from . import crystal_frame as CF
+        probs = CF.check_spec(spec)
+        if probs:
+            raise RuntimeError("Crystal frame spec is not valid: " + "; ".join(probs)
+                               + " (Strain tab: frame_* rows, or set frame mode = manual)")
+    st.crystal_frame_spec = spec
+
     # use_roi=False here on purpose: we pass the reference via gvects, keeping the
     # FULL calibrated braggpeaks (not a masked, default-calibration copy).
     result = pl.compute_strain_map_step(
         st, use_roi=False, gvects=gvects, label_override=label, log=log)
+    card = (getattr(st, "crystal_frame_cards", {}) or {}).get(label)
+    if card and card.get("mode") == "crystal":
+        # coordinate_rotation is an output in crystal mode: show what was used
+        p.coordinate_rotation = round(float(card["x_angle_applied_deg"]), 3)
 
     # keep figures for later save
     if not getattr(st, "strain_figures", None):
@@ -3415,6 +3541,42 @@ def reset_bragg_calibration(scan: Scan, *, log: Log = None) -> None:
     scan.status = "pending"
     _log(log, f"[{scan.name}] bragg calibration reset to uncalibrated"
               + (" (reloaded braggpeaks)" if reloaded else " (cleared in place)"))
+
+
+def copy_detection_settings(dst: Scan, src: Scan, *, log: Log = None) -> None:
+    """Copy tuned Path-B detect params + vacuum/probe source from ``src`` onto ``dst``.
+
+    ``six_points`` stay per-file (they are ADF scan positions). List fields are
+    copied so later edits on ``src`` do not mutate the destination.
+    """
+    if dst is src:
+        return
+    for attr in DETECTION_SETTING_ATTRS:
+        val = getattr(src.params, attr)
+        setattr(dst.params, attr, list(val) if isinstance(val, list) else val)
+    if src.vacuum_path:
+        dst.vacuum_path = src.vacuum_path
+    _log(log, f"[{dst.name}] detection settings copied from '{src.name}'")
+
+
+def ensure_datacube_and_probe(scan: Scan, *, shared_probe=None, log: Log = None) -> None:
+    """Load the datacube and attach a probe if either is missing.
+
+    Unlike ``load_datacube_and_probe``, this is a no-op when both are already in
+    RAM (the file just used to tune detection) and it *raises* if the probe cannot
+    be computed — full-scan detection cannot run without one. ``shared_probe`` is
+    the vacuum template computed once for a multi-file queue.
+    """
+    st = scan.ensure_state()
+    if getattr(st, "datacube", None) is None:
+        load_datacube(scan, log=log)
+    if getattr(st, "probe", None) is not None:
+        return
+    if shared_probe is not None:
+        apply_probe(scan, shared_probe, source=scan.params.probe_source or "vacuum",
+                    log=log)
+        return
+    compute_probe(scan, log=log)
 
 
 def load_datacube_and_probe(scan: Scan, *, log: Log = None) -> None:
@@ -4245,6 +4407,41 @@ def channel_clim(scan: "Scan", channel: str) -> tuple[float, float] | None:
     return None
 
 
+def channel_display_cmap(scan: "Scan", channel: str) -> str:
+    """Colormap name matching the GUI: strain / θ / ADF (gray)."""
+    ch = str(channel).lower()
+    p = getattr(scan, "params", None)
+    if ch == "adf":
+        return "gray"
+    if ch in _ORIENT_CH:
+        return str(getattr(p, "strain_cmap_theta", None) or "PRGn")
+    return str(getattr(p, "strain_cmap", None) or "RdBu_r")
+
+
+def channel_display_levels(scan: "Scan", channel: str, arr) -> tuple[float, float]:
+    """(vmin, vmax) for displaying a ``channel_map_2d`` array.
+
+    Honours the GUI range (``vrange`` / ``vrange_theta`` / ``stress_vmax``).
+    ADF uses 1–99 percentiles. Stress with ``stress_vmax==0`` falls back to
+    ±p98(|arr|) — never a per-array auto scale when the user set a range.
+    """
+    clim = channel_clim(scan, channel)
+    if clim is not None:
+        return clim
+    a = np.asarray(arr, dtype=float)
+    finite = a[np.isfinite(a)]
+    ch = str(channel).lower()
+    if ch == "adf":
+        if finite.size:
+            return (float(np.percentile(finite, 1)),
+                    float(np.percentile(finite, 99)))
+        return 0.0, 1.0
+    if finite.size:
+        vmax = float(np.percentile(np.abs(finite), 98)) or 1.0
+        return -vmax, vmax
+    return -1.0, 1.0
+
+
 def build_channel_panel_figure(scan: "Scan", channel: str, label: str = "without_roi",
                                *, title: str | None = None):
     """One-panel map figure for Report tree channel leaves / export (GUI vranges)."""
@@ -4254,18 +4451,8 @@ def build_channel_panel_figure(scan: "Scan", channel: str, label: str = "without
     if arr is None:
         return None
     a = np.asarray(arr, dtype=float)
-    cmap = str(getattr(scan.params, "strain_cmap", None) or "RdBu_r")
-    if str(channel).lower() in _ORIENT_CH:
-        cmap = str(getattr(scan.params, "strain_cmap_theta", None) or "PRGn")
-    clim = channel_clim(scan, channel)
-    if clim is None:
-        finite = a[np.isfinite(a)]
-        if finite.size:
-            vmax = float(np.nanpercentile(np.abs(finite), 98)) or 1.0
-            clim = (-vmax, vmax)
-        else:
-            clim = (-1.0, 1.0)
-    vmin, vmax = clim
+    cmap = channel_display_cmap(scan, channel)
+    vmin, vmax = channel_display_levels(scan, channel, a)
     fig, ax = plt.subplots(figsize=(5.2, 4.4), constrained_layout=True)
     im = ax.imshow(a, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -4281,6 +4468,65 @@ def map_key_label_channel(map_key: str) -> tuple[str, str]:
     kind = "stress" if map_key.startswith("stress") else "strain"
     return label, kind
 
+
+
+def r_pixel_nm(scan: "Scan") -> float | None:
+    """STEM scan step in nm/px from ``params.r_px_pm`` (Velox EMD, pm) or state."""
+    p = getattr(scan, "params", None)
+    pm = float(getattr(p, "r_px_pm", 0.0) or 0.0) if p is not None else 0.0
+    if pm > 0:
+        return pm / 1000.0
+    st = getattr(scan, "state", None)
+    if st is None:
+        return None
+    nm = getattr(st, "image_pixel_size", None)
+    units = str(getattr(st, "image_pixel_units", "") or "nm").lower()
+    if nm is None:
+        return None
+    try:
+        val = float(nm)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    if units in ("pm", "picometer", "picometre"):
+        return val / 1000.0
+    return val
+
+
+def r_pixel_scale(scan: "Scan", fallback_nm: float | None = None) -> tuple[float, str]:
+    """Multiply ``distance_px`` by this scale to get axis units (``nm`` or ``px``)."""
+    nm = r_pixel_nm(scan)
+    if nm is None:
+        nm = fallback_nm
+    if nm is None or nm <= 0:
+        return 1.0, "px"
+    return float(nm), "nm"
+
+
+def scale_line_distance(dist_px, scan: "Scan", fallback_nm: float | None = None):
+    """Return ``(distance_in_axis_units, unit)`` from a pixel-distance array."""
+    scale, unit = r_pixel_scale(scan, fallback_nm=fallback_nm)
+    return np.asarray(dist_px, dtype=float) * scale, unit
+
+
+def apply_r_pixel_from_params(scan: "Scan", *, log: Log = None) -> None:
+    """Push ``params.r_px_pm`` onto the workflow state (nm) for figures / py4DSTEM.
+
+    ``r_px_pm == 0`` means keep distances in pixels — do not re-push a stale
+    ``state.image_pixel_size`` from an earlier EMD / session restore.
+    """
+    p = getattr(scan, "params", None)
+    if float(getattr(p, "r_px_pm", 0.0) or 0.0) <= 0:
+        return
+    nm = r_pixel_nm(scan)
+    if nm is None:
+        return
+    st = scan.ensure_state()
+    try:
+        _pipeline().propagate_r_pixel_calibration(st, float(nm), "nm", log=log)
+    except Exception as exc:
+        _log(log, f"[{getattr(scan, 'name', '?')}] R-pixel not propagated: {exc}")
 
 
 def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
@@ -4344,7 +4590,7 @@ def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
                                channel: str = "eyy", *, width: int = 3,
                                register: bool = True):
     """Top: the chosen map (strain channel or ADF) with the lines overlaid.
-    Bottom: that channel's profile vs distance (px), one curve per line."""
+    Bottom: that channel's profile vs distance (nm if R is set, else px)."""
     from matplotlib.figure import Figure
     from fast_artifacts import _as_hw3
     prof = line_profiles(scan, label, width=width)
@@ -4366,14 +4612,9 @@ def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
     fig = Figure(figsize=(7.6, 7.2), constrained_layout=True)
     ax_map = fig.add_subplot(2, 1, 1)
     if base is not None:
-        if channel == "adf":
-            v = base[base > 0]
-            lo, hi = ((float(np.percentile(v, 1)), float(np.percentile(v, 99)))
-                      if v.size else (float(base.min()), float(base.max() or 1)))
-            ax_map.imshow(base, cmap="gray", vmin=lo, vmax=hi, origin="upper")
-        else:
-            m = float(np.nanpercentile(np.abs(base), 95)) or 1.0
-            ax_map.imshow(base, cmap="RdBu_r", vmin=-m, vmax=m, origin="upper")
+        lo, hi = channel_display_levels(scan, channel, base)
+        ax_map.imshow(base, cmap=channel_display_cmap(scan, channel),
+                      vmin=lo, vmax=hi, origin="upper")
     ax_map.set_title(f"{scan.name} — {ylab} ({label})", fontsize=9)
     ax_map.set_xticks([]); ax_map.set_yticks([])
     ax_p = fig.add_subplot(2, 1, 2)
@@ -4384,8 +4625,9 @@ def build_line_profiles_figure(scan: "Scan", label: str = "without_roi",
         ax_map.text(x0 + 2, y0 - 2, lid, color=c, fontsize=7)
         pr = prof.get(lid, {})
         if channel in pr and "dist" in pr:
-            ax_p.plot(pr["dist"], pr[channel], color=c, lw=1.2, label=lid)
-    ax_p.set_xlabel("distance (px)"); ax_p.set_ylabel(ylab)
+            xd, _u = scale_line_distance(pr["dist"], scan)
+            ax_p.plot(xd, pr[channel], color=c, lw=1.2, label=lid)
+    ax_p.set_xlabel(f"distance ({r_pixel_scale(scan)[1]})"); ax_p.set_ylabel(ylab)
     ax_p.grid(alpha=0.3)
     if prof:
         ax_p.legend(fontsize=7, ncol=4)
@@ -4469,12 +4711,13 @@ def build_grouped_line_figure(scans: list, line_id: str, channel: str = "eyy",
     m = len(cd)
     clab = _channel_label(scans[0], channel) if scans else _CH_LABEL.get(channel, channel)
 
+    cd_plot, d_unit = scale_line_distance(cd, scans[0]) if scans else (cd, "px")
     for i, (name, _d, v) in enumerate(series):
         c = SIX_POINT_COLORS[i % len(SIX_POINT_COLORS)]
-        ax1.plot(cd, v[:m], color=c, lw=1.0, alpha=0.8, label=name[:14])
-    ax1.plot(cd, mean_c, color="black", lw=2.0, label="mean")
-    ax1.fill_between(cd, mean_c - std_c, mean_c + std_c, color="0.5", alpha=0.25, label="±std")
-    ax1.set_xlabel("distance (px)"); ax1.set_ylabel(clab)
+        ax1.plot(cd_plot, v[:m], color=c, lw=1.0, alpha=0.8, label=name[:14])
+    ax1.plot(cd_plot, mean_c, color="black", lw=2.0, label="mean")
+    ax1.fill_between(cd_plot, mean_c - std_c, mean_c + std_c, color="0.5", alpha=0.25, label="±std")
+    ax1.set_xlabel(f"distance ({d_unit})"); ax1.set_ylabel(clab)
     ax1.set_title(f"{line_id} across {len(series)} file(s) — {clab} ({label})", fontsize=9)
     ax1.grid(alpha=0.3); ax1.legend(fontsize=6, ncol=2)
 
@@ -4765,10 +5008,11 @@ def build_maps_with_lines_figure(scan: "Scan", label: str = "without_roi", *, wi
             pr = prof.get(lid, {})
             if ch in pr and "dist" in pr:
                 col = SIX_POINT_COLORS[j % len(SIX_POINT_COLORS)]
-                ax_p.plot(pr["dist"], pr[ch], color=col, lw=1.0, label=lid)
+                xd, _u = scale_line_distance(pr["dist"], scan)
+                ax_p.plot(xd, pr[ch], color=col, lw=1.0, label=lid)
                 has_curve = True
         ax_p.grid(alpha=0.3)
-        ax_p.set_xlabel("distance (px)", fontsize=7)
+        ax_p.set_xlabel(f"distance ({r_pixel_scale(scan)[1]})", fontsize=7)
         ax_p.tick_params(labelsize=7)
         if i == 0 and has_curve:
             ax_p.legend(fontsize=6, ncol=min(4, len(lines)))
@@ -4794,15 +5038,9 @@ def build_single_line_map_figure(scan: "Scan", line_id: str, channel: str = "eyy
         return fig
     gs = fig.add_gridspec(2, 1, height_ratios=[3, 1])
     ax = fig.add_subplot(gs[0, 0])
-    v = m[np.isfinite(m)]
-    symmetric = not str(channel).startswith("adf")
-    if symmetric:
-        vmax = float(np.percentile(np.abs(v), 98)) if v.size else 1.0
-        ax.imshow(m, cmap="RdBu_r", vmin=-(vmax or 1.0), vmax=(vmax or 1.0), origin="upper")
-    else:
-        lo, hi = ((float(np.percentile(v, 1)), float(np.percentile(v, 99)))
-                  if v.size else (float(m.min()), float(m.max() or 1)))
-        ax.imshow(m, cmap="gray", vmin=lo, vmax=hi, origin="upper")
+    lo, hi = channel_display_levels(scan, channel, m)
+    ax.imshow(m, cmap=channel_display_cmap(scan, channel),
+              vmin=lo, vmax=hi, origin="upper")
     try:
         (x0, y0), (x1, y1) = seg
         ax.plot([x0, x1], [y0, y1], color="#e6194b", lw=2.0)
@@ -4814,8 +5052,11 @@ def build_single_line_map_figure(scan: "Scan", line_id: str, channel: str = "eyy
     ax_p = fig.add_subplot(gs[1, 0])
     pr = line_profiles(scan, label, width=width).get(line_id, {})
     if channel in pr and "dist" in pr:
-        ax_p.plot(pr["dist"], pr[channel], color="#e6194b", lw=1.2)
-    ax_p.set_xlabel("distance (px)", fontsize=8); ax_p.set_ylabel(clab, fontsize=8)
+        xd, xu = scale_line_distance(pr["dist"], scan)
+        ax_p.plot(xd, pr[channel], color="#e6194b", lw=1.2)
+    else:
+        xu = r_pixel_scale(scan)[1]
+    ax_p.set_xlabel(f"distance ({xu})", fontsize=8); ax_p.set_ylabel(clab, fontsize=8)
     ax_p.grid(alpha=0.3); ax_p.tick_params(labelsize=7)
     return fig
 
@@ -5665,7 +5906,20 @@ def params_from_template_scan(sc_cfg) -> CalibrationParams:
         strain_cmap_theta=str(s13.get("cmap_theta", "PRGn")),
         strain_show_orientation=bool(s13.get("show_orientation", True)),
         strain_scan_roi_bounds=s13.get("scan_roi_bounds"),
+        **_frame_fields_from(s13.get("crystal_frame") or {}),
     )
+
+
+def _frame_fields_from(cf: dict) -> dict:
+    """CalibrationParams frame_* kwargs from a saved crystal_frame spec (missing
+    keys keep the dataclass defaults)."""
+    out = {}
+    for src, dst in (("mode", "frame_mode"), ("x_hkl", "frame_x_hkl"),
+                     ("y_hkl", "frame_y_hkl"), ("g1_hkl", "frame_g1_hkl"),
+                     ("g2_hkl", "frame_g2_hkl")):
+        if cf.get(src) is not None:
+            out[dst] = cf[src] if src == "mode" else [int(v) for v in cf[src]]
+    return out
 
 
 def _overlay_params_dict(params: "CalibrationParams", pd: dict) -> None:
@@ -5810,7 +6064,8 @@ def save_params_template(scans: list[Scan], path: str, *, template_index: int = 
                        "cmap_theta": str(p.strain_cmap_theta),
                        "show_orientation": bool(p.strain_show_orientation),
                        "scan_roi_bounds": (list(p.strain_scan_roi_bounds)
-                                           if p.strain_scan_roi_bounds else None)},
+                                           if p.strain_scan_roi_bounds else None),
+                       "crystal_frame": p.crystal_frame_spec()},
             "stress": {"mode": "plane_stress", "c11_gpa": float(c11),
                        "c12_gpa": float(c12), "c44_gpa": float(c44)},
         }

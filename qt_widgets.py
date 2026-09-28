@@ -1164,8 +1164,10 @@ class FilesTree(QtWidgets.QTreeWidget):
     """Scan list where each file with an associated ``.h5`` is expandable to
     browse its root (groups / datasets). Double-clicking an array node asks the
     host to open it (``nodeActivated``); selecting any row picks the scan
-    (``scanSelected``). The h5 root is populated lazily on expand (cheap: it reads
-    structure only, never the heavy 4D payload), via the injected ``explore_fn``.
+    (``scanSelected``). Ctrl+click adds files to a multi-selection without
+    changing the active file (used to queue Compute braggpeaks). The h5 root is
+    populated lazily on expand (cheap: it reads structure only, never the heavy
+    4D payload), via the injected ``explore_fn``.
     """
 
     scanSelected = QtCore.Signal(int)         # top-level scan row (or its child) chosen
@@ -1180,6 +1182,7 @@ class FilesTree(QtWidgets.QTreeWidget):
         self.setHeaderLabels(["File / h5 root", "Info"])
         self.setAlternatingRowColors(True)
         self.setUniformRowHeights(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         hdr = self.header()
         hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -1212,8 +1215,54 @@ class FilesTree(QtWidgets.QTreeWidget):
         self.blockSignals(False)
 
     def select_scan(self, idx: int) -> None:
+        """Make ``idx`` the only selected file (plain click / gallery)."""
         if 0 <= idx < self.topLevelItemCount():
-            self.setCurrentItem(self.topLevelItem(idx))
+            self.clearSelection()
+            it = self.topLevelItem(idx)
+            it.setSelected(True)
+            self.setCurrentItem(it)
+
+    def _scan_item(self, item: QtWidgets.QTreeWidgetItem | None):
+        """Top-level scan row for ``item`` (itself, or the scan that owns a child)."""
+        if item is None:
+            return None
+        data = item.data(0, self._ROLE)
+        if not data or data[0] not in ("scan", "node", "placeholder"):
+            return None
+        idx = int(data[1])
+        if 0 <= idx < self.topLevelItemCount():
+            return self.topLevelItem(idx)
+        return None
+
+    def selected_scan_indices(self) -> list[int]:
+        """Unique scan rows in the current multi-selection (Ctrl/Shift+click)."""
+        seen: list[int] = []
+        for it in self.selectedItems():
+            data = it.data(0, self._ROLE)
+            if data and data[0] in ("scan", "node", "placeholder"):
+                idx = int(data[1])
+                if idx not in seen:
+                    seen.append(idx)
+        return seen
+
+    def toggle_scan_selected(self, idx: int) -> None:
+        """Add/remove a top-level file without changing the current (active) item."""
+        it = self.topLevelItem(idx)
+        if it is not None:
+            it.setSelected(not it.isSelected())
+
+    def mousePressEvent(self, event) -> None:
+        """Ctrl+Left-click toggles a file in the selection without changing the
+        active (current) scan — so detection params stay on the file just tuned."""
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier):
+            item = self.itemAt(event.position().toPoint())
+            scan_item = self._scan_item(item)
+            if scan_item is not None:
+                self.toggle_scan_selected(self.indexOfTopLevelItem(scan_item))
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     # ── lazy h5-root expansion ──────────────────────────────────────────────────
     def _on_expanded(self, item: QtWidgets.QTreeWidgetItem) -> None:

@@ -272,10 +272,13 @@ def build_manifest(state: Any) -> dict[str, Any]:
         "q_pixel_size": getattr(state, "q_pixel_size", None),
         "q_pixel_units": getattr(state, "q_pixel_units", "A^-1"),
         "origin_xy": origin_xy,
-        # g1/g2 fitted reciprocal vectors live inside the StrainMap object and are
-        # not reliably recoverable post-hoc; recorded as null when unknown.
-        "g1_qxy": None,
-        "g2_qxy": None,
+        # basis g1/g2 (from choose_basis_vectors); the reference g1/g2 actually
+        # used by each get_strain are in crystal_frame[label].g*_ref_qxy.
+        "g1_qxy": ((getattr(state, "strain_basis_params", {}) or {}).get("g1_qxy")),
+        "g2_qxy": ((getattr(state, "strain_basis_params", {}) or {}).get("g2_qxy")),
+        # crystal frame of the tensor: one card per label (crystal_frame.py)
+        "crystal_frame": _jsonable(getattr(state, "crystal_frame_cards", {}) or {}),
+        "crystal_frame_spec": _jsonable(getattr(state, "crystal_frame_spec", None)),
         "calstate": calstate,
         "strain_params": _jsonable(getattr(state, "strain_params", {})),
         "strain_basis_params": _jsonable(getattr(state, "strain_basis_params", {})),
@@ -561,6 +564,10 @@ def load_fast_artifacts(
         _set("strain_params", manifest["strain_params"])
     if manifest.get("strain_basis_params"):
         _set("strain_basis_params", manifest["strain_basis_params"])
+    if isinstance(manifest.get("crystal_frame"), dict):
+        _set("crystal_frame_cards", dict(manifest["crystal_frame"]))
+    if isinstance(manifest.get("crystal_frame_spec"), dict):
+        _set("crystal_frame_spec", dict(manifest["crystal_frame_spec"]))
     rb = manifest.get("roi_bounds")
     if isinstance(rb, (list, tuple)) and len(rb) == 4:
         _set("roi_bounds", tuple(int(v) for v in rb))

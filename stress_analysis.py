@@ -4,8 +4,9 @@ Stress analysis from 2D strain maps (linear elasticity, cubic crystal).
 Strain components are unitless tensor strains ε_ij as produced by the workflow
 (εyy, εxx, εxy channel order in the raw stack). Rotation θ is not used.
 
-Stiffness C_ijkl in Voigt form for cubic: C11, C12, C44 in Pa.
-Shear stress uses tensor shear strain ε_xy with σ_xy = 2 C44 ε_xy.
+Stiffness C_ijkl in Voigt form for cubic: C11, C12, C44 in Pa (cube axes).
+The stiffness is rotated into the axes of the strain tensor (crystal frame card,
+see crystal_frame.py) before Hooke's law is applied.
 """
 
 from __future__ import annotations
@@ -25,6 +26,92 @@ def pa_to_gpa(arr: np.ndarray) -> np.ndarray:
     return np.asarray(arr, dtype=np.float64) / 1.0e9
 
 
+# --------------------------------------------------------------------------- #
+# Stiffness in the frame of the strain tensor
+# --------------------------------------------------------------------------- #
+# Voigt order: 1 xx, 2 yy, 3 zz, 4 yz, 5 xz, 6 xy (engineering shear strains).
+_VOIGT = {(0, 0): 0, (1, 1): 1, (2, 2): 2, (1, 2): 3, (2, 1): 3,
+          (0, 2): 4, (2, 0): 4, (0, 1): 5, (1, 0): 5}
+
+
+def cubic_stiffness_voigt(C11: float, C12: float, C44: float) -> np.ndarray:
+    """6x6 Voigt stiffness of a cubic crystal in its CUBE axes [100],[010],[001]."""
+    C = np.zeros((6, 6))
+    C[:3, :3] = C12
+    np.fill_diagonal(C[:3, :3], C11)
+    C[3, 3] = C[4, 4] = C[5, 5] = C44
+    return C
+
+
+def _voigt_to_tensor(C6: np.ndarray) -> np.ndarray:
+    C = np.zeros((3, 3, 3, 3))
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                for l in range(3):
+                    C[i, j, k, l] = C6[_VOIGT[(i, j)], _VOIGT[(k, l)]]
+    return C
+
+
+def _tensor_to_voigt(C: np.ndarray) -> np.ndarray:
+    C6 = np.zeros((6, 6))
+    for (i, j), a in _VOIGT.items():
+        for (k, l), b in _VOIGT.items():
+            C6[a, b] = C[i, j, k, l]
+    return C6
+
+
+def tensor_frame_axes(x_hkl, y_hkl, psi_deg: float = 0.0) -> np.ndarray:
+    """3x3 matrix whose ROWS are the tensor axes (x, y, z) in cube coordinates.
+
+    x starts along x_hkl, y along y_hkl (Gram-Schmidt), z = x cross y (the beam
+    / zone direction); then x, y are turned by psi_deg about z (from x towards
+    y). Cubic directions: [hkl] is parallel to (hkl)."""
+    ex = np.asarray(x_hkl, float)
+    ex = ex / np.linalg.norm(ex)
+    ey = np.asarray(y_hkl, float)
+    ey = ey - (ey @ ex) * ex
+    ey = ey / np.linalg.norm(ey)
+    t = np.radians(float(psi_deg))
+    ex, ey = np.cos(t) * ex + np.sin(t) * ey, -np.sin(t) * ex + np.cos(t) * ey
+    return np.vstack([ex, ey, np.cross(ex, ey)])
+
+
+def rotate_stiffness(C6: np.ndarray, axes: np.ndarray) -> np.ndarray:
+    """Voigt stiffness expressed in the axes given as rows of ``axes``."""
+    R = np.asarray(axes, float)
+    C = _voigt_to_tensor(C6)
+    Cr = np.einsum("ai,bj,ck,dl,ijkl->abcd", R, R, R, R, C, optimize=True)
+    return _tensor_to_voigt(Cr)
+
+
+def inplane_stiffness(C11: float, C12: float, C44: float, *, mode: str = "plane_stress",
+                      axes: np.ndarray | None = None) -> np.ndarray:
+    """3x3 Q with (sigma_xx, sigma_yy, sigma_xy) = Q @ (eps_xx, eps_yy, 2 eps_xy).
+
+    ``axes``: rows = tensor axes in cube coordinates (``tensor_frame_axes``);
+    None = cube axes (the historical behaviour).
+    plane_strain: eps_zz = eps_yz = eps_xz = 0.
+    plane_stress: sigma_zz = sigma_yz = sigma_xz = 0 (thin lamella); the
+    out-of-plane strains are eliminated exactly, including the couplings that
+    appear when the axes are not cube axes.
+    """
+    m = str(mode).lower().replace("-", "_").replace(" ", "_")
+    C = cubic_stiffness_voigt(C11, C12, C44)
+    if axes is not None:
+        C = rotate_stiffness(C, axes)
+    p, o = [0, 1, 5], [2, 3, 4]
+    Cpp = C[np.ix_(p, p)]
+    if m == "plane_strain":
+        return Cpp
+    if m == "plane_stress":
+        Coo = C[np.ix_(o, o)]
+        if abs(np.linalg.det(Coo)) < 1e-30:
+            raise ValueError("singular out-of-plane stiffness (check C11, C44)")
+        return Cpp - C[np.ix_(p, o)] @ np.linalg.solve(Coo, C[np.ix_(o, p)])
+    raise ValueError(f"mode must be 'plane_stress' or 'plane_strain', got {mode!r}")
+
+
 def compute_stress(
     eps_xx: np.ndarray,
     eps_yy: np.ndarray,
@@ -34,52 +121,35 @@ def compute_stress(
     C44: float,
     *,
     mode: str = "plane_stress",
+    axes: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """
-    Hooke's law for cubic crystals in the film (x–y) plane.
+    Hooke's law for a cubic crystal in the film (x-y) plane, IN THE AXES OF THE
+    STRAIN TENSOR.
 
-    * ``plane_strain``: ε_zz = 0 (thick film / constrained normal strain).
-      σ_xx = C11 ε_xx + C12 ε_yy, σ_yy = C12 ε_xx + C11 ε_yy, σ_xy = 2 C44 ε_xy.
+    The constants C11, C12, C44 are cube-axis constants. When the tensor is not
+    written along cube axes (e.g. x = [-110], y = [001] for Si [110]) the
+    stiffness is rotated first; ``axes`` gives the tensor axes (rows, cube
+    coordinates). With axes=None the cube-axis formulas are used:
 
-    * ``plane_stress``: σ_zz = 0 (free surface normal stress, thin lamella).
-      With cubic symmetry, ε_zz = -(C12/C11)(ε_xx + ε_yy), which leads to
-      effective in-plane moduli
-      C11' = C11 - C12²/C11, C12' = C12(1 - C12/C11), and
-      σ_xx = C11' ε_xx + C12' ε_yy, σ_yy = C12' ε_xx + C11' ε_yy, σ_xy = 2 C44 ε_xy.
+    * ``plane_strain``: sigma_xx = C11 exx + C12 eyy, sigma_xy = 2 C44 exy.
+    * ``plane_stress``: C11' = C11 - C12^2/C11, C12' = C12 (1 - C12/C11).
 
-    Returns σ_ij in **Pa** (same shape as inputs). θ is not used.
+    Returns sigma_ij in **Pa** (same shape as inputs). theta is not used.
     """
-    m = str(mode).lower().replace("-", "_").replace(" ", "_")
     exx = np.asarray(eps_xx, dtype=np.float64)
     eyy = np.asarray(eps_yy, dtype=np.float64)
     exy = np.asarray(eps_xy, dtype=np.float64)
     if exx.shape != eyy.shape or exx.shape != exy.shape:
         raise ValueError("eps_xx, eps_yy, eps_xy must have the same shape.")
-
-    C11 = float(C11)
-    C12 = float(C12)
-    C44 = float(C44)
-
-    if m in ("plane_strain",):
-        sigma_xx = C11 * exx + C12 * eyy
-        sigma_yy = C12 * exx + C11 * eyy
-        sigma_xy = 2.0 * C44 * exy
-    elif m in ("plane_stress",):
-        denom = C11
-        if abs(denom) < 1e-30:
-            raise ValueError("C11 must be non-zero for plane stress reduction.")
-        c11p = C11 - (C12 * C12) / denom
-        c12p = C12 * (1.0 - C12 / denom)
-        sigma_xx = c11p * exx + c12p * eyy
-        sigma_xy = 2.0 * C44 * exy
-        sigma_yy = c12p * exx + c11p * eyy
-    else:
-        raise ValueError(f"mode must be 'plane_stress' or 'plane_strain', got {mode!r}")
-
+    if abs(float(C11)) < 1e-30:
+        raise ValueError("C11 must be non-zero.")
+    Q = inplane_stiffness(float(C11), float(C12), float(C44), mode=mode, axes=axes)
+    g = 2.0 * exy
     return {
-        "sigma_xx": sigma_xx,
-        "sigma_yy": sigma_yy,
-        "sigma_xy": sigma_xy,
+        "sigma_xx": Q[0, 0] * exx + Q[0, 1] * eyy + Q[0, 2] * g,
+        "sigma_yy": Q[1, 0] * exx + Q[1, 1] * eyy + Q[1, 2] * g,
+        "sigma_xy": Q[2, 0] * exx + Q[2, 1] * eyy + Q[2, 2] * g,
     }
 
 

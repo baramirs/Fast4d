@@ -79,6 +79,37 @@ def _install_qt_message_filter(QtCore) -> None:
     QtCore.qInstallMessageHandler(handler)
 
 
+def _force_light_theme(app, QtCore, QtGui) -> None:
+    """Keep Fast4D light even when Windows is in dark mode.
+
+    Qt >= 6.5 follows the Windows dark setting: the palette text turns white,
+    but the blue QSS above paints light backgrounds -> white text on light blue.
+    Pin the light scheme + an explicit light palette. Set FAST4D_THEME=system
+    to get the old behaviour back."""
+    if os.environ.get("FAST4D_THEME", "").strip().lower() == "system":
+        return
+    try:                                        # Qt >= 6.8
+        app.styleHints().setColorScheme(QtCore.Qt.ColorScheme.Light)
+    except Exception:
+        pass
+    C, R = QtGui.QColor, QtGui.QPalette.ColorRole
+    pal = QtGui.QPalette()
+    for role, col in ((R.Window, "#EAF4FF"), (R.WindowText, "#0D2A4A"),
+                      (R.Base, "#FFFFFF"), (R.AlternateBase, "#F3F8FE"),
+                      (R.Text, "#0D2A4A"), (R.Button, "#E3F2FD"),
+                      (R.ButtonText, "#0D47A1"), (R.BrightText, "#B71C1C"),
+                      (R.ToolTipBase, "#FFFFE1"), (R.ToolTipText, "#000000"),
+                      (R.Highlight, "#1976D2"), (R.HighlightedText, "#FFFFFF"),
+                      (R.Link, "#1565C0"), (R.PlaceholderText, "#7A8CA0"),
+                      (R.Light, "#FFFFFF"), (R.Midlight, "#E6EEF7"),
+                      (R.Mid, "#B0C4DA"), (R.Dark, "#8AA2BC"), (R.Shadow, "#5A6B7D")):
+        pal.setColor(role, C(col))
+    grp = QtGui.QPalette.ColorGroup.Disabled
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        pal.setColor(grp, role, C("#9FB0C0"))
+    app.setPalette(pal)
+
+
 def main() -> int:
     _install_warning_filters()
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -96,6 +127,7 @@ def main() -> int:
     if f.pointSize() <= 0 and f.pixelSize() <= 0:
         f.setPointSize(9)
         app.setFont(f)
+    _force_light_theme(app, QtCore, QtGui)     # no white text in Windows dark mode
     app.setStyleSheet(_BLUE_QSS)               # blue palette across the GUI
     # software icon = the py4DSTEM logo (the fast-mode's icon); fall back to strain.png
     for name in ("4dstem_hero.png", "strain.png", "py4dstem_logo.png"):

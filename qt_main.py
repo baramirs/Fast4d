@@ -58,6 +58,46 @@ def _is_visible(dlg) -> bool:
         return False
 
 
+def _apply_channel_map_item(img, arr, scan, channel, *, pg_mod, cbar=None) -> tuple[float, float]:
+    """Paint a live-tool ImageItem with the GUI colour range (not auto-percentiles)."""
+    import numpy as np
+    a = np.asarray(arr, dtype=float)
+    lo, hi = E.channel_display_levels(scan, channel, a)
+    img.setImage(a, autoLevels=False, levels=(lo, hi))
+    cmap_name = E.channel_display_cmap(scan, channel)
+    ch = str(channel).lower()
+    if ch == "adf":
+        img.setLookupTable(None)
+    else:
+        try:
+            lut = pg_mod.colormap.get(cmap_name, source="matplotlib").getLookupTable(nPts=256)
+            img.setLookupTable(lut)
+        except Exception:
+            pass
+    if cbar is not None:
+        try:
+            cbar.setLevels((float(lo), float(hi)))
+            cm = pg_mod.colormap.get(cmap_name, source="matplotlib")
+            cbar.setColorMap(cm)
+        except Exception:
+            pass
+    return float(lo), float(hi)
+
+
+def _attach_live_colorbar(glw, pg_mod):
+    """Standalone ColorBarItem beside a live-tool map (shows the GUI clim).
+
+    Do not call ``setImageItem``: levels come from the GUI range via
+    ``_apply_channel_map_item``, not from an interactive histogram.
+    """
+    try:
+        cbar = pg_mod.ColorBarItem(width=16, interactive=False)
+        glw.addItem(cbar, row=0, col=1)
+        return cbar
+    except Exception:
+        return None
+
+
 # icon strip: (step_key, label, icon stem). Mirrors the workflow order.
 # Analysis / Live tools live in menu Tools — not a workflow step icon.
 STEPS = [
@@ -2069,7 +2109,11 @@ class VirtualizationDialog(QtWidgets.QDialog):
         self._sc = host.active_scan()
         self._dp_mean = None
         self._dp_max = None
-        self._alpha = None
+        self._alpha = None          # alpha of this scan's DP (get_probe_size)
+        self._alpha_vac = None      # alpha of the vacuum probe (the kernel)
+        self._vac_probe = None      # vacuum probe image (shown if no DP yet)
+        self._qshape = None
+        self._det_info = {}
         self._cx = 128.0   # center col (x = qy)
         self._cy = 128.0   # center row (y = qx)
         self.setWindowTitle(f"Create ADF / BF / DP  —  {self._sc.name if self._sc else ''}")
@@ -2126,6 +2170,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
         v.addLayout(moderow)
         b_dp = QtWidgets.QPushButton("Compute DP + probe (heavy)")
         b_dp.clicked.connect(self._compute_dp); v.addWidget(b_dp)
+        self._b_dp = b_dp
         # display mean/max
         drow = QtWidgets.QHBoxLayout()
         self._rb_mean = QtWidgets.QRadioButton("Mean DP"); self._rb_mean.setChecked(True)
@@ -2152,18 +2197,75 @@ class VirtualizationDialog(QtWidgets.QDialog):
         self._s_out = self._slider(v, "ADF outer", 0, 256, 90)
         for s in (self._s_bf, self._s_in, self._s_out):
             s.valueChanged.connect(self._redraw_overlays)
-        # init-from-probe multipliers
+        # detector preset: radii = ratio x alpha (default BF = a, HAADF 2a..8a)
+        grp = QtWidgets.QGroupBox("Detectors from alpha (default, editable)")
+        g = QtWidgets.QVBoxLayout(grp)
+        arow = QtWidgets.QHBoxLayout()
+        arow.addWidget(QtWidgets.QLabel("alpha from:"))
+        self._alpha_src = QtWidgets.QComboBox()
+        self._alpha_src.addItem("Vacuum probe (kernel)", "vacuum")
+        self._alpha_src.addItem("This scan's DP", "dp")
+        self._alpha_src.setToolTip(
+            "Vacuum: alpha = radius of the vacuum probe (no sample scattering) — the\n"
+            "same kernel used for disk detection. Computed once per vacuum file and\n"
+            "cached (memory + ~/.fast4d/probe_cache), so other scans reuse it.")
+        self._alpha_src.currentIndexChanged.connect(lambda _i: self._apply_mult())
+        arow.addWidget(self._alpha_src, 1)
+        g.addLayout(arow)
+        self._b_vac = QtWidgets.QPushButton("Load vacuum probe (cached)")
+        self._b_vac.setToolTip("Gets alpha (and a start center) from the vacuum file. "
+                               "Uses the cache if this vacuum was already processed — "
+                               "no vacuum reload, no 4D pass over the scan.")
+        self._b_vac.clicked.connect(self._load_vacuum_probe)
+        g.addWidget(self._b_vac)
         mrow = QtWidgets.QHBoxLayout()
-        self._m_in = self._dspin(0.0, 20.0, 1.5); self._m_out = self._dspin(0.0, 40.0, 6.0)
-        self._m_bf = self._dspin(0.0, 20.0, 1.2)
-        mrow.addWidget(QtWidgets.QLabel("×in")); mrow.addWidget(self._m_in)
-        mrow.addWidget(QtWidgets.QLabel("×out")); mrow.addWidget(self._m_out)
-        mrow.addWidget(QtWidgets.QLabel("×BF")); mrow.addWidget(self._m_bf)
-        v.addLayout(mrow)
-        b_mult = QtWidgets.QPushButton("Init radii from probe (× alpha)")
-        b_mult.clicked.connect(self._apply_mult); v.addWidget(b_mult)
+        self._m_bf = self._dspin(0.0, 20.0, E.DETECTOR_RATIOS["bf"])
+        self._m_in = self._dspin(0.0, 20.0, E.DETECTOR_RATIOS["adf_inner"])
+        self._m_out = self._dspin(0.0, 40.0, E.DETECTOR_RATIOS["adf_outer"])
+        for sp in (self._m_bf, self._m_in, self._m_out):
+            sp.setMinimumWidth(52); sp.setMaximumWidth(62); sp.setDecimals(1)
+        mrow.setSpacing(3)
+        mrow.addWidget(QtWidgets.QLabel("BF×")); mrow.addWidget(self._m_bf)
+        mrow.addWidget(QtWidgets.QLabel("in×")); mrow.addWidget(self._m_in)
+        mrow.addWidget(QtWidgets.QLabel("out×")); mrow.addWidget(self._m_out)
+        g.addLayout(mrow)
+        crow = QtWidgets.QHBoxLayout()
+        self._clamp = QtWidgets.QCheckBox("Clamp outer to detector edge")
+        self._clamp.setChecked(True)
+        self._clamp.setToolTip("Keep the HAADF ring complete (a ring cut by the detector "
+                               "edge is not azimuthally symmetric).")
+        crow.addWidget(self._clamp)
+        g.addLayout(crow)
+        mr = QtWidgets.QHBoxLayout()
+        mr.addWidget(QtWidgets.QLabel("alpha (mrad, optional):"))
+        self._alpha_mrad = QtWidgets.QDoubleSpinBox()
+        self._alpha_mrad.setRange(0.0, 200.0); self._alpha_mrad.setDecimals(2)
+        self._alpha_mrad.setSpecialValueText("unknown")
+        self._alpha_mrad.setToolTip("Convergence semi-angle. Only used to show the radii "
+                                    "in mrad (px -> mrad = alpha_mrad / alpha_px).")
+        try:
+            self._alpha_mrad.setValue(float(QtCore.QSettings("Fast4D", "virtualization")
+                                             .value("alpha_mrad", 0.0)))
+        except Exception:
+            pass
+        self._alpha_mrad.valueChanged.connect(self._on_alpha_mrad)
+        mr.addWidget(self._alpha_mrad)
+        g.addLayout(mr)
+        bm = QtWidgets.QHBoxLayout()
+        b_mult = QtWidgets.QPushButton("Apply ratios")
+        b_mult.clicked.connect(self._apply_mult); bm.addWidget(b_mult)
+        b_def = QtWidgets.QPushButton("Reset 1 / 2 / 8")
+        b_def.clicked.connect(self._reset_ratios); bm.addWidget(b_def)
+        g.addLayout(bm)
+        self._det_lbl = QtWidgets.QLabel("")
+        self._det_lbl.setWordWrap(True)
+        self._det_lbl.setStyleSheet("font-family:monospace; font-size:10px; color:#4E342E;")
+        g.addWidget(self._det_lbl)
+        v.addWidget(grp)
+        for s_ in (self._s_bf, self._s_in, self._s_out):
+            s_.valueChanged.connect(lambda *_: self._update_det_label())
         # compute + save
-        self._heavy_buttons = [b_dp]
+        self._heavy_buttons = [b_dp, self._b_vac]
         for txt, fn in (("Compute ADF", lambda: self._compute_vi("adf")),
                         ("Compute BF", lambda: self._compute_vi("bf")),
                         ("Compute ADF + BF", lambda: self._compute_vi("both")),
@@ -2196,6 +2298,130 @@ class VirtualizationDialog(QtWidgets.QDialog):
                     return
                 self._host.sig_call.emit(lambda p=p: self._dp_progress.setValue(p))
             self._remove_tqdm_sinks = qt_tqdm.add_temp_sinks(progress=_on_progress)
+        self._sync_alpha_source()
+
+    # ── vacuum-alpha preset ──────────────────────────────────────────────────
+    def _sync_alpha_source(self) -> None:
+        """Default to the vacuum alpha when this scan has a vacuum file; if that
+        vacuum is already cached, pick it up immediately (cheap)."""
+        sc = self._sc
+        vac = getattr(sc, "vacuum_path", "") if sc is not None else ""
+        self._alpha_src.setCurrentIndex(0 if vac else 1)
+        self._b_vac.setEnabled(bool(vac))
+        self._update_dp_button()
+        if not vac:
+            self._update_det_label()
+            return
+        try:
+            cached = E.vacuum_probe_cached(vac)
+        except Exception:
+            cached = False
+        if cached:
+            self._load_vacuum_probe()
+        else:
+            self._update_det_label()
+
+    def _update_dp_button(self) -> None:
+        """With the vacuum alpha already known (cache), the button only runs the
+        DP pass (center check / display) — no probe work is left to do."""
+        if self._alpha_vac is not None:
+            self._b_dp.setText("Compute DP (heavy · center check)")
+            self._b_dp.setToolTip(
+                "alpha is already known from the cached vacuum probe. This only runs\n"
+                "the DP mean/max pass to show the pattern and refine the beam center.\n"
+                "Optional: you can go straight to Compute ADF/BF.")
+        else:
+            self._b_dp.setText("Compute DP + probe (heavy)")
+            self._b_dp.setToolTip("DP mean/max pass + probe size/center from this scan's DP"
+                                  + (" and the vacuum alpha (cached afterwards)."
+                                     if getattr(self._sc, "vacuum_path", "") else "."))
+
+    def _load_vacuum_probe(self) -> None:
+        sc = self._sc
+        vac = getattr(sc, "vacuum_path", "") if sc is not None else ""
+        if not vac:
+            self._status.setText("This scan has no vacuum file (Choose vacuum file…).")
+            return
+        if self._host._busy:
+            return
+
+        def work():
+            return E.vacuum_probe_params(vac, log=self._dialog_log)
+
+        def done(res):
+            self._set_dialog_busy(False)
+            if not isinstance(res, dict):
+                self._status.setText("Vacuum probe failed — see console."); return
+            self._alpha_vac = float(res["alpha"])
+            self._vac_probe = res.get("probe")
+            if self._dp_mean is None and self._dp_max is None:
+                # no DP of the scan yet: start from the vacuum center / shape
+                self._cy, self._cx = float(res["qx0"]), float(res["qy0"])
+                if self._vac_probe is not None and getattr(self._vac_probe, "ndim", 0) == 2:
+                    self._qshape = tuple(self._vac_probe.shape)
+                    qmax = int(max(self._qshape) // 2)
+                    for s_ in (self._s_bf, self._s_in, self._s_out):
+                        s_.setMaximum(max(qmax, s_.value()))
+            if self._dp_mean is None and self._dp_max is None:
+                self._probe_lbl.setText(f"Vacuum: alpha={self._alpha_vac:.4f}  "
+                                        f"qx0(row)={res['qx0']:.2f}  qy0(col)={res['qy0']:.2f}")
+            self._alpha_src.setCurrentIndex(0)
+            self._update_dp_button()
+            self._apply_mult()
+            self._redraw_dp()
+            how = {"memory": "cache (RAM)", "disk": "disk cache",
+                   "computed": "vacuum file (now cached)"}.get(res.get("origin"), "?")
+            self._status.setText(f"Vacuum alpha = {self._alpha_vac:.2f} px from {how}. "
+                                 + ("Check the center on the DP." if self._dp_mean is not None
+                                    or self._dp_max is not None else
+                                    "Center = vacuum center (compute DP to verify)."))
+
+        self._set_dialog_busy(True)
+        self._status.setText("Vacuum probe…")
+        self._host._run_async(work, label="Vacuum probe", on_done=done)
+
+    def _current_alpha(self):
+        src = self._alpha_src.currentData()
+        if src == "vacuum" and self._alpha_vac is not None:
+            return self._alpha_vac, "vacuum"
+        if self._alpha is not None:
+            return self._alpha, "dp"
+        if self._alpha_vac is not None:
+            return self._alpha_vac, "vacuum"
+        return None, None
+
+    def _reset_ratios(self) -> None:
+        self._m_bf.setValue(E.DETECTOR_RATIOS["bf"])
+        self._m_in.setValue(E.DETECTOR_RATIOS["adf_inner"])
+        self._m_out.setValue(E.DETECTOR_RATIOS["adf_outer"])
+        self._apply_mult()
+
+    def _on_alpha_mrad(self, val) -> None:
+        try:
+            QtCore.QSettings("Fast4D", "virtualization").setValue("alpha_mrad", float(val))
+        except Exception:
+            pass
+        self._update_det_label()
+
+    def _update_det_label(self) -> None:
+        a, src = self._current_alpha()
+        bf, r0, r1 = self._s_bf.value(), self._s_in.value(), self._s_out.value()
+        lines = []
+        if a is None:
+            lines.append("α: —  (Load vacuum probe or Compute DP)")
+        else:
+            lines.append(f"α = {a:.2f} px ({'vacuum' if src == 'vacuum' else 'scan DP'})")
+            if self._alpha is not None and self._alpha_vac is not None:
+                lines.append(f"  (vacuum {self._alpha_vac:.2f} | DP {self._alpha:.2f})")
+            lines.append(f"BF {bf} px = {bf / a:.2f}α   ADF {r0}-{r1} px = "
+                         f"{r0 / a:.2f}-{r1 / a:.2f}α")
+            am = float(self._alpha_mrad.value())
+            if am > 0:
+                k = am / a
+                lines.append(f"≈ BF {bf * k:.1f} mrad  HAADF {r0 * k:.1f}-{r1 * k:.1f} mrad")
+        if self._det_info.get("clamped"):
+            lines.append(f"! outer clamped to the detector edge ({self._det_info['r_edge']:.0f} px)")
+        self._det_lbl.setText("\n".join(lines))
 
     # ── progress / busy-state plumbing ───────────────────────────────────────
     def _dialog_log(self, msg: str) -> None:
@@ -2240,6 +2466,8 @@ class VirtualizationDialog(QtWidgets.QDialog):
         scans = self._host._scans
         self._sc = scans[i] if (isinstance(i, int) and 0 <= i < len(scans)) else None
         self._dp_mean = self._dp_max = self._alpha = None
+        self._alpha_vac = self._vac_probe = self._qshape = None
+        self._det_info = {}
         self._drag = None
         try:
             self._img.clear()
@@ -2257,6 +2485,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
             self._status.setText(f"'{nm}' has no raw 4D path — pick a file with a .mib/.dm4/.h5.")
         else:
             self._status.setText(f"'{nm}' selected. Compute DP+probe to begin.")
+        self._sync_alpha_source()
 
     # ── DP compute / display ─────────────────────────────────────────────────
     def _compute_dp(self):
@@ -2268,8 +2497,16 @@ class VirtualizationDialog(QtWidgets.QDialog):
         mode = ("mean" if self._rb_mode_mean.isChecked()
                 else "max" if self._rb_mode_max.isChecked() else "both")
 
+        want_vac = bool(getattr(sc, "vacuum_path", "")) and self._alpha_vac is None
+
         def work():
-            return E.vc_compute_dp_probe(sc, mode=mode, log=self._dialog_log)
+            res = E.vc_compute_dp_probe(sc, mode=mode, log=self._dialog_log)
+            if want_vac:
+                try:
+                    res["vac"] = E.vacuum_probe_params(sc.vacuum_path, log=self._dialog_log)
+                except Exception as exc:
+                    self._dialog_log(f"[{sc.name}] vacuum alpha not available: {exc}")
+            return res
 
         def done(res):
             self._set_dialog_busy(False)
@@ -2277,12 +2514,20 @@ class VirtualizationDialog(QtWidgets.QDialog):
                 self._status.setText("DP/probe failed — see console."); return
             self._dp_mean = res["dp_mean"]; self._dp_max = res["dp_max"]
             self._alpha = res["alpha"]
+            self._qshape = res.get("qshape")
+            if isinstance(res.get("vac"), dict):
+                self._alpha_vac = float(res["vac"]["alpha"])
+                self._vac_probe = res["vac"].get("probe")
+                self._update_dp_button()
             self._cy, self._cx = float(res["qx0"]), float(res["qy0"])   # (row, col)
             qmax = int(res["qmax"])
             for s in (self._s_bf, self._s_in, self._s_out):
                 s.setMaximum(max(qmax, s.value()))
-            self._probe_lbl.setText(f"Probe: alpha={res['alpha']:.4f}  "
-                                    f"qx0(row)={res['qx0']:.2f}  qy0(col)={res['qy0']:.2f}")
+            vtxt = (f"\nVacuum: alpha={self._alpha_vac:.4f}" if self._alpha_vac is not None
+                    else "")
+            self._probe_lbl.setText(f"DP: alpha={res['alpha']:.4f}  "
+                                    f"qx0(row)={res['qx0']:.2f}  qy0(col)={res['qy0']:.2f}"
+                                    + vtxt)
             self._rb_mean.setEnabled(self._dp_mean is not None)
             self._rb_max.setEnabled(self._dp_max is not None)
             if self._dp_mean is not None:
@@ -2295,18 +2540,26 @@ class VirtualizationDialog(QtWidgets.QDialog):
 
         self._set_dialog_busy(True)
         self._dp_progress.setValue(0)
-        self._status.setText("Computing DP + probe (heavy)…")
+        self._status.setText("Computing DP (heavy)…" if self._alpha_vac is not None
+                             else "Computing DP + probe (heavy)…")
         self._host._run_async(work, label=f"DP+probe ({sc.name})", on_done=done)
 
     def _redraw_dp(self):
         a = self._dp_mean if self._rb_mean.isChecked() else self._dp_max
+        if a is None:
+            a = self._dp_max if self._dp_mean is None else self._dp_mean
+        if a is None:
+            a = self._vac_probe                   # vacuum probe until a DP exists
         if a is None:
             return
         a = self._np.asarray(a, dtype=float)
         self._img.setImage(a)
         v = a[a > 0]
         if v.size:
-            self._img.setLevels([float(self._np.percentile(v, 1)), float(self._np.percentile(v, 99.5))])
+            lo, hi = float(self._np.percentile(v, 1)), float(self._np.percentile(v, 99.5))
+            if not hi > lo:
+                lo, hi = 0.0, max(hi, 1e-12)
+            self._img.setLevels([lo, hi])
         self._redraw_overlays()
         self._vb.autoRange()
 
@@ -2348,7 +2601,7 @@ class VirtualizationDialog(QtWidgets.QDialog):
             self._s_out.setValue(d)
 
     def eventFilter(self, obj, ev):
-        if self._dp_mean is None and self._dp_max is None:
+        if self._dp_mean is None and self._dp_max is None and self._vac_probe is None:
             return False
         t = ev.type()
         T = QtCore.QEvent.Type
@@ -2372,33 +2625,61 @@ class VirtualizationDialog(QtWidgets.QDialog):
                 self._drag = None
                 self._status.setText(f"center (y,x)=({self._cy:.1f}, {self._cx:.1f})  "
                                      f"BF={self._s_bf.value()} ADF=({self._s_in.value()},{self._s_out.value()})")
+                self._update_det_label()
                 return True
         return False
 
     def _apply_mult(self):
-        if self._alpha is None:
-            self._status.setText("Compute the probe first (no alpha yet)."); return
-        a = float(self._alpha)
-        self._s_in.setValue(int(round(self._m_in.value() * a)))
-        self._s_out.setValue(int(round(self._m_out.value() * a)))
-        self._s_bf.setValue(int(round(self._m_bf.value() * a)))
+        a, _src = self._current_alpha()
+        if a is None:
+            self._update_det_label()
+            return
+        r = E.detector_radii_from_alpha(
+            a, center_yx=(self._cy, self._cx), qshape=self._qshape,
+            bf=self._m_bf.value(), adf_inner=self._m_in.value(),
+            adf_outer=self._m_out.value(), clamp=self._clamp.isChecked())
+        self._det_info = r
+        for s_, val in ((self._s_bf, r["bf"]), (self._s_in, r["adf_inner"]),
+                        (self._s_out, r["adf_outer"])):
+            v_ = int(round(val))
+            if v_ > float(getattr(s_, "_hi", v_)):
+                s_.setMaximum(v_)
+            s_.setValue(v_)
         self._redraw_overlays()
+        self._update_det_label()
 
     # ── virtual images + save ────────────────────────────────────────────────
     def _compute_vi(self, which):
         if self._sc is None or self._host._busy:
             return
-        if self._dp_mean is None and self._dp_max is None:
-            self._status.setText("Compute DP+probe first."); return
+        if self._dp_mean is None and self._dp_max is None and self._vac_probe is None:
+            self._status.setText("Compute DP+probe (or Load vacuum probe) first."); return
         sc = self._sc
         center = (self._cy, self._cx)                # (row, col)
         adf = (self._s_in.value(), self._s_out.value())
         bf = self._s_bf.value()
+        a, src = self._current_alpha()
+        meta = {"alpha_px": a, "alpha_source": src,
+                "alpha_vacuum_px": self._alpha_vac, "alpha_dp_px": self._alpha,
+                "vacuum_path": getattr(sc, "vacuum_path", "") or None,
+                "center_source": ("dp" if (self._dp_mean is not None
+                                           or self._dp_max is not None) else "vacuum"),
+                "ratios_set": [self._m_bf.value(), self._m_in.value(), self._m_out.value()],
+                "clamped": bool(self._det_info.get("clamped"))}
+        if a:
+            meta["ratios_used"] = [bf / a, adf[0] / a, adf[1] / a]
+        am = float(self._alpha_mrad.value())
+        if a and am > 0:
+            k = am / a
+            meta.update({"alpha_mrad": am, "bf_mrad": bf * k,
+                         "adf_mrad": [adf[0] * k, adf[1] * k]})
 
         def work():
+            if getattr(getattr(sc, "state", None), "datacube", None) is None:
+                E.load_datacube(sc, log=self._dialog_log)   # vacuum-only path
             E.vc_compute_virtual_images(sc, which=which, center_yx=center,
                                         adf_radii=adf, bf_radius=bf,
-                                        log=self._dialog_log)
+                                        log=self._dialog_log, detector_meta=meta)
 
         def done(_r):
             self._set_dialog_busy(False)
@@ -2487,21 +2768,22 @@ class VirtualizationDialog(QtWidgets.QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DriftEstimateDialog(QtWidgets.QDialog):
-    """Estimate inter-scan drift by phase cross-correlating strain or ADF maps.
+    """Inter-scan drift from the ADF / BF of user-chosen scans (reproducibility).
 
-    Context
-    -------
-    This tool is for experiments where the **same sample region** was scanned
-    multiple times (e.g. repeated measurements, time series, or different
-    sessions).  Between acquisitions the sample may drift slightly, so the
-    same physical feature appears at a different pixel position in each file.
+    Use case: the SAME region scanned several times in a row under the same
+    conditions (e.g. 3 repeats). Each scan is registered onto a reference by
+    phase cross-correlation of its ADF, BF, or both (ADF+BF: measured on each
+    and averaged; their difference is reported as the uncertainty). The
+    result is a per-file drift CSV (``engine.load_drift_csv``) so the line /
+    ROI plugin places the same line on the same physical feature in every file.
 
-    This dialog measures those per-file rigid shifts (dy, dx in pixels) against
-    a chosen reference scan and writes a drift CSV.  The CSV can then be loaded
-    with «Load drift CSV» so that line profiles and area ROIs are automatically
-    adjusted per file.
+    Modes: "vs reference" (every scan against one) or "chained" (each against
+    the previous one in the list order, accumulated — for series whose
+    contrast changes over time). Order the list by acquisition (drag & drop).
 
-    Note: this is NOT intra-scan drift (beam distortion within one scan).
+    Quality: NCC before -> after the shift, the ADF/BF disagreement, and an
+    overlay (reference magenta, scan green; grey where they match) for the
+    selected row. Not intra-scan drift (distortion within one acquisition).
     """
 
     def __init__(self, host) -> None:
@@ -2510,268 +2792,793 @@ class DriftEstimateDialog(QtWidgets.QDialog):
         self._host = host
         self._scans = host._scans
         self._results: list[dict] = []
-        self.setWindowTitle("Estimate inter-scan drift")
-        self.resize(700, 480)
+        self._run_scans: list = []
+        self._run_ref = None
+        self._run_key = "adf+bf"
+        self.setWindowTitle("Inter-scan drift (ADF / BF)")
+        self.resize(1180, 720)
         self._build()
 
+    # ── layout ────────────────────────────────────────────────────────────────
     def _build(self) -> None:
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setSpacing(8)
-        lay.setContentsMargins(14, 12, 14, 10)
+        import drift_estimate as _DE
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-        # ── info banner ───────────────────────────────────────────────────────
+        outer = QtWidgets.QHBoxLayout(self)
+        left = QtWidgets.QVBoxLayout()
+        outer.addLayout(left, 0)
+
         info = QtWidgets.QLabel(
-            "<b>What this does:</b> measures how many pixels each scan is shifted "
-            "relative to the reference scan, using cross-correlation of strain or "
-            "ADF maps.  Use this when you have <b>multiple files of the same "
-            "sample region</b> and want line profiles / area ROIs to land on the "
-            "same physical feature across all files."
-        )
+            "<b>Same region, scanned several times.</b> Measures how many pixels each "
+            "scan moved relative to the reference, from its ADF and/or BF. Tick the "
+            "scans to include and drag them into acquisition order.")
         info.setWordWrap(True)
+        info.setMaximumWidth(330)
         info.setStyleSheet("background:#E3F2FD; border:1px solid #90CAF9; "
                            "border-radius:4px; padding:7px; color:#0D2A4A;")
-        lay.addWidget(info)
+        left.addWidget(info)
 
-        # ── controls row ──────────────────────────────────────────────────────
-        ctrl = QtWidgets.QHBoxLayout()
+        left.addWidget(QtWidgets.QLabel("<b>Scans</b> (checked = included; drag to reorder)"))
+        self._list = QtWidgets.QListWidget()
+        self._list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setMaximumWidth(330)
+        for i, s in enumerate(self._scans):
+            it = QtWidgets.QListWidgetItem(s.name)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                        | QtCore.Qt.ItemFlag.ItemIsDragEnabled)
+            it.setCheckState(QtCore.Qt.CheckState.Checked)
+            it.setData(QtCore.Qt.ItemDataRole.UserRole, i)
+            self._list.addItem(it)
+        self._list.itemChanged.connect(lambda _it: self._refresh_ref_options())
+        self._list.model().rowsMoved.connect(lambda *_: self._refresh_ref_options())
+        left.addWidget(self._list, 1)
+        row = QtWidgets.QHBoxLayout()
+        for txt, st in (("All", True), ("None", False)):
+            b = QtWidgets.QPushButton(txt)
+            b.clicked.connect(lambda _=False, st=st: self._check_all(st))
+            row.addWidget(b)
+        left.addLayout(row)
 
-        ctrl.addWidget(QtWidgets.QLabel("Reference scan:"))
+        form = QtWidgets.QFormLayout()
         self._ref_cb = QtWidgets.QComboBox()
-        for s in self._scans:
-            self._ref_cb.addItem(s.name)
-        if 0 <= self._host._active < len(self._scans):
-            self._ref_cb.setCurrentIndex(self._host._active)
-        ctrl.addWidget(self._ref_cb, 2)
-
-        ctrl.addSpacing(12)
-        ctrl.addWidget(QtWidgets.QLabel("Channel:"))
+        form.addRow("Reference:", self._ref_cb)
         self._chan_cb = QtWidgets.QComboBox()
-        import drift_estimate as _DE
         for lbl, key in _DE.CHANNELS:
             self._chan_cb.addItem(lbl, key)
-        # default to ε_xx (index 1) — usually best contrast for cross-correlation
-        self._chan_cb.setCurrentIndex(1)
+        self._chan_cb.setCurrentIndex(0)                 # ADF + BF
         self._chan_cb.setToolTip(
-            "Map used for cross-correlation.\n"
-            "ADF works well when virtual images are available.\n"
-            "ε_xx or ε_yy work well when strain maps are computed."
-        )
-        ctrl.addWidget(self._chan_cb)
-
-        ctrl.addSpacing(12)
-        ctrl.addWidget(QtWidgets.QLabel("Precision:"))
-        self._ups = QtWidgets.QSpinBox()
-        self._ups.setRange(1, 100)
-        self._ups.setValue(10)
-        self._ups.setSuffix("×")
-        self._ups.setToolTip(
-            "Sub-pixel upsampling factor.\n"
-            "10 → 0.1 px precision.  Higher = slower but more accurate."
-        )
-        ctrl.addWidget(self._ups)
-        ctrl.addStretch(1)
-
-        lay.addLayout(ctrl)
-
-        # ── tracking ROI row ──────────────────────────────────────────────────
-        roi_row = QtWidgets.QHBoxLayout()
-        roi_row.addWidget(QtWidgets.QLabel("Track within ROI:"))
+            "ADF + BF: shift measured on each image and averaged; their difference is "
+            "reported as the uncertainty (two independent contrasts of the same field).\n"
+            "ADF or BF alone, or a strain map if virtual images are not available.")
+        form.addRow("Image:", self._chan_cb)
+        self._mode_cb = QtWidgets.QComboBox()
+        self._mode_cb.addItem("vs reference", "reference")
+        self._mode_cb.addItem("chained (each vs previous)", "chained")
+        self._mode_cb.setToolTip(
+            "vs reference: every scan against the reference (independent errors).\n"
+            "chained: each scan against the previous one in the list, accumulated — "
+            "use it when contrast changes along the series (contamination, damage); "
+            "the error grows with the number of links.")
+        form.addRow("Mode:", self._mode_cb)
         self._roi_cb = QtWidgets.QComboBox()
         self._roi_cb.setToolTip(
-            "Restrict cross-correlation to a tracking region you defined in the ROI "
-            "editor (e.g. vacuum + a particle edge).\n"
-            "This keeps registration precise as the number of files grows — the whole "
-            "map averages out small features, a focused ROI does not.\n\n"
-            "Define ROIs first with 'Edit ROIs…', then pick one here."
-        )
-        roi_row.addWidget(self._roi_cb, 1)
-        b_refresh_roi = QtWidgets.QPushButton("↻")
-        b_refresh_roi.setMaximumWidth(32)
-        b_refresh_roi.setToolTip("Reload ROI list from the reference scan.")
-        b_refresh_roi.clicked.connect(self._refresh_roi_options)
-        roi_row.addWidget(b_refresh_roi)
-        lay.addLayout(roi_row)
+            "Restrict the correlation to a feature-rich area ROI of the reference "
+            "(e.g. an edge). Define it with 'Edit ROIs…' in Set up Lines.")
+        form.addRow("Track in ROI:", self._roi_cb)
+        self._ups = QtWidgets.QSpinBox(); self._ups.setRange(1, 200); self._ups.setValue(20)
+        self._ups.setSuffix("×"); self._ups.setToolTip("Sub-pixel upsampling: 20 → 0.05 px.")
+        form.addRow("Precision:", self._ups)
+        self._bg = QtWidgets.QDoubleSpinBox(); self._bg.setRange(0.0, 200.0)
+        self._bg.setDecimals(1); self._bg.setValue(0.0); self._bg.setSuffix(" px")
+        self._bg.setSpecialValueText("auto")
+        self._bg.setToolTip("Gaussian width of the smooth background removed before "
+                            "correlating (thickness / illumination gradients). 0 = auto.")
+        form.addRow("Background:", self._bg)
+        self._win = QtWidgets.QCheckBox("taper edges (Tukey window)")
+        self._win.setChecked(True)
+        form.addRow("", self._win)
+        left.addLayout(form)
+        self._refresh_ref_options()
         self._ref_cb.currentIndexChanged.connect(self._refresh_roi_options)
-        self._refresh_roi_options()
 
-        # ── run button ────────────────────────────────────────────────────────
-        btn_row = QtWidgets.QHBoxLayout()
         self._btn_run = QtWidgets.QPushButton("▶  Estimate drift")
         self._btn_run.setStyleSheet(
             "QPushButton{background:#1565C0; color:white; font-weight:bold; "
-            "border-radius:5px; padding:5px 16px;}"
+            "border-radius:5px; padding:6px 16px;}"
             "QPushButton:hover{background:#1976D2;}"
-            "QPushButton:disabled{background:#90CAF9; color:#ccc;}"
-        )
+            "QPushButton:disabled{background:#90CAF9; color:#ccc;}")
         self._btn_run.clicked.connect(self._run)
-        btn_row.addWidget(self._btn_run)
-        self._status_lbl = QtWidgets.QLabel("")
-        self._status_lbl.setStyleSheet("color:#1565C0; font-size:11px;")
-        btn_row.addWidget(self._status_lbl, 1)
-        lay.addLayout(btn_row)
+        left.addWidget(self._btn_run)
 
-        # ── results table ─────────────────────────────────────────────────────
-        self._table = QtWidgets.QTableWidget(0, 6)
+        # right: results, summary, preview, actions
+        right = QtWidgets.QVBoxLayout()
+        outer.addLayout(right, 1)
+        self._table = QtWidgets.QTableWidget(0, 8)
         self._table.setHorizontalHeaderLabels(
-            ["Scan", "dy (px)", "dx (px)", "Magnitude", "Error", "Notes"]
-        )
+            ["Scan", "dy (px)", "dx (px)", "|shift| px", "|shift| nm",
+             "NCC before → after", "ADF/BF diff (px)", "Notes"])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
+        self._table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
-        lay.addWidget(self._table, 1)
+        self._table.itemSelectionChanged.connect(self._preview)
+        right.addWidget(self._table, 2)
+        self._summary = QtWidgets.QLabel("")
+        self._summary.setWordWrap(True)
+        self._summary.setStyleSheet("color:#0D2A4A;")
+        right.addWidget(self._summary)
 
-        # ── save / load buttons ───────────────────────────────────────────────
-        act_row = QtWidgets.QHBoxLayout()
+        # two views: every selected scan overlaid (before | after the correction),
+        # and the reference against the scan picked in the table
+        self._tabs = QtWidgets.QTabWidget()
+        self._ofig = Figure(figsize=(8, 3.6))
+        self._ocanvas = FigureCanvasQTAgg(self._ofig)
+        self._tabs.addTab(self._ocanvas, "All scans overlaid: before | after")
+        self._fig = Figure(figsize=(8, 2.8))
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._tabs.addTab(self._canvas, "Selected scan vs reference")
+        self._tabs.setMinimumHeight(260)
+        right.addWidget(self._tabs, 3)
+        self._overlays = None
+
+        act = QtWidgets.QHBoxLayout()
+        self._status_lbl = QtWidgets.QLabel("")
+        self._status_lbl.setStyleSheet("color:#1565C0; font-size:11px;")
+        act.addWidget(self._status_lbl, 1)
         self._btn_save = QtWidgets.QPushButton("Save drift CSV…")
         self._btn_save.setEnabled(False)
-        self._btn_save.setToolTip(
-            "Save the computed shifts as a CSV file.\n"
-            "You can share this file and reload it later with 'Load drift CSV'."
-        )
+        self._btn_save.setToolTip("stem, shift_dy_px, shift_dx_px (+ QC columns). "
+                                  "Reload it with 'Load drift CSV' in the line / ROI tools.")
         self._btn_save.clicked.connect(self._save_csv)
         self._btn_load = QtWidgets.QPushButton("Load into session")
         self._btn_load.setEnabled(False)
-        self._btn_load.setToolTip(
-            "Assign the computed shifts directly to the loaded scans in this session.\n"
-            "No file is written — the shifts are applied immediately."
-        )
+        self._btn_load.setToolTip("Assign the shifts to these scans now; then use "
+                                  "'Propagate (with drift)' in Set up Lines.")
         self._btn_load.clicked.connect(self._load_into_session)
-        act_row.addWidget(self._btn_save)
-        act_row.addWidget(self._btn_load)
-        act_row.addStretch(1)
+        self._btn_ovl = QtWidgets.QPushButton("Save overlay images…")
+        self._btn_ovl.setEnabled(False)
+        self._btn_ovl.setToolTip("Two PNGs with a colour legend: all scans overlaid as "
+                                 "acquired (drift visible) and after the correction.")
+        self._btn_ovl.clicked.connect(self._save_overlays)
+        act.addWidget(self._btn_ovl)
+        act.addWidget(self._btn_save)
+        act.addWidget(self._btn_load)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.accept)
-        act_row.addWidget(bb)
-        lay.addLayout(act_row)
+        act.addWidget(bb)
+        right.addLayout(act)
 
-    # ── actions ───────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _check_all(self, on: bool) -> None:
+        st = QtCore.Qt.CheckState.Checked if on else QtCore.Qt.CheckState.Unchecked
+        for i in range(self._list.count()):
+            self._list.item(i).setCheckState(st)
+
+    def _selected_scans(self) -> list:
+        out = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.checkState() == QtCore.Qt.CheckState.Checked:
+                j = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                if 0 <= j < len(self._scans):
+                    out.append(self._scans[j])
+        return out
+
+    def _refresh_ref_options(self) -> None:
+        cur = self._ref_cb.currentText()
+        sel = self._selected_scans()
+        self._ref_cb.blockSignals(True)
+        self._ref_cb.clear()
+        for s in sel:
+            self._ref_cb.addItem(s.name)
+        k = self._ref_cb.findText(cur)
+        if k < 0 and 0 <= self._host._active < len(self._scans):
+            k = self._ref_cb.findText(self._scans[self._host._active].name)
+        self._ref_cb.setCurrentIndex(max(k, 0))
+        self._ref_cb.blockSignals(False)
+        self._refresh_roi_options()
+
+    def _ref_scan(self):
+        name = self._ref_cb.currentText()
+        return next((s for s in self._scans if s.name == name), None)
 
     def _refresh_roi_options(self, *_) -> None:
-        """Populate the tracking-ROI dropdown from the reference scan's area ROIs."""
         self._roi_cb.clear()
         self._roi_cb.addItem("(whole map)", None)
-        ref_idx = self._ref_cb.currentIndex()
-        ref_scan = self._scans[ref_idx] if 0 <= ref_idx < len(self._scans) else None
-        rois = E.scan_area_rois(ref_scan) if ref_scan else {}
+        ref = self._ref_scan()
+        rois = E.scan_area_rois(ref) if ref is not None else {}
         for rid, bounds in rois.items():
             self._roi_cb.addItem(f"{rid}  {[int(b) for b in bounds]}", list(bounds))
-        # auto-select the first real ROI when one exists (the whole point of this tool)
-        if rois:
-            self._roi_cb.setCurrentIndex(1)
 
+    @staticmethod
+    def _px_nm(scan) -> float | None:
+        try:
+            pm = float(getattr(scan.params, "r_px_pm", 0.0) or 0.0)
+        except Exception:
+            pm = 0.0
+        return pm / 1000.0 if pm > 0 else None
+
+    # ── actions ───────────────────────────────────────────────────────────────
     def _run(self) -> None:
-        if not self._scans:
-            QtWidgets.QMessageBox.information(self, "Drift estimation", "No files loaded.")
-            return
-        if len(self._scans) < 2:
+        scans = self._selected_scans()
+        ref = self._ref_scan()
+        if len(scans) < 2 or ref is None:
             QtWidgets.QMessageBox.information(
-                self, "Drift estimation",
-                "Load at least 2 files to measure inter-scan drift.\n\n"
-                "Drift estimation compares each file against a reference — "
-                "it needs multiple scans of the same sample region."
-            )
+                self, "Inter-scan drift",
+                "Tick at least 2 scans of the same region (and pick the reference).")
             return
-
-        ref_idx = self._ref_cb.currentIndex()
-        ref_scan = self._scans[ref_idx] if 0 <= ref_idx < len(self._scans) else self._scans[0]
-        image_key = self._chan_cb.currentData()
-        upsample = self._ups.value()
-        roi_bounds = self._roi_cb.currentData()   # None → whole map
-        scans = list(self._scans)
-
-        self._btn_run.setEnabled(False)
-        self._btn_save.setEnabled(False)
-        self._btn_load.setEnabled(False)
-        self._status_lbl.setText("Running cross-correlation…")
+        key = self._chan_cb.currentData()
+        mode = self._mode_cb.currentData()
+        kw = dict(image_key=key, mode=mode, upsample_factor=self._ups.value(),
+                  roi_bounds=self._roi_cb.currentData(), background_sigma=self._bg.value(),
+                  window=self._win.isChecked(), log=self._host._console.log)
+        for b in (self._btn_run, self._btn_save, self._btn_load, self._btn_ovl):
+            b.setEnabled(False)
+        self._status_lbl.setText("Loading ADF/BF and cross-correlating…")
         self._table.setRowCount(0)
-
         import drift_estimate as _DE
 
         def work():
-            return _DE.estimate_drift(
-                scans, ref_scan,
-                image_key=image_key,
-                upsample_factor=upsample,
-                roi_bounds=roi_bounds,
-                log=self._host._console.log,
-            )
+            for s in scans:                      # make sure the ADF/BF previews are loaded
+                if E.cached_adf(s) is None:
+                    try:
+                        E.load_adf(s, log=self._host._console.log)
+                    except Exception:
+                        pass
+            res = _DE.estimate_drift(scans, ref, **kw)
+            try:
+                ovl = _DE.overlay_maps(scans, res, key)
+            except Exception as exc:
+                self._host._console.log(f"[Drift] overlay skipped: {exc}")
+                ovl = None
+            return res, ovl
 
         def done(results):
             self._btn_run.setEnabled(True)
             if results is None:
                 self._status_lbl.setText("Error — see console.")
                 return
-            self._results = results
+            results, self._overlays = results
+            self._results, self._run_scans, self._run_ref, self._run_key = results, scans, ref, key
             self._populate_table(results)
+            self._draw_overlays()
             self._btn_save.setEnabled(True)
             self._btn_load.setEnabled(True)
-            self._status_lbl.setText(
-                f"Done — {len(results)} scan(s). "
-                "Click 'Load into session' to apply or 'Save drift CSV' to export."
-            )
+            self._btn_ovl.setEnabled(self._overlays is not None)
+            self._status_lbl.setText(f"Done — {len(results)} scan(s).")
+            if len(results) > 1:
+                self._table.selectRow(1 if results[0].get("is_reference") else 0)
 
         self._host._run_async(work, label="Estimate drift", on_done=done)
 
     def _populate_table(self, results: list[dict]) -> None:
+        import math
+        import drift_estimate as _DE
+        px = self._px_nm(self._run_ref) if self._run_ref is not None else None
         self._table.setRowCount(len(results))
-        for row, r in enumerate(results):
-            def _item(text, bold=False, color=None):
-                it = QtWidgets.QTableWidgetItem(text)
-                it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-                if bold:
-                    f = it.font(); f.setBold(True); it.setFont(f)
-                if color:
-                    it.setForeground(QtGui.QColor(color))
-                return it
 
-            self._table.setItem(row, 0, _item(r["name"], bold=r["is_reference"]))
-            self._table.setItem(row, 1, _item(f"{r['dy']:+.2f}"))
-            self._table.setItem(row, 2, _item(f"{r['dx']:+.2f}"))
-            self._table.setItem(row, 3, _item(f"{r['magnitude']:.2f} px"))
-            err_color = "#C62828" if r["error"] > 0.5 else None
-            self._table.setItem(row, 4, _item(f"{r['error']:.4f}", color=err_color))
+        def item(text, bold=False, color=None):
+            it = QtWidgets.QTableWidgetItem(text)
+            it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if bold:
+                f = it.font(); f.setBold(True); it.setFont(f)
+            if color:
+                it.setForeground(QtGui.QColor(color))
+            return it
+
+        fin = lambda v: v is not None and not (isinstance(v, float) and math.isnan(v))
+        for r_, r in enumerate(results):
+            self._table.setItem(r_, 0, item(r["name"], bold=r["is_reference"]))
+            self._table.setItem(r_, 1, item(f"{r['dy']:+.2f}"))
+            self._table.setItem(r_, 2, item(f"{r['dx']:+.2f}"))
+            self._table.setItem(r_, 3, item(f"{r['magnitude']:.2f}"))
+            self._table.setItem(r_, 4, item(f"{r['magnitude'] * px:.2f}" if px else "—"))
+            nb, na = r.get("ncc_before"), r.get("ncc_after")
+            col = "#C62828" if fin(na) and na < 0.5 and not r["is_reference"] else None
+            self._table.setItem(r_, 5, item("—" if r["is_reference"] else
+                                            f"{nb:.2f} → {na:.2f}" if fin(na) else "—", color=col))
+            d = r.get("adf_bf_diff_px")
+            self._table.setItem(r_, 6, item(f"{d:.2f}" if fin(d) and not r["is_reference"] else "—",
+                                            color="#E65100" if fin(d) and d > 1.0 else None))
             note = "REFERENCE" if r["is_reference"] else r.get("warning", "")
-            note_color = "#E65100" if r.get("warning") else ("#1565C0" if r["is_reference"] else None)
-            self._table.setItem(row, 5, _item(note, color=note_color))
-
+            self._table.setItem(r_, 7, item(note, color="#1565C0" if r["is_reference"]
+                                            else ("#E65100" if note else None)))
         self._table.resizeColumnsToContents()
+        s = _DE.summary(results, px_nm=px)
+        unit = (lambda v_px, v_nm: f"{v_px:.2f} px ({v_nm:.2f} nm)") if px else \
+               (lambda v_px, v_nm: f"{v_px:.2f} px")
+        self._summary.setText(
+            f"<b>{s['n']} scans</b> · largest shift from the reference "
+            f"{unit(s['max_shift_px'], s.get('max_shift_nm', 0))} · mean step between "
+            f"consecutive scans {unit(s['mean_step_px'], s.get('mean_step_nm', 0))} · "
+            f"worst NCC after alignment {s['ncc_after_min']:.2f}"
+            + ("" if px else "  <i>(set 'R px' in the Stress tab for nm)</i>"))
+
+    def _preview(self) -> None:
+        """Reference vs selected scan: overlay before / after the shift."""
+        import numpy as np
+        import drift_estimate as _DE
+        rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
+        if not rows or not self._results:
+            return
+        r = self._results[rows[0].row()]
+        sc = next((s for s in self._run_scans if s.name == r["name"]), None)
+        if sc is None or self._run_ref is None:
+            return
+        key = "adf" if self._run_key == "adf+bf" else self._run_key
+        a = _DE._get_map(self._run_ref, key)
+        b = _DE._get_map(sc, key)
+        if (a is None or b is None) and self._run_key == "adf+bf":
+            key = "bf"
+            a, b = _DE._get_map(self._run_ref, key), _DE._get_map(sc, key)
+        if a is None or b is None:
+            return
+        if a.shape != b.shape:
+            h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+            a, b = a[:h, :w], b[:h, :w]
+
+        def norm(x):
+            x = np.asarray(x, float)
+            lo, hi = np.nanpercentile(x, (1, 99))
+            return np.clip((x - lo) / max(hi - lo, 1e-12), 0, 1)
+
+        A = norm(a)
+        B0 = norm(b)
+        B1 = norm(_DE.shift_image(b, r["dy"], r["dx"]))
+        B1 = np.where(np.isfinite(B1), B1, 0.0)
+
+        def rgb(p, q):          # reference magenta, scan green: grey where they agree
+            return np.dstack([p, q, p])
+
+        self._fig.clear()
+        axs = self._fig.subplots(1, 3)
+        axs[0].imshow(A, cmap="gray"); axs[0].set_title(f"reference {self._run_ref.name}", fontsize=9)
+        axs[1].imshow(rgb(A, B0)); axs[1].set_title(f"{sc.name} as acquired", fontsize=9)
+        axs[2].imshow(rgb(A, B1))
+        axs[2].set_title(f"after shift ({r['dy']:+.2f}, {r['dx']:+.2f}) px", fontsize=9)
+        for ax in axs:
+            ax.set_xticks([]); ax.set_yticks([])
+        bounds = self._roi_cb.currentData()
+        if bounds:
+            from matplotlib.patches import Rectangle
+            x0, x1, y0, y1 = bounds
+            for ax in axs:
+                ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, ec="yellow", lw=0.8))
+        self._fig.text(0.5, 0.01, f"{key.upper()} · magenta = reference, green = scan, "
+                                  "grey/white = overlap", ha="center", fontsize=8)
+        self._fig.tight_layout(rect=(0, 0.05, 1, 1))
+        self._canvas.draw_idle()
+
+    def _draw_overlays(self) -> None:
+        """All selected scans in one image each, before and after the correction."""
+        import drift_estimate as _DE
+        from matplotlib.patches import Patch
+        self._ofig.clear()
+        if self._overlays is None:
+            self._ocanvas.draw_idle()
+            return
+        before, after, ch, names = self._overlays
+        axs = self._ofig.subplots(1, 2)
+        axs[0].imshow(before, interpolation="nearest")
+        axs[0].set_title("as acquired — coloured fringes = drift", fontsize=9)
+        axs[1].imshow(after, interpolation="nearest")
+        axs[1].set_title("after correction — grey/white = scans agree", fontsize=9)
+        for ax in axs:
+            ax.set_xticks([]); ax.set_yticks([])
+        cols = _DE.overlay_colors(len(names))
+        ref = getattr(self._run_ref, "name", "")
+        self._ofig.legend(handles=[Patch(facecolor=c, edgecolor="k",
+                                         label=n + ("  (ref)" if n == ref else ""))
+                                   for n, c in zip(names, cols)],
+                          loc="lower center", ncol=min(len(names), 6), fontsize=8, frameon=False)
+        self._ofig.text(0.01, 0.99, ch.upper(), va="top", fontsize=8)
+        self._ofig.tight_layout(rect=(0, 0.1, 1, 0.97))
+        self._ocanvas.draw_idle()
+        self._tabs.setCurrentIndex(0)
+
+    def _write_overlays(self, folder, stem) -> list:
+        import drift_estimate as _DE
+        before, after, ch, names = self._overlays
+        return _DE.save_overlays(before, after, names, folder, stem=stem, channel=ch,
+                                 results=self._results, px_nm=self._px_nm(self._run_ref))
+
+    def _save_overlays(self) -> None:
+        if self._overlays is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save overlay images (…_before.png / …_after.png)",
+            "drift_overlay.png", "PNG (*.png)")
+        if not path:
+            return
+        from pathlib import Path as _P
+        p = _P(path)
+        out = self._write_overlays(p.parent, p.stem)
+        self._status_lbl.setText("Saved " + ", ".join(o.name for o in out))
+        self._host._console.log("[Drift] overlays saved: " + ", ".join(str(o) for o in out))
 
     def _save_csv(self) -> None:
         if not self._results:
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save drift CSV", "drift_shifts.csv", "CSV (*.csv);;All (*)"
-        )
+            self, "Save drift CSV", "drift_shifts.csv", "CSV (*.csv);;All (*)")
         if not path:
             return
         import drift_estimate as _DE
-        saved = _DE.save_drift_csv(self._results, path)
-        self._status_lbl.setText(f"Saved → {saved.name}")
-        QtWidgets.QMessageBox.information(
-            self, "Drift CSV saved",
-            f"Saved: {saved}\n\n"
-            "You can reload this file in future sessions with 'Load drift CSV'."
-        )
+        saved = _DE.save_drift_csv(self._results, path,
+                                   reference=getattr(self._run_ref, "name", None))
+        msg = f"Saved → {saved.name}"
+        if self._overlays is not None:          # the evidence travels with the numbers
+            try:
+                out = self._write_overlays(saved.parent, saved.stem + "_overlay")
+                msg += " + " + ", ".join(o.name for o in out)
+            except Exception as exc:
+                self._host._console.log(f"[Drift] overlay images not saved: {exc}")
+        self._status_lbl.setText(msg)
+        self._host._console.log(f"[Drift] {msg} in {saved.parent}")
 
     def _load_into_session(self) -> None:
         if not self._results:
             return
-        import engine as E
         n = 0
         for r in self._results:
-            for sc in self._scans:
+            for sc in self._run_scans:
                 if sc.name == r["name"]:
                     sc.drift = (float(r["dx"]), float(r["dy"]))
                     n += 1
         self._host._console.log(
-            f"[Drift] Shifts loaded into session for {n} scan(s). "
-            "Enable 'Apply drift' in the line-profile / ROI dialog to use them."
-        )
-        self._status_lbl.setText(f"Shifts applied to {n} scan(s) in session.")
+            f"[Drift] shifts loaded into session for {n} scan(s). Use 'Propagate (with "
+            "drift)' in Set up Lines, or 'Apply drift' in the multi-file line tool.")
+        self._status_lbl.setText(f"Shifts applied to {n} scan(s).")
 
+
+
+class ReproducibilityDialog(QtWidgets.QDialog):
+    """Reproducibility experiment: the same region scanned N times in a row with
+    nothing changed on the microscope. Every metric is shown WITHOUT and WITH
+    the inter-scan drift correction (the drift loaded from the drift plugin),
+    so the drift part of the apparent irreproducibility is separated from the
+    measurement's own scatter. See reproducibility.py for the definitions."""
+
+    def __init__(self, host) -> None:
+        super().__init__(host)
+        _enable_minmax(self)
+        self._host = host
+        self._scans = host._scans
+        self._res = None
+        self._run_scans: list = []
+        self.setWindowTitle("Reproducibility experiment")
+        self.resize(1320, 860)
+        self._build()
+
+    # ── layout ────────────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        self._FC, self._TB, self._Fig = FigureCanvasQTAgg, NavigationToolbar2QT, Figure
+        outer = QtWidgets.QHBoxLayout(self)
+
+        left = QtWidgets.QVBoxLayout()
+        info = QtWidgets.QLabel(
+            "<b>Same region, scanned consecutively, nothing changed.</b> Tick the scans, "
+            "order them by acquisition (drag), pick the reference. Lines and ROIs are "
+            "taken from the reference scan; every metric is computed without and with "
+            "drift correction.")
+        info.setWordWrap(True); info.setMaximumWidth(320)
+        info.setStyleSheet("background:#E3F2FD; border:1px solid #90CAF9; border-radius:4px; "
+                           "padding:7px; color:#0D2A4A;")
+        left.addWidget(info)
+        self._list = QtWidgets.QListWidget()
+        self._list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setMaximumWidth(320)
+        for i, s in enumerate(self._scans):
+            it = QtWidgets.QListWidgetItem(s.name)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                        | QtCore.Qt.ItemFlag.ItemIsDragEnabled)
+            it.setCheckState(QtCore.Qt.CheckState.Checked)
+            it.setData(QtCore.Qt.ItemDataRole.UserRole, i)
+            self._list.addItem(it)
+        self._list.itemChanged.connect(lambda _it: self._refresh_ref())
+        left.addWidget(self._list, 1)
+        form = QtWidgets.QFormLayout()
+        self._ref_cb = QtWidgets.QComboBox()
+        self._ref_cb.currentIndexChanged.connect(lambda _i: self._refresh_status())
+        form.addRow("Reference:", self._ref_cb)
+        self._label_cb = QtWidgets.QComboBox()
+        self._label_cb.addItem("without ROI (global reference)", "without_roi")
+        self._label_cb.addItem("with ROI (experimental reference)", "with_roi")
+        self._label_cb.setToolTip("Which strain maps: with a common global reference, or "
+                                  "each zeroed on its own ROI (removes offsets between scans).")
+        form.addRow("Strain maps:", self._label_cb)
+        self._width = QtWidgets.QSpinBox(); self._width.setRange(1, 51); self._width.setValue(3)
+        self._width.setSuffix(" px")
+        self._width.setToolTip("Line integration width (same physical width on every scan).")
+        form.addRow("Line width:", self._width)
+        self._imgs = QtWidgets.QCheckBox("include ADF / BF profiles and maps")
+        self._imgs.setChecked(True)
+        form.addRow("", self._imgs)
+        left.addLayout(form)
+        self._status = QtWidgets.QLabel("")
+        self._status.setWordWrap(True); self._status.setMaximumWidth(320)
+        left.addWidget(self._status)
+        b_drift = QtWidgets.QPushButton("Estimate drift (ADF / BF)…")
+        b_drift.clicked.connect(lambda: self._host._show_tool(DriftEstimateDialog(self._host)))
+        left.addWidget(b_drift)
+        b_ref = QtWidgets.QPushButton("Refresh lines / drift status")
+        b_ref.clicked.connect(self._refresh_status)
+        left.addWidget(b_ref)
+        self._btn_run = QtWidgets.QPushButton("▶  Compute reproducibility")
+        self._btn_run.setStyleSheet(
+            "QPushButton{background:#1565C0; color:white; font-weight:bold; "
+            "border-radius:5px; padding:6px 16px;}"
+            "QPushButton:disabled{background:#90CAF9; color:#ccc;}")
+        self._btn_run.clicked.connect(self._run)
+        left.addWidget(self._btn_run)
+        outer.addLayout(left, 0)
+
+        right = QtWidgets.QVBoxLayout()
+        self._tabs = QtWidgets.QTabWidget()
+        self._tbl_sum = self._table()
+        self._tabs.addTab(self._tbl_sum, "Summary (no drift | drift corrected)")
+        # lines tab
+        wl = QtWidgets.QWidget(); vl = QtWidgets.QVBoxLayout(wl)
+        rl = QtWidgets.QHBoxLayout(); rl.addWidget(QtWidgets.QLabel("Line:"))
+        self._line_cb = QtWidgets.QComboBox(); self._line_cb.currentIndexChanged.connect(self._show_line)
+        rl.addWidget(self._line_cb); rl.addStretch(1); vl.addLayout(rl)
+        self._line_host = QtWidgets.QVBoxLayout(); vl.addLayout(self._line_host, 3)
+        self._tbl_line = self._table(); vl.addWidget(self._tbl_line, 1)
+        self._tabs.addTab(wl, "Lines")
+        # maps tab
+        wm = QtWidgets.QWidget(); vm = QtWidgets.QVBoxLayout(wm)
+        rm = QtWidgets.QHBoxLayout(); rm.addWidget(QtWidgets.QLabel("Map:"))
+        self._map_cb = QtWidgets.QComboBox(); self._map_cb.currentIndexChanged.connect(self._show_map)
+        rm.addWidget(self._map_cb); rm.addStretch(1); vm.addLayout(rm)
+        self._map_host = QtWidgets.QVBoxLayout(); vm.addLayout(self._map_host, 3)
+        self._tbl_map = self._table(); vm.addWidget(self._tbl_map, 1)
+        self._tabs.addTab(wm, "Maps: offset / RMSE / s(r)")
+        # ROIs tab
+        self._tbl_roi = self._table()
+        self._tabs.addTab(self._tbl_roi, "ROIs and contrast")
+        # drift tab
+        wd = QtWidgets.QWidget(); vd = QtWidgets.QHBoxLayout(wd)
+        self._drift_host = QtWidgets.QVBoxLayout(); vd.addLayout(self._drift_host, 1)
+        rd = QtWidgets.QVBoxLayout(); self._tbl_drift = self._table(); rd.addWidget(self._tbl_drift, 2)
+        self._tbl_q = self._table(); rd.addWidget(QtWidgets.QLabel("<b>Fit quality</b>")); rd.addWidget(self._tbl_q, 1)
+        vd.addLayout(rd, 1)
+        self._tabs.addTab(wd, "Drift and fit quality")
+        right.addWidget(self._tabs, 1)
+        self._notes = QtWidgets.QLabel(""); self._notes.setWordWrap(True)
+        self._notes.setStyleSheet("color:#8a4b00;")
+        right.addWidget(self._notes)
+        act = QtWidgets.QHBoxLayout(); act.addStretch(1)
+        self._btn_exp = QtWidgets.QPushButton("Export report (CSV + PNG)…")
+        self._btn_exp.clicked.connect(self._export); self._btn_exp.setEnabled(False)
+        self._btn_rep = QtWidgets.QPushButton("Send figures to Report")
+        self._btn_rep.clicked.connect(self._send_report); self._btn_rep.setEnabled(False)
+        act.addWidget(self._btn_exp); act.addWidget(self._btn_rep)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.accept); act.addWidget(bb)
+        right.addLayout(act)
+        outer.addLayout(right, 1)
+        self._refresh_ref()
+
+    def _table(self):
+        t = QtWidgets.QTableWidget(0, 0)
+        t.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        t.verticalHeader().setVisible(False)
+        sc = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Copy, t)
+        sc.activated.connect(lambda t=t: self._copy_table(t))
+        return t
+
+    @staticmethod
+    def _copy_table(t):
+        rows = sorted({i.row() for i in t.selectedIndexes()}) or range(t.rowCount())
+        head = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+        lines = ["\t".join(head)]
+        for r in rows:
+            lines.append("\t".join((t.item(r, c).text() if t.item(r, c) else "")
+                                   for c in range(t.columnCount())))
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+
+    @staticmethod
+    def _fill(t, df, highlight=None):
+        import math
+        t.clear()
+        if df is None or len(df) == 0:
+            t.setRowCount(0); t.setColumnCount(0); return
+        cols = list(df.columns)
+        t.setColumnCount(len(cols)); t.setHorizontalHeaderLabels(cols); t.setRowCount(len(df))
+        for r, row in enumerate(df.itertuples(index=False)):
+            for c, v in enumerate(row):
+                if isinstance(v, float):
+                    txt = "—" if math.isnan(v) else (f"{v:.4g}" if abs(v) < 1e4 else f"{v:.0f}")
+                else:
+                    txt = str(v)
+                it = QtWidgets.QTableWidgetItem(txt)
+                if highlight and cols[c] in highlight:
+                    it.setBackground(QtGui.QColor(highlight[cols[c]]))
+                t.setItem(r, c, it)
+        t.resizeColumnsToContents()
+
+    def _set_fig(self, host, fig):
+        while host.count():
+            w = host.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+        canvas = self._FC(fig)
+        host.addWidget(self._TB(canvas, self)); host.addWidget(canvas, 1)
+        canvas.draw_idle()
+
+    # ── state ─────────────────────────────────────────────────────────────────
+    def _selected(self):
+        out = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.checkState() == QtCore.Qt.CheckState.Checked:
+                out.append(self._scans[it.data(QtCore.Qt.ItemDataRole.UserRole)])
+        return out
+
+    def _refresh_ref(self):
+        cur = self._ref_cb.currentText()
+        self._ref_cb.blockSignals(True); self._ref_cb.clear()
+        for s in self._selected():
+            self._ref_cb.addItem(s.name)
+        k = self._ref_cb.findText(cur)
+        if k < 0 and 0 <= self._host._active < len(self._scans):
+            k = self._ref_cb.findText(self._scans[self._host._active].name)
+        self._ref_cb.setCurrentIndex(max(k, 0)); self._ref_cb.blockSignals(False)
+        self._refresh_status()
+
+    def _ref(self):
+        return next((s for s in self._scans if s.name == self._ref_cb.currentText()), None)
+
+    def _refresh_status(self):
+        sel, ref = self._selected(), self._ref()
+        nd = sum(1 for s in sel if getattr(s, "drift", None))
+        lines = sorted((getattr(ref, "lines", None) or {})) if ref else []
+        rois = sorted(E.scan_area_rois(ref)) if ref else []
+        txt = [f"<b>{len(sel)}</b> scans selected",
+               f"lines on the reference: <b>{', '.join(lines) or 'none'}</b>",
+               f"area ROIs on the reference: <b>{', '.join(rois) or 'none'}</b>",
+               (f"drift loaded on <b>{nd}/{len(sel)}</b> scans" if nd else
+                "<span style='color:#C62828'><b>no drift loaded</b> — estimate it or load "
+                "the drift CSV; otherwise both columns are identical</span>")]
+        self._status.setText("<br>".join(txt))
+
+    # ── actions ───────────────────────────────────────────────────────────────
+    def _run(self):
+        scans, ref = self._selected(), self._ref()
+        if len(scans) < 2 or ref is None:
+            QtWidgets.QMessageBox.information(self, "Reproducibility",
+                                              "Tick at least 2 scans and pick the reference.")
+            return
+        label = self._label_cb.currentData()
+        width = self._width.value()
+        imgs = ("adf", "bf") if self._imgs.isChecked() else ()
+        self._btn_run.setEnabled(False)
+        self._notes.setText("Computing…")
+        import reproducibility as RP
+
+        def work():
+            for s in scans:
+                if imgs and E.cached_adf(s) is None:
+                    try:
+                        E.load_adf(s, log=self._host._console.log)
+                    except Exception:
+                        pass
+            return RP.run(scans, ref, label=label, width=width, images=imgs,
+                          log=self._host._console.log)
+
+        def done(res):
+            self._btn_run.setEnabled(True)
+            if res is None:
+                self._notes.setText("Error — see console."); return
+            self._res, self._run_scans = res, scans
+            self._show_all()
+
+        self._host._run_async(work, label="Reproducibility", on_done=done)
+
+    def _show_all(self):
+        import reproducibility as RP
+        res = self._res
+        hl = {"no_drift": "#FDECEA", "drift": "#E3F2FD"}
+        self._fill(self._tbl_sum, RP.summary_table(res), hl)
+        self._line_cb.blockSignals(True); self._line_cb.clear()
+        self._line_cb.addItems(list(res.lines)); self._line_cb.blockSignals(False)
+        self._map_cb.blockSignals(True); self._map_cb.clear()
+        for ch in res.maps:
+            self._map_cb.addItem(RP.LABEL.get(ch, ch), ch)
+        self._map_cb.blockSignals(False)
+        self._show_line(); self._show_map()
+        import pandas as pd
+        rows = []
+        for rid, chs in res.rois.items():
+            for ch, m in chs.items():
+                for mode in RP.MODES:
+                    s = m[mode]["summary"]
+                    rows.append(dict(object=rid, channel=ch, mode=mode, mean=s["mean"],
+                                     std=s["std"], cv_pct=s["cv_pct"],
+                                     **{n: v for n, v in zip(res.names, m[mode]["values"])}))
+        for key, chs in res.contrast.items():
+            for ch, m in chs.items():
+                for mode in RP.MODES:
+                    s = m[mode]["summary"]
+                    rows.append(dict(object=f"contrast {key}", channel=ch, mode=mode, mean=s["mean"],
+                                     std=s["std"], cv_pct=s["cv_pct"],
+                                     **{n: v for n, v in zip(res.names, m[mode]["values"])}))
+        self._fill(self._tbl_roi, pd.DataFrame(rows))
+        self._fill(self._tbl_drift, RP.drift_table(res))
+        self._fill(self._tbl_q, RP.quality_table(res))
+        self._set_fig(self._drift_host, RP.drift_figure(res))
+        self._notes.setText("  ".join(res.notes))
+        self._btn_exp.setEnabled(True); self._btn_rep.setEnabled(True)
+
+    def _show_line(self, *_):
+        import pandas as pd
+        import reproducibility as RP
+        if self._res is None or not self._line_cb.currentText():
+            return
+        lid = self._line_cb.currentText()
+        self._set_fig(self._line_host, RP.line_figure(self._res, lid))
+        rows = []
+        for ch, m in self._res.lines[lid].items():
+            for mode in RP.MODES:
+                for p in m[mode]["per_scan"]:
+                    rows.append(dict(channel=ch, mode=mode, **p))
+        self._fill(self._tbl_line, pd.DataFrame(rows))
+
+    def _show_map(self, *_):
+        import pandas as pd
+        import reproducibility as RP
+        ch = self._map_cb.currentData()
+        if self._res is None or not ch:
+            return
+        self._set_fig(self._map_host, RP.map_figure(self._res, ch))
+        rows = [dict(mode=mode, **p) for mode in RP.MODES
+                for p in self._res.maps[ch][mode]["per_scan"]]
+        self._fill(self._tbl_map, pd.DataFrame(rows))
+
+    def _export(self):
+        if self._res is None:
+            return
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the reproducibility report")
+        if not d:
+            return
+        import reproducibility as RP
+        out = RP.export(self._res, d)
+        self._host._console.log(f"[Repro] report exported: {len(out)} files in {d}")
+        self._notes.setText(f"Exported {len(out)} files to {d}")
+
+    def _send_report(self):
+        """Register the figures on the reference scan (Report → Reports)."""
+        import reproducibility as RP
+        res = self._res
+        ref = next((s for s in self._run_scans if s.name == res.ref), None)
+        if ref is None:
+            return
+        n = 0
+        for lid in res.lines:
+            n += bool(E.register_figure(ref, f"report_repro_line_{lid}_{res.label}",
+                                        RP.line_figure(res, lid), force=True))
+        for ch in res.maps:
+            n += bool(E.register_figure(ref, f"report_repro_map_{ch}_{res.label}",
+                                        RP.map_figure(res, ch), force=True))
+        n += bool(E.register_figure(ref, f"report_repro_drift_{res.label}", RP.drift_figure(res),
+                                    force=True))
+        try:
+            self._host._update_active_views()
+            self._host._params.report_refresh()
+            report = self._host._params.report
+            keys = [k for k in E.list_figure_keys(ref) if k.startswith("report_repro_")]
+            if report is not None and keys:
+                report.select_figure(self._host._scans.index(ref), keys[0])
+                self._host._params._tabs.setCurrentWidget(report)
+        except Exception:
+            pass
+        self._host._console.log(f"[Repro] {n} figure(s) sent to the Report under {ref.name}.")
+        self._notes.setText(f"{n} figure(s) added to the Report ({ref.name} → Reports).")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Live line profile — drag a line on a CHOSEN map and see its profile update live;
@@ -2831,6 +3638,20 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
         self._width.valueChanged.connect(self._on_width_changed)
         r1.addWidget(QtWidgets.QLabel("width:"))
         r1.addWidget(self._width)
+        self._r_px = QtWidgets.QDoubleSpinBox()
+        self._r_px.setRange(0.0, 1_000_000.0)
+        self._r_px.setDecimals(3)
+        self._r_px.setSingleStep(0.1)
+        self._r_px.setSuffix(" pm/px")
+        self._r_px.setToolTip(
+            "STEM scan step from the Velox EMD PixelSize (picometres per pixel).\n"
+            "0 = keep distances in pixels. Example: 143.5 pm/px → axis in nm.")
+        sc0 = self._scans[self._file.currentIndex()] if self._scans else None
+        self._r_px.setValue(float(getattr(getattr(sc0, "params", None), "r_px_pm", 0.0) or 0.0)
+                            if sc0 is not None else 0.0)
+        self._r_px.valueChanged.connect(self._on_r_px_changed)
+        r1.addWidget(QtWidgets.QLabel("R:"))
+        r1.addWidget(self._r_px)
         lay.addLayout(r1)
 
         # ── row 2: lines + drift ──────────────────────────────────────────────
@@ -2884,11 +3705,13 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
         split = QtWidgets.QSplitter()
         pg.setConfigOptions(imageAxisOrder="row-major")
         self._glw = pg.GraphicsLayoutWidget()
-        self._vb = self._glw.addViewBox()
+        self._vb = self._glw.addViewBox(row=0, col=0)
         self._vb.setAspectLocked(True)
         self._vb.invertY(True)
         self._img = pg.ImageItem()
         self._vb.addItem(self._img)
+        self._cbar = _attach_live_colorbar(self._glw, pg)
+        self._clim: tuple[float, float] | None = None
         split.addWidget(self._glw)
         self._plot = pg.PlotWidget()
         self._plot.setLabel("bottom", "distance (px)")
@@ -3022,6 +3845,34 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
         self._redraw_all_bands()
         self._update_profiles()
 
+    def _sync_r_px_spin(self) -> None:
+        sc = self._cur()
+        val = float(getattr(getattr(sc, "params", None), "r_px_pm", 0.0) or 0.0) if sc else 0.0
+        self._r_px.blockSignals(True)
+        self._r_px.setValue(val)
+        self._r_px.blockSignals(False)
+
+    def _commit_r_px(self) -> None:
+        """Write the Live R (pm/px from EMD) onto the template scan."""
+        sc = self._cur()
+        if sc is None:
+            return
+        sc.params.r_px_pm = float(self._r_px.value())
+        E.apply_r_pixel_from_params(sc)
+
+    def _on_r_px_changed(self, *_):
+        self._commit_r_px()
+        self._update_profiles()
+
+    def _scaled_distance(self, dist, sc):
+        """px → nm using that file's R, else the template spinbox (0 = stay in px)."""
+        pm = float(getattr(getattr(sc, "params", None), "r_px_pm", 0.0) or 0.0)
+        if pm <= 0:
+            pm = float(self._r_px.value())
+        if pm > 0:
+            return self._np.asarray(dist, dtype=float) * (pm / 1000.0), "nm"
+        return self._np.asarray(dist, dtype=float), "px"
+
     def _on_roi_changed(self) -> None:
         self._redraw_all_bands()
         self._update_profiles()
@@ -3080,9 +3931,11 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
     # ── map reload ────────────────────────────────────────────────────────────
     def _reload_map(self, *_):
         sc = self._cur()
+        self._sync_r_px_spin()
         ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         m = E.channel_map_2d(sc, ch, lab) if sc else None
         if m is None:
+            self._clim = None
             self._img.clear()
             self._status.setText(f"No '{ch}' map for this file/ROI (compute strain"
                                  + ("/stress" if ch and str(ch).startswith("s") else "")
@@ -3090,21 +3943,8 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
             self._plot.clear()
             return
         a = self._np.asarray(m, dtype=float)
-        self._img.setImage(a)
-        fin = a[self._np.isfinite(a)]
-        if ch != "adf":
-            vmax = float(self._np.percentile(self._np.abs(fin), 98)) if fin.size else 1.0
-            self._img.setLevels([-(vmax or 1.0), (vmax or 1.0)])
-            try:
-                self._img.setLookupTable(
-                    self._pg.colormap.get("RdBu_r", source="matplotlib").getLookupTable(nPts=256))
-            except Exception:
-                pass
-        else:
-            self._img.setLookupTable(None)
-            if fin.size:
-                self._img.setLevels([float(self._np.percentile(fin, 1)),
-                                     float(self._np.percentile(fin, 99))])
+        self._clim = _apply_channel_map_item(
+            self._img, a, sc, ch, pg_mod=self._pg, cbar=getattr(self, "_cbar", None))
         h, w = a.shape
         if self._map_shape != (h, w):
             saved = [self._seg_from_roi(e["roi"]) for e in self._line_entries]
@@ -3173,17 +4013,27 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
                     dx, dy = E._line_drift_shift(sc, use_drift=use_drift)
                 s = E._spec_to_segment(spec, H, W, dx, dy)
                 dist, vals = E._line_samples(m, s, width=w)
+                xd, unit = self._scaled_distance(dist, sc)
                 c = ent["color"] if sc is tpl else COLS[si % len(COLS)]
                 name = f"{ent['id']} · {sc.name}" if len(self._line_entries) > 1 else sc.name
-                self._plot.plot(self._np.asarray(dist), self._np.asarray(vals),
+                self._plot.plot(self._np.asarray(xd), self._np.asarray(vals),
                                 pen=self._pg.mkPen(c, width=2, style=ls), name=name)
                 n_curves += 1
         clab = E._channel_label(tpl, ch) if tpl else ch
+        axis_unit = "px"
+        if tpl is not None:
+            axis_unit = self._scaled_distance([0.0], tpl)[1]
         self._plot.setLabel("left", clab)
+        self._plot.setLabel("bottom", f"distance ({axis_unit})")
         drift_note = "drift ON" if use_drift else "same pixel coords"
+        clim_note = ""
+        if getattr(self, "_clim", None) is not None:
+            clim_note = f" · clim=[{self._clim[0]:g}, {self._clim[1]:g}]"
+        r_pm = float(self._r_px.value())
+        r_note = f"R={r_pm:g} pm/px" if r_pm > 0 else "R=pixels"
         self._status.setText(
-            f"{clab} · width={w}px (yellow band) · {len(self._line_entries)} line(s) · "
-            f"{n_curves} curve(s) · {len(scans)} file(s) · {drift_note}")
+            f"{clab} · {r_note} · width={w}px (yellow band) · {len(self._line_entries)} line(s) · "
+            f"{n_curves} curve(s) · {len(scans)} file(s) · {drift_note}{clim_note}")
 
     def _send_to_report(self) -> None:
         tpl = self._cur()
@@ -3220,6 +4070,13 @@ class LiveLineProfileDialog(QtWidgets.QDialog):
             if ans != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
             use_drift = False
+        self._commit_r_px()
+        r_pm = float(self._r_px.value())
+        if r_pm > 0:
+            for sc in scans:
+                if float(getattr(sc.params, "r_px_pm", 0.0) or 0.0) <= 0:
+                    sc.params.r_px_pm = r_pm
+                E.apply_r_pixel_from_params(sc)
         ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         w = int(self._width.value())
         line_ids = E.allocate_line_ids(self._host._scans, len(specs))
@@ -3668,11 +4525,13 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
         split = QtWidgets.QSplitter()
         pg.setConfigOptions(imageAxisOrder="row-major")
         self._glw = pg.GraphicsLayoutWidget()
-        self._vb = self._glw.addViewBox()
+        self._vb = self._glw.addViewBox(row=0, col=0)
         self._vb.setAspectLocked(True)
         self._vb.invertY(True)
         self._img = pg.ImageItem()
         self._vb.addItem(self._img)
+        self._cbar = _attach_live_colorbar(self._glw, pg)
+        self._clim: tuple[float, float] | None = None
         split.addWidget(self._glw)
         self._plot = pg.PlotWidget()
         self._plot.setLabel("bottom", "ROI")
@@ -3818,6 +4677,7 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
         ch, lab = self._chan.currentData(), self._label.currentData() or "without_roi"
         m = E.channel_map_2d(sc, ch, lab) if sc else None
         if m is None:
+            self._clim = None
             self._img.clear()
             self._status.setText(f"No '{ch}' map for this file/ROI (compute strain"
                                  + ("/stress" if ch and str(ch).startswith("s") else "")
@@ -3825,21 +4685,8 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
             self._plot.clear()
             return
         a = self._np.asarray(m, dtype=float)
-        self._img.setImage(a)
-        fin = a[self._np.isfinite(a)]
-        if ch != "adf":
-            vmax = float(self._np.percentile(self._np.abs(fin), 98)) if fin.size else 1.0
-            self._img.setLevels([-(vmax or 1.0), (vmax or 1.0)])
-            try:
-                self._img.setLookupTable(
-                    self._pg.colormap.get("RdBu_r", source="matplotlib").getLookupTable(nPts=256))
-            except Exception:
-                pass
-        else:
-            self._img.setLookupTable(None)
-            if fin.size:
-                self._img.setLevels([float(self._np.percentile(fin, 1)),
-                                     float(self._np.percentile(fin, 99))])
+        self._clim = _apply_channel_map_item(
+            self._img, a, sc, ch, pg_mod=self._pg, cbar=getattr(self, "_cbar", None))
         h, w = a.shape
         if self._map_shape != (h, w):
             saved = [self._bounds_from_roi(e["roi"]) for e in self._roi_entries]
@@ -3931,9 +4778,12 @@ class LiveROIProfileDialog(QtWidgets.QDialog):
         except Exception:
             pass
         drift_note = "drift ON" if use_drift else "same pixel coords"
+        clim_note = ""
+        if getattr(self, "_clim", None) is not None:
+            clim_note = f" · clim=[{self._clim[0]:g}, {self._clim[1]:g}]"
         self._status.setText(
             f"{clab} · {len(self._roi_entries)} ROI(s) · {n_curves} file curve(s) · "
-            f"{len(scans)} file(s) · {drift_note}")
+            f"{len(scans)} file(s) · {drift_note}{clim_note}")
 
     def _send_to_report(self) -> None:
         tpl = self._cur()
@@ -4242,7 +5092,8 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                               "(the raw .npy is always saved too).")
         cmaprow.addWidget(self._cmap, 1)
         fl.addLayout(cmaprow)
-        hint = QtWidgets.QLabel("Expand a file to explore its h5 root · double-click "
+        hint = QtWidgets.QLabel("Ctrl+click several files to queue them · "
+                                "Expand a file to explore its h5 root · double-click "
                                 "an image node to view it (no heavy load).")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888; font-size:9px;")
@@ -4336,6 +5187,18 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             "Configure line ROIs, area ROIs, drift, and propagation.")
         act_setup.triggered.connect(self._open_line_setup)
         tools.addAction(act_setup)
+        act_drift = QtGui.QAction("Inter-scan drift (ADF / BF)…", self)
+        act_drift.setToolTip(
+            "Rigid drift between repeated scans of the same region, from their ADF/BF; "
+            "writes the per-file drift CSV used by the line / ROI tools.")
+        act_drift.triggered.connect(lambda: self._show_tool(DriftEstimateDialog(self)))
+        tools.addAction(act_drift)
+        act_repro = QtGui.QAction("Reproducibility experiment…", self)
+        act_repro.setToolTip(
+            "Same region scanned several times: line / ROI / map repeatability, "
+            "each without and with the inter-scan drift correction.")
+        act_repro.triggered.connect(lambda: self._show_tool(ReproducibilityDialog(self)))
+        tools.addAction(act_repro)
         tools.addSeparator()
         act_an_file = QtGui.QAction("Analyse (file)", self)
         act_an_file.setToolTip(
@@ -4740,7 +5603,11 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                 add("Load data + probe", self._load_data_and_probe)
                 add("Tune detection (live)…", self._open_detect_tuner)
                 add("Preview at 6 pts", lambda: self._async_step("detect_preview"))
-                add("Compute braggpeaks…", self._compute_braggpeaks)
+            if any(E.needs_detection_workflow(s) for s in self._scans):
+                add("Compute braggpeaks…", self._compute_braggpeaks,
+                    tip="Ctrl+click several files in Files to queue them. Uses the "
+                        "detection parameters of the current (tuned) file. Load data "
+                        "+ probe runs automatically per file, then RAM is freed.")
         elif key == "roi":
             add_setting_bar("roi")
             add("Pick on ADF…", self._pick_roi, tip="Quick ROI pick on the active ADF.")
@@ -5395,6 +6262,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         self._refresh_files()
         self._update_active_views()
         self._params.report_refresh()
+        self._populate_step_actions(self._step)
 
     def _refresh_files(self) -> None:
         rows = []
@@ -6155,20 +7023,72 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                 _show_tuner(),
             ))
 
+    def _selected_file_scans(self) -> list:
+        """Files-dock multi-selection; falls back to the active file."""
+        idxs = self._files.selected_scan_indices()
+        if not idxs and 0 <= self._active < len(self._scans):
+            idxs = [self._active]
+        return [self._scans[i] for i in idxs if 0 <= i < len(self._scans)]
+
     def _compute_braggpeaks(self) -> None:
-        sc = self._need_active()
-        if sc is None or self._busy or not self._path_b_only(sc, "Compute braggpeaks"):
+        """Queue Path-B detection on the Files-dock selection (Ctrl+click).
+
+        Load data + probe runs automatically per file. Detection parameters come
+        from the current (tuned) file. Files that already have braggpeaks.h5 are
+        skipped.
+        """
+        if self._busy:
             return
-        save = D._braggpeaks_save_path(sc, D.ComputeOptions())
-        if QtWidgets.QMessageBox.question(
+        self._params.apply()
+        selected = self._selected_file_scans()
+        if not selected:
+            QtWidgets.QMessageBox.information(
+                self, "Compute braggpeaks", "Select at least one file in the Files panel.")
+            return
+        source = self.active_scan() or selected[0]
+        path_b = [s for s in selected if E.needs_detection_workflow(s)]
+        skipped = [s for s in selected if s not in path_b]
+        if not path_b:
+            self._path_b_only(selected[0], "Compute braggpeaks")
+            return
+        src_probe = (source.params.probe_source or "vacuum").lower()
+        if src_probe == "vacuum" and not (
+                source.vacuum_path and Path(source.vacuum_path).is_file()):
+            QtWidgets.QMessageBox.warning(
                 self, "Compute braggpeaks",
-                f"Run full-scan detection for '{sc.name}' (heavy)?\nSave: {save}") \
+                f"The current file '{source.name}' has no vacuum file for the probe.\n\n"
+                "Set it in the Probe step (Choose vacuum file…) before queuing detection.")
+            return
+        from qt_splash import ensure_heavy_imports, heavy_ready
+        if not heavy_ready():
+            self._status.showMessage("Waiting for py4DSTEM to finish loading…")
+            ensure_heavy_imports(log=self._console.log, block=True)
+        opts = D.ComputeOptions()
+        lines = [f"  • {s.name}  →  {D._braggpeaks_save_path(s, opts)}" for s in path_b]
+        skip_bit = ""
+        if skipped:
+            skip_bit = ("\n\nSkipped (already have braggpeaks.h5):\n"
+                        + "\n".join(f"  • {s.name}" for s in skipped))
+        msg = (
+            f"Run full-scan detection for {len(path_b)} file(s)? (heavy)\n"
+            f"Detection parameters + vacuum from '{source.name}'.\n"
+            "Each file: Load data + probe → braggpeaks → free RAM.\n\n"
+            + "\n".join(lines) + skip_bit
+        )
+        if QtWidgets.QMessageBox.question(self, "Compute braggpeaks", msg) \
                 != QtWidgets.QMessageBox.StandardButton.Yes:
             return
-        self._run_async(lambda: E.compute_braggpeaks(sc, save_path=save, log=self._console.log),
-                        label=f"braggpeaks ({sc.name})",
-                        on_done=lambda _r: (self._refresh_files(), self._update_active_views(),
-                                            E.free_memory([sc], log=self._console.log)))
+        src = source
+        pool = list(path_b)
+        self._cancel_event.clear()
+        self._run_async(
+            lambda: D.compute_braggpeaks_all(
+                pool, opts, source=src, log=self._console.log,
+                progress=self.sig_progress.emit,
+                on_scan_done=self.sig_scan_done.emit,
+                cancel=self._cancel_event.is_set),
+            label=f"braggpeaks ({len(pool)} file(s))",
+            on_done=self.sig_finished.emit)
 
     # ── compute / analysis ─────────────────────────────────────────────────────
     def _compute_options(self) -> D.ComputeOptions:
@@ -6278,8 +7198,14 @@ class Fast4DWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_progress(self, ev) -> None:
         self._progress.setValue(int((ev.scan_index + 0.5) / max(ev.n_scans, 1) * 100))
-        if 0 <= ev.scan_index < len(self._scans) and self._active != ev.scan_index:
-            self._active = ev.scan_index
+        idx = ev.scan_index
+        name = getattr(ev, "scan_name", "")
+        for i, scn in enumerate(self._scans):
+            if scn.name == name:
+                idx = i
+                break
+        if 0 <= idx < len(self._scans) and self._active != idx:
+            self._active = idx
             self._refresh_files()
         sc = self.active_scan()
         if sc is not None:
@@ -6332,6 +7258,9 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if isinstance(result, Exception):
             self._status.showMessage("Failed — see console.")
         elif isinstance(result, D.BatchOutcome):
+            labels = [lab for o in result.outcomes
+                      for lab in (getattr(o, "labels", None) or [])]
+            kind = "Braggpeaks" if "braggpeaks" in labels else "Compute"
             if getattr(self, "_save_root", ""):
                 try:
                     p = E.save_session_json(
@@ -6345,7 +7274,7 @@ class Fast4DWindow(QtWidgets.QMainWindow):
                                    log=self._console.log)
                 except Exception as exc:
                     self._console.log(f"[warn] summary skipped: {exc}")
-            self._status.showMessage(f"Compute done: {result.summary()}")
+            self._status.showMessage(f"{kind} done: {result.summary()}")
         elif isinstance(result, dict):
             n = sum(len(v.get("stress", {})) for v in result.values())
             self._status.showMessage(f"Analysis done: stress on {n} map(s).")

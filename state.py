@@ -96,6 +96,10 @@ class WorkflowState:
     strain_figures: dict[str, Any] = field(default_factory=dict)
     strain_arrays: dict[str, Any] = field(default_factory=dict)
     strain_raw: dict[str, Any] = field(default_factory=dict)  # label -> raw strainmap_g1g2.data (often 3D/structured)
+    # Crystal frame of the strain tensor (see crystal_frame.py): the spec pushed from
+    # CalibrationParams, and one frame card per computed label (written to the manifest).
+    crystal_frame_spec: dict[str, Any] | None = None
+    crystal_frame_cards: dict[str, Any] = field(default_factory=dict)
     line_profiles_px: dict[str, Any] = field(default_factory=dict)  # label -> {1:(p0,p1), 2:(p0,p1)}
     fixed_line_profiles_px: dict[int, tuple[tuple[float, float], tuple[float, float]]] | None = None
     # Step 14 reference ROI on εxx map: pixel box x0,x1,y0,y1 with x1/y1 exclusive (numpy slice semantics).
@@ -202,6 +206,7 @@ class WorkflowState:
         self.strain_figures.clear()
         self.strain_arrays.clear()
         self.strain_raw.clear()
+        self.crystal_frame_cards.clear()
         self.line_profiles_px.clear()
         self.fixed_line_profiles_px = None
         self.strain_roi_mask = None

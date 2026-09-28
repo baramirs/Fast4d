@@ -943,12 +943,154 @@ def load_data_step(
     return state
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Vacuum-probe cache. The vacuum 4D file is the SAME for a whole session / batch,
+# so its probe (probe image + sigmoid kernel + alpha/center) is computed ONCE and
+# reused by every scan that points to the same file:
+#   * memory: one shared entry per vacuum, keyed by (path, size, mtime) — a changed
+#     or re-exported vacuum file gets a new key automatically;
+#   * disk:   a small .npz (probe + kernel + alpha, ~0.5 MB) under
+#     ~/.fast4d/probe_cache (or $FAST4D_PROBE_CACHE) → a new session skips the
+#     heavy vacuum .mib load entirely.
+# The vacuum datacube itself is dropped right after the probe is extracted (it used
+# to stay in every scan's state = one full vacuum 4D copy per scan in RAM).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PROBE_CACHE_VERSION = 1          # bump if the probe recipe (ROI, kernel) changes
+_VACUUM_PROBE_CACHE: dict = {}    # key -> {"probe", "alpha", "qx0", "qy0", "path", "origin"}
+
+
+def _vacuum_cache_key(vacuum_path: str | Path) -> tuple:
+    p = Path(vacuum_path).expanduser().resolve()
+    st = p.stat()
+    return (os.path.normcase(str(p)), int(st.st_size), int(st.st_mtime_ns),
+            _PROBE_CACHE_VERSION)
+
+
+def probe_disk_cache_dir() -> Path:
+    env = os.environ.get("FAST4D_PROBE_CACHE", "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".fast4d" / "probe_cache"
+
+
+def _probe_disk_cache_file(key: tuple) -> Path:
+    import hashlib
+    h = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()[:20]
+    return probe_disk_cache_dir() / f"vacuum_probe_{h}.npz"
+
+
+def _probe_arrays(probe: Any) -> tuple[np.ndarray, np.ndarray]:
+    pr = np.asarray(getattr(probe, "probe", None), dtype=np.float32)
+    kr = probe_kernel_template_ndarray(probe)
+    return pr, np.asarray(kr, dtype=np.float32)
+
+
+def _save_probe_disk_cache(key: tuple, entry: dict, log=None) -> None:
+    try:
+        f = _probe_disk_cache_file(key)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        pr, kr = _probe_arrays(entry["probe"])
+        tmp = f.with_suffix(".tmp.npz")
+        np.savez_compressed(tmp, probe=pr, kernel=kr,
+                            alpha=entry["alpha"], qx0=entry["qx0"], qy0=entry["qy0"],
+                            key=np.array(repr(key)), path=np.array(str(entry["path"])))
+        os.replace(tmp, f)
+        _log(log, f"Vacuum probe cached on disk: {f}")
+    except Exception as exc:                      # cache is best-effort
+        _log(log, f"Vacuum probe disk cache not written: {exc}")
+
+
+def _load_probe_disk_cache(key: tuple) -> dict | None:
+    f = _probe_disk_cache_file(key)
+    if not f.is_file():
+        return None
+    try:
+        with np.load(f, allow_pickle=False) as z:
+            if str(z["key"]) != repr(key):
+                return None
+            return {"probe": _ProbeShim(z["probe"], z["kernel"]),
+                    "alpha": float(z["alpha"]), "qx0": float(z["qx0"]),
+                    "qy0": float(z["qy0"]), "path": str(z["path"]), "origin": "disk"}
+    except Exception:
+        return None
+
+
+def get_vacuum_probe(vacuum_mib_path: str | Path, *, use_disk_cache: bool = True,
+                     log: Callable[[str], None] | None = None) -> dict:
+    """Probe of a vacuum file, computed at most once per (file, mtime).
+
+    Returns ``{"probe", "alpha", "qx0", "qy0", "path", "origin"}`` where origin is
+    'memory', 'disk' or 'computed'. The probe object is SHARED between scans (it is
+    read-only downstream: only ``.probe`` / ``.kernel`` are read).
+    """
+    vacuum_path = Path(vacuum_mib_path).expanduser()
+    if not vacuum_path.exists():
+        raise FileNotFoundError(f"Vacuum file does not exist: {vacuum_path}")
+    key = _vacuum_cache_key(vacuum_path)
+    hit = _VACUUM_PROBE_CACHE.get(key)
+    if hit is not None:
+        _log(log, f"Vacuum probe reused from memory ({vacuum_path.name}, "
+                  f"alpha={hit['alpha']:.4g} px) — vacuum not reloaded.")
+        return dict(hit, origin="memory")
+    if use_disk_cache:
+        hit = _load_probe_disk_cache(key)
+        if hit is not None:
+            _VACUUM_PROBE_CACHE[key] = hit
+            _log(log, f"Vacuum probe loaded from disk cache ({vacuum_path.name}, "
+                      f"alpha={hit['alpha']:.4g} px) — vacuum .mib not loaded.")
+            return dict(hit)
+
+    vacuumcube = _load_raw_datacube(vacuum_path, log=log)
+    _log(log, f"Loaded vacuum data: {vacuum_path}")
+    _log(log, _shape_message("vacuumcube", vacuumcube))
+    roi = make_central_vacuum_roi(vacuumcube.Rshape, fraction=0.05)
+
+    def _probe_workflow():
+        pr = vacuumcube.get_vacuum_probe(ROI=roi)
+        alpha_pr, qx0_pr, qy0_pr = vacuumcube.get_probe_size(pr.probe)
+        pr.get_kernel(mode="sigmoid", radii=(alpha_pr, 2 * alpha_pr))
+        return pr, alpha_pr, qx0_pr, qy0_pr
+
+    try:
+        probe, alpha_pr, qx0_pr, qy0_pr = _with_plot_suppressed(_probe_workflow)
+    finally:
+        del vacuumcube                            # free the vacuum 4D right away
+        import gc
+        gc.collect()
+    entry = {"probe": probe, "alpha": float(alpha_pr), "qx0": float(qx0_pr),
+             "qy0": float(qy0_pr), "path": str(vacuum_path), "origin": "computed"}
+    _VACUUM_PROBE_CACHE[key] = dict(entry, origin="memory")
+    if use_disk_cache:
+        _save_probe_disk_cache(key, entry, log=log)
+    return entry
+
+
+def vacuum_probe_cache_info() -> list[dict]:
+    """Entries currently held in memory (for the GUI / console)."""
+    return [{"path": v["path"], "alpha": v["alpha"], "qx0": v["qx0"], "qy0": v["qy0"]}
+            for v in _VACUUM_PROBE_CACHE.values()]
+
+
+def clear_vacuum_probe_cache(*, disk: bool = False) -> int:
+    """Forget cached vacuum probes (memory; also the .npz files if ``disk``)."""
+    n = len(_VACUUM_PROBE_CACHE)
+    _VACUUM_PROBE_CACHE.clear()
+    if disk:
+        d = probe_disk_cache_dir()
+        if d.is_dir():
+            for f in d.glob("vacuum_probe_*.npz"):
+                try:
+                    f.unlink(); n += 1
+                except OSError:
+                    pass
+    return n
+
+
 def compute_probe_step(
     state: WorkflowState,
     vacuum_mib_path: str | Path,
     log: Callable[[str], None] | None = None,
 ) -> WorkflowState:
-    """Step 2: load vacuum, compute probe, extract probe params, build sigmoid kernel."""
+    """Step 2: probe + sigmoid kernel from a vacuum file (cached: see get_vacuum_probe)."""
 
     vacuum_path = Path(vacuum_mib_path).expanduser()
     if not vacuum_path.exists():
@@ -958,33 +1100,21 @@ def compute_probe_step(
         _log(log, "Probe already computed for this vacuum path; reusing current probe.")
         return state
 
+    entry = get_vacuum_probe(vacuum_path, log=log)
+
     state.reset_probe_products()
     state.vacuum_mib_path = vacuum_path
-
-    state.vacuumcube = _load_raw_datacube(vacuum_path, log=log)
-    _log(log, f"Loaded vacuum data: {vacuum_path}")
-    _log(log, _shape_message("vacuumcube", state.vacuumcube))
-
-    roi = make_central_vacuum_roi(state.vacuumcube.Rshape, fraction=0.05)
-
-    def _probe_workflow():
-        pr = state.vacuumcube.get_vacuum_probe(ROI=roi)
-        alpha_pr, qx0_pr, qy0_pr = state.vacuumcube.get_probe_size(pr.probe)
-        pr.get_kernel(mode="sigmoid", radii=(alpha_pr, 2 * alpha_pr))
-        return pr, alpha_pr, qx0_pr, qy0_pr
-
-    probe, alpha_pr, qx0_pr, qy0_pr = _with_plot_suppressed(_probe_workflow)
-
-    state.probe = probe
-    state.probe_alpha = float(alpha_pr)
-    state.probe_qx0 = float(qx0_pr)
-    state.probe_qy0 = float(qy0_pr)
+    state.vacuumcube = None                       # not kept (RAM): the probe is enough
+    state.probe = entry["probe"]
+    state.probe_alpha = float(entry["alpha"])
+    state.probe_qx0 = float(entry["qx0"])
+    state.probe_qy0 = float(entry["qy0"])
 
     state.probe_source = "vacuum_mib"
 
     _log(
         log,
-        "Computed vacuum probe and sigmoid kernel: "
+        f"Vacuum probe ready ({entry['origin']}): "
         f"alpha_pr={state.probe_alpha:.6g}, "
         f"qx0_pr={state.probe_qx0:.6g}, "
         f"qy0_pr={state.probe_qy0:.6g}",
@@ -4455,6 +4585,97 @@ def _prepare_gvects_for_get_strain(strainmap: Any, gvects: Any) -> Any:
     return _sanitize_gvects(strainmap, gvects)
 
 
+def _crystal_frame_module():
+    try:
+        from . import crystal_frame as CF
+    except ImportError:
+        import crystal_frame as CF
+    return CF
+
+
+def _reference_g12_for_frame(strainmap: Any, gv: Any) -> tuple[np.ndarray, np.ndarray, str]:
+    """The reference g1, g2 that get_strain will use (same rule as py4DSTEM)."""
+    if isinstance(gv, tuple) and len(gv) == 2:
+        return (np.asarray(gv[0], float).ravel()[:2], np.asarray(gv[1], float).ravel()[:2],
+                "explicit reference g1,g2")
+    try:
+        from py4DSTEM.process.strain.latticevectors import get_reference_g1g2
+        base = getattr(strainmap, "mask", None)
+        if isinstance(gv, np.ndarray) and gv.dtype == bool:
+            m = gv if base is None else np.logical_and(gv, base)
+            src = "median over the reference ROI"
+        else:
+            m = base if base is not None else np.ones(strainmap.rshape, bool)
+            src = "median over the whole scan"
+        g1, g2 = get_reference_g1g2(strainmap.g1g2_map, np.asarray(m, bool))
+        return np.asarray(g1, float), np.asarray(g2, float), src
+    except Exception:
+        return (np.asarray(strainmap.g1, float).ravel()[:2],
+                np.asarray(strainmap.g2, float).ravel()[:2], "basis g1,g2 (fallback)")
+
+
+def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, label: str,
+                         log: Callable[[str], None] | None = None) -> dict | None:
+    """Crystal-frame standard (crystal_frame.py). In mode 'crystal' the x axis of
+    get_strain is NOT the typed coordinate_rotation: it is the direction of x_hkl
+    computed from the reference g1, g2 that this very get_strain uses. In mode
+    'manual' the typed angle is kept and the card records how far it is from x_hkl.
+    Either way a frame card is stored in state.crystal_frame_cards[label]."""
+    CF = _crystal_frame_module()
+    spec = dict(getattr(state, "crystal_frame_spec", None) or {})
+    manual = spec.get("mode", "manual") != "crystal"
+    assumptions = ["QR rotation/flip calibrated: calibrated (qx, qy) parallel to scan (rx, ry)"]
+    if not spec.get("x_hkl"):
+        spec = dict(CF.DEFAULT_SPEC, mode="manual")
+        assumptions.append("hkl labels of g1, g2 are the defaults "
+                           f"({CF.hkl_str(spec['g1_hkl'])}), ({CF.hkl_str(spec['g2_hkl'])})")
+    try:
+        g1, g2, src = _reference_g12_for_frame(strainmap, kwargs.get("gvects"))
+        fr = CF.frame_from_g(g1, g2, spec)
+    except Exception as exc:
+        _log(log, f"Crystal frame: could not evaluate ({exc}); keeping the typed "
+                  f"coordinate_rotation = {kwargs.get('coordinate_rotation', 0.0)}")
+        return None
+    typed = float(kwargs.get("coordinate_rotation", 0.0) or 0.0)
+    if manual:
+        applied = typed
+    else:
+        applied = float(fr["angle_deg"])
+        kwargs["coordinate_rotation"] = applied
+        try:
+            state.strain_params.setdefault("get_strain", {})["coordinate_rotation"] = applied
+        except Exception:
+            pass
+        _log(log, f"Crystal frame [{label}]: x || [{CF.hkl_str(spec['x_hkl'])}] = "
+                  f"{CF.combo_label(fr['x_combo'])}  ->  coordinate_rotation = {applied:.3f} deg "
+                  f"(typed value {typed:.3f} ignored)")
+    if not fr["label_ok"]:
+        _log(log, f"WARNING crystal frame [{label}]: g1^g2 measured {fr['g_angle_meas_deg']:.2f} deg "
+                  f"but the hkl labels predict {fr['g_angle_pred_deg']:.2f} deg -- check "
+                  f"g1_hkl / g2_hkl, x may not be [{CF.hkl_str(spec['x_hkl'])}]")
+    sbp = getattr(state, "strain_basis_params", {}) or {}
+    card = CF.make_card(
+        "Fast4D", spec, "calibrated q (qx, qy), py4DSTEM get_strain",
+        fr["angle_deg"], applied, 1,
+        x_def=CF.combo_label(fr["x_combo"]), y_def=CF.combo_label(fr["y_combo"]),
+        y_sign=fr["y_sign"], ortho_err_deg=fr["ortho_err_deg"],
+        g1_ref_qxy=[float(v) for v in g1], g2_ref_qxy=[float(v) for v in g2],
+        reference=src, label=str(label),
+        g_angle_meas_deg=fr["g_angle_meas_deg"], g_angle_pred_deg=fr["g_angle_pred_deg"],
+        label_err_deg=fr["label_err_deg"], label_ok=fr["label_ok"],
+        qr_rotation=sbp.get("qr_rotation"), qr_flip=sbp.get("qr_flip"),
+        assumptions=assumptions)
+    if manual and abs(card["residual_rotation_deg"]) > CF.ANGLE_TOL_DEG:
+        _log(log, f"Crystal frame [{label}] (manual): coordinate_rotation {typed:.2f} deg is "
+                  f"{card['residual_rotation_deg']:+.2f} deg away from [{CF.hkl_str(spec['x_hkl'])}] "
+                  f"({fr['angle_deg']:.2f} deg). Set the frame mode to 'crystal' to fix it.")
+    try:
+        state.crystal_frame_cards[str(label)] = card
+    except Exception:
+        state.crystal_frame_cards = {str(label): card}
+    return card
+
+
 def compute_strain_map_step(
     state: WorkflowState,
     use_roi: bool = False,
@@ -4504,6 +4725,7 @@ def compute_strain_map_step(
         kwargs = dict(state.strain_params["get_strain"])
         if gvects is not None:
             kwargs["gvects"] = _prepare_gvects_for_get_strain(strainmap, gvects)
+        _apply_crystal_frame(state, strainmap, kwargs, label, log)
         strainmap.get_strain(**kwargs)
 
     # Capture the figure(s) produced by py4DSTEM (notebook style),
@@ -4595,14 +4817,40 @@ def compute_stress_analysis_step(
     except ImportError:
         from stress_analysis import build_stress_maps_figure, compute_stress
 
+    try:
+        from .stress_analysis import tensor_frame_axes
+    except ImportError:
+        from stress_analysis import tensor_frame_axes
+
     exx, eyy, exy = strain_tensor_components_from_state(state, label)
-    sigma = compute_stress(exx, eyy, exy, c11_pa, c12_pa, c44_pa, mode=mode)
+    # The elastic constants are cube-axis constants; the tensor is written in the
+    # crystal frame of its card (e.g. x = [-110], y = [001]). Rotate the stiffness
+    # into THOSE axes. The native x of get_strain sits at (applied - true) from
+    # x_hkl, turned towards the native y, which is y_sign * y_hkl.
+    card = (getattr(state, "crystal_frame_cards", {}) or {}).get(str(label))
+    axes, frame_txt, ysg = None, "cube axes [100]/[010] (no frame card)", 1
+    if card and card.get("x_hkl") and card.get("y_hkl"):
+        ysg = int(card.get("y_sign", 1) or 1)
+        psi = -float(card.get("residual_rotation_deg", 0.0)) * ysg
+        axes = tensor_frame_axes(card["x_hkl"], card["y_hkl"], psi)
+        frame_txt = (f"x || [{' '.join(str(v) for v in card['x_hkl'])}]"
+                     f"{f' turned {psi:+.2f} deg' if abs(psi) > 1e-6 else ''}, "
+                     f"y || [{' '.join(str(v) for v in card['y_hkl'])}]")
+    else:
+        _log(log, f"WARNING stress [{label}]: no crystal frame card -- Hooke's law applied as "
+                  f"if the tensor were along cube axes, which is wrong unless it is.")
+    sigma = compute_stress(exx, eyy, exy * ysg, c11_pa, c12_pa, c44_pa, mode=mode, axes=axes)
+    if ysg != 1:
+        sigma["sigma_xy"] = sigma["sigma_xy"] * ysg
+    _log(log, f"Stress [{label}] ({mode}): stiffness in the tensor frame: {frame_txt}")
     state.stress_tensors_pa[label] = {k: np.asarray(v, dtype=np.float64) for k, v in sigma.items()}
     state.stress_meta[label] = {
         "mode": str(mode),
         "C11_Pa": float(c11_pa),
         "C12_Pa": float(c12_pa),
         "C44_Pa": float(c44_pa),
+        "stiffness_frame": frame_txt,
+        "tensor_axes_cube": (axes.tolist() if axes is not None else None),
     }
     gs = (state.strain_params or {}).get("get_strain", {})
     vr = gs.get("vrange", [-5.0, 5.0])

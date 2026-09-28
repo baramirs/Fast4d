@@ -93,7 +93,14 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("indexing_seed", "Indexing RANSAC seed", "int"),
     ],
     "strain": [
-        ParamSpec("coordinate_rotation", "coordinate_rotation (deg)", "float", decimals=2),
+        ParamSpec("frame_mode", "Tensor frame (crystal = auto angle)", "enum",
+                  ("crystal", "manual")),
+        ParamSpec("frame_x_hkl", "Frame x || [hkl]", "list3"),
+        ParamSpec("frame_y_hkl", "Frame y || [hkl]", "list3"),
+        ParamSpec("frame_g1_hkl", "g1 label (hkl)", "list3"),
+        ParamSpec("frame_g2_hkl", "g2 label (hkl)", "list3"),
+        ParamSpec("coordinate_rotation", "coordinate_rotation (deg; output if crystal)",
+                  "float", decimals=2),
         ParamSpec("max_peak_spacing", "max_peak_spacing", "float", decimals=2),
         ParamSpec("vrange", "vrange (min, max) %", "list2"),
         ParamSpec("vrange_theta", "vrange_theta (min, max) deg", "list2"),
@@ -112,6 +119,7 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("stress_symmetry", "Symmetry", "enum", ("cubic", "isotropic")),
         ParamSpec("stress_units", "Stress units", "enum", ("GPa", "MPa")),
         ParamSpec("stress_vmax", "Range ±vmax (0=auto)", "float", decimals=3),
+        ParamSpec("r_px_pm", "R px (pm/px from EMD, 0=pixels)", "float", decimals=3),
     ],
 }
 

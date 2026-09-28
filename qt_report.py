@@ -84,6 +84,8 @@ def _is_report_key(key: str) -> bool:
 def _label_for_key(key: str) -> str:
     if key in FIG_LABELS:
         return FIG_LABELS[key]
+    if key.startswith("report_repro_"):
+        return f"Reproducibility — {key[len('report_repro_'):]}"
     if key.startswith("report_line_group_"):
         return f"Grouped lines — {key[len('report_line_group_'):]}"
     if key.startswith("report_line_profiles_"):

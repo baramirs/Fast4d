@@ -465,6 +465,8 @@ class ParamTable(QtWidgets.QWidget):
             self._status.setStyleSheet("color:#C62828;")
             self._status.setText("⚠ " + "; ".join(errors[:2]))
         else:
+            for sc in self._get_scans() or []:
+                E.apply_r_pixel_from_params(sc)
             self._status.setStyleSheet("color:#2E7D32;")
             self._status.setText(f"Applied to {n} file(s) ✓")
         self.applied.emit(errors)

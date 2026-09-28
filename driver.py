@@ -383,6 +383,156 @@ def compute_all(scans: list[E.Scan], opts: ComputeOptions | None = None, *,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BRAGGPEAKS QUEUE  (Path B only: load + probe + detect, serial, free RAM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _snapshot_shared_probe(source: E.Scan | None, *, log: Log = None):
+    """Reuse a vacuum-file probe already in RAM, or compute it once.
+
+    Only the vacuum-file template is shareable across scans. ``bf_roi`` /
+    ``synthetic`` / ``mean_dp`` probes are per-file (they come from each
+    scan's own datacube) and must not be copied.
+    """
+    if source is None:
+        return None
+    src = (source.params.probe_source or "vacuum").lower()
+    if src != "vacuum":
+        return None
+    st = getattr(source, "state", None)
+    existing = getattr(st, "probe", None) if st is not None else None
+    if existing is not None:
+        return existing
+    if not source.vacuum_path:
+        return None
+    try:
+        return E.compute_shared_probe(source.vacuum_path, log=log)
+    except Exception as exc:
+        _log(log, f"shared vacuum probe skipped: {exc}")
+        return None
+
+
+def compute_braggpeaks_scan(
+    scan: E.Scan,
+    opts: ComputeOptions | None = None,
+    *,
+    shared_probe=None,
+    log: Log = None,
+    progress: Progress = None,
+    scan_index: int = 0,
+    n_scans: int = 1,
+    cancel: Callable[[], bool] | None = None,
+) -> ScanOutcome:
+    """Path-B full-scan detection for ONE scan. Never raises (errors → outcome)."""
+    opts = opts or ComputeOptions()
+    t0 = time.perf_counter()
+    path = E.analysis_path(scan)
+    out = ScanOutcome(scan=scan, ok=False, path=path)
+
+    def emit(step: str, message: str = "") -> None:
+        _emit(progress, ProgressEvent(scan_index, n_scans, scan.name, path, step, message))
+
+    def ck() -> None:
+        if cancel is not None and cancel():
+            raise _Cancelled()
+
+    try:
+        if path == "A":
+            emit("skip", "already has braggpeaks.h5")
+            _log(log, f"[{scan.name}] already has braggpeaks.h5 — skipping detection.")
+            out.ok = True
+            out.labels = ["skipped"]
+            out.elapsed_s = time.perf_counter() - t0
+            return out
+
+        problems = validate_scan(scan, opts)
+        if problems:
+            raise RuntimeError("; ".join(problems))
+        ck()
+
+        emit("load_datacube", "loading raw 4D datacube + probe")
+        E.ensure_datacube_and_probe(scan, shared_probe=shared_probe, log=log)
+        ck()
+        emit("braggpeaks", "full-scan Bragg disk detection (CUDA)")
+        save_bp = _braggpeaks_save_path(scan, opts) if opts.save_braggpeaks else None
+        E.compute_braggpeaks(scan, save_path=save_bp, log=log)
+        ck()
+        scan.status = "computed"
+        out.ok = True
+        out.labels = ["braggpeaks"]
+    except _Cancelled:
+        scan.status = "pending"
+        out.error = "cancelled"
+        emit("cancelled", "cancelled by user")
+        _log(log, f"[{scan.name}] braggpeaks cancelled at a step boundary.")
+    except Exception as exc:
+        scan.status = "error"
+        out.error = f"{type(exc).__name__}: {exc}"
+        emit("error", out.error)
+        _log(log, f"[{scan.name}] BRAGGPEAKS FAILED: {out.error}\n{traceback.format_exc()}")
+
+    out.elapsed_s = time.perf_counter() - t0
+    return out
+
+
+def compute_braggpeaks_all(
+    scans: list[E.Scan],
+    opts: ComputeOptions | None = None,
+    *,
+    source: E.Scan | None = None,
+    log: Log = None,
+    progress: Progress = None,
+    on_scan_done: Callable[[ScanOutcome], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+) -> BatchOutcome:
+    """Serial Path-B detection over N files (N == 1 is just "single").
+
+    Copies tuned detect params + vacuum from ``source`` (the file the user just
+    tuned) onto every other scan, then for each: load datacube + probe → detect
+    → persist braggpeaks.h5 → free RAM. Cancel is cooperative between files.
+    """
+    opts = opts or ComputeOptions()
+    t0 = time.perf_counter()
+    result = BatchOutcome()
+    n = len(scans)
+    src = source or (scans[0] if scans else None)
+    if src is not None:
+        for sc in scans:
+            if sc is not src:
+                E.copy_detection_settings(sc, src, log=log)
+    shared_probe = _snapshot_shared_probe(src, log=log)
+    _log(log, f"BRAGGPEAKS queue: {n} file(s)"
+              + (f" — params from '{src.name}'" if src is not None else ""))
+    for i, scan in enumerate(scans):
+        if cancel is not None and cancel():
+            _log(log, f"CANCELLED — stopped before '{scan.name}' ({i}/{n} done).")
+            break
+        out = compute_braggpeaks_scan(
+            scan, opts, shared_probe=shared_probe, log=log, progress=progress,
+            scan_index=i, n_scans=n, cancel=cancel)
+        result.outcomes.append(out)
+        _log(log, f"[{scan.name}] {'OK' if out.ok else 'FAILED'} "
+                  f"({_fmt_elapsed(out.elapsed_s)})"
+                  + (f" — {out.error}" if out.error else ""))
+        if on_scan_done is not None:
+            try:
+                on_scan_done(out)
+            except Exception:
+                pass
+        bp_path = getattr(scan, "braggpeaks_path", None)
+        drop_bp = bool(bp_path) and Path(str(bp_path)).exists()
+        E.free_memory([scan], drop_braggpeaks=drop_bp, log=log)
+        if out.error == "cancelled" or (cancel is not None and cancel()):
+            _log(log, f"CANCELLED — stopped after '{scan.name}' ({i + 1}/{n}).")
+            break
+        if not out.ok and opts.stop_on_error:
+            _log(log, f"Stopping queue after failure on '{scan.name}'.")
+            break
+    result.elapsed_s = time.perf_counter() - t0
+    _log(log, f"BRAGGPEAKS complete: {result.summary()}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ANALYSIS  (light, reads saved strain arrays — never recomputes)
 # ─────────────────────────────────────────────────────────────────────────────
 
