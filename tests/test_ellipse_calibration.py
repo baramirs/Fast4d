@@ -67,3 +67,40 @@ def test_a_real_center_is_kept(monkeypatch, origin_scan):
     probe = _captured_center(monkeypatch, st, None)
     c = (probe["origin"][0] + 1.5, probe["origin"][1] - 0.5)
     assert _captured_center(monkeypatch, st, c)["center"] == c
+
+
+# ── M2 ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("p, ok", [
+    ((128.0, 128.0, 51.0, 50.0, 0.5), True),        # a/b 1.02, on the origin
+    ((128.0, 128.0, 77.5, 50.0, 0.5), False),       # a/b 1.55 (Scan01, 162 px ROI)
+    ((140.0, 128.0, 51.0, 50.0, 0.5), False),       # centre 12 px off
+    ((128.0, 128.0, 500.0, 490.0, 0.5), False),     # scale far from the ring
+])
+def test_ellipse_quality_control(p, ok):
+    q = P.ellipse_fit_quality(p, origin=(128.0, 128.0), q_range=(40, 60))
+    assert q["ok"] is ok
+    assert bool(q["reasons"]) is (not ok)
+
+
+def test_rejected_ellipse_is_not_applied(monkeypatch):
+    import py4DSTEM
+    sc, _ = _scan()
+    sc.params.ellipse_enabled = True
+    sc.params.ellipse_use_roi = False
+    E.set_roi(sc, log=lambda m: None)
+    E.calibrate_origin(sc, make_figure=False, log=lambda m: None)
+    monkeypatch.setattr(py4DSTEM.process.calibration, "fit_ellipse_1D",
+                        lambda bvm, center=None, fitradii=None, mask=None:
+                        (center[0], center[1], 77.5, 50.0, 0.3))
+    with pytest.raises(RuntimeError, match="rejected"):
+        E.calibrate_ellipse(sc, make_figure=False, log=lambda m: None)
+    bp = sc.state.braggpeaks
+    assert not bp.calstate.get("ellipse", False)
+
+
+def test_q_pixel_far_from_the_seed_warns():
+    w = E.q_pixel_fit_warnings(px_guess=0.0224, px_fit=0.030512, use_roi=True, n_patterns=162)
+    assert any("seed" in s for s in w) and any("ROI" in s for s in w)
+    assert E.q_pixel_fit_warnings(px_guess=0.0224, px_fit=0.021572, use_roi=False,
+                                  n_patterns=65536) == []

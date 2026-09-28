@@ -2627,6 +2627,35 @@ def ellipse_fit_center(center, bvm, log: Callable[[str], None] | None = None):
     return c
 
 
+#: Ellipse quality control (M2): accept only a near-circular fit centred on the origin.
+ELLIPSE_MAX_AXIS_RATIO_DEV = 0.05     # |a/b - 1|
+ELLIPSE_MAX_CENTER_SHIFT_PX = 3.0     # detector px (scaled by the BVM sampling)
+
+
+def ellipse_fit_quality(p_ellipse, origin, q_range, sampling: int = 1) -> dict:
+    """{ok, reasons, ab, shift, scale_ok} for a fit_ellipse_1D result (x0, y0, a, b, theta)
+    against the calibrated ``origin`` and the fitted ring ``q_range`` (BVM px)."""
+    x0, y0, a, b, _theta = (float(v) for v in p_ellipse)
+    r0, r1 = sorted(float(v) for v in q_range)
+    R = 0.5 * (r0 + r1)
+    shift = float(np.hypot(x0 - float(origin[0]), y0 - float(origin[1])))
+    lo, hi = sorted((abs(a), abs(b)))
+    ab = hi / lo if lo > 0 else float("inf")
+    scale_ok = bool(0.5 * R <= lo and hi <= 2.0 * R)
+    reasons = []
+    if not all(np.isfinite([x0, y0, a, b])):
+        reasons.append("non-finite parameters")
+    if not scale_ok:
+        reasons.append(f"axes {a:.1f}/{b:.1f} px far from the {r0:.0f}-{r1:.0f} px ring")
+    if abs(ab - 1.0) > ELLIPSE_MAX_AXIS_RATIO_DEV:
+        reasons.append(f"a/b = {ab:.3f} (limit 1 +- {ELLIPSE_MAX_AXIS_RATIO_DEV:.2f})")
+    max_shift = ELLIPSE_MAX_CENTER_SHIFT_PX * max(int(sampling), 1)
+    if shift > max_shift:
+        reasons.append(f"centre {shift:.1f} px from the origin (limit {max_shift:.1f})")
+    return {"ok": not reasons, "reasons": reasons, "ab": ab, "shift": shift,
+            "scale_ok": scale_ok}
+
+
 def fit_ellipse_step(
     state: WorkflowState,
     q_range: tuple[int, int],

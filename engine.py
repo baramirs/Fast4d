@@ -2628,6 +2628,10 @@ def calibrate_origin(scan: Scan, *, make_figure: bool = True, log: Log = None) -
 
 
 # ── 3. ELLIPSE (optional) ─────────────────────────────────────────────────────
+#: Fewer calibration-ROI patterns than this: warn before an ellipse fit (Scan01: 162).
+MIN_ELLIPSE_ROI_PATTERNS = 1000
+
+
 def calibrate_ellipse(scan: Scan, *, make_figure: bool = True, log: Log = None) -> None:
     """Ellipse calibration (OFF unless params.ellipse_enabled). Uses shared ROI."""
     p = scan.params
@@ -2642,9 +2646,23 @@ def calibrate_ellipse(scan: Scan, *, make_figure: bool = True, log: Log = None) 
     st = scan.ensure_state()
     r0, r1 = sorted(int(v) for v in p.ellipse_q_range)
     center = getattr(p, "ellipse_center", None) or None   # [0, 0] / off-map: fit_ellipse_step
+    if p.ellipse_use_roi:
+        n_roi = int(np.asarray(st.roi_mask).sum()) if getattr(st, "roi_mask", None) is not None else 0
+        if 0 < n_roi < MIN_ELLIPSE_ROI_PATTERNS:
+            _log(log, f"WARNING [{scan.name}] ellipse fit on a ROI of {n_roi} patterns "
+                      f"(< {MIN_ELLIPSE_ROI_PATTERNS}): a small BVM rarely constrains an "
+                      f"ellipse; the fit is checked before it is applied.")
     res = pl.fit_ellipse_step(st, (r0, r1), sampling=int(p.ellipse_sampling),
                               use_roi=bool(p.ellipse_use_roi),
                               center=center, log=log)
+    q = pl.ellipse_fit_quality(res["p_ellipse"], res["bvm"].origin, (r0, r1),
+                               sampling=int(p.ellipse_sampling))
+    if not q["ok"]:
+        st.p_ellipse = None
+        raise RuntimeError(
+            f"[{scan.name}] ellipse fit rejected, NOT applied: " + "; ".join(q["reasons"])
+            + f". p = {tuple(round(float(v), 3) for v in res['p_ellipse'])}. Check the ring "
+            f"radii / ROI, or turn the ellipse off.")
     pl.apply_ellipse_step(st, log=log)
     if make_figure:
         try:
@@ -2712,11 +2730,15 @@ def fit_ellipse_preview(scan: Scan, r0, r1, *, sampling: int = 1,
     shift = float(np.hypot(y0 - y0o, x0 - x0o))
     R = 0.5 * (r0 + r1)
     ok_scale = (0.5 * R <= a <= 2.0 * R) and (0.5 * R <= b <= 2.0 * R)
+    qc = _pipeline().ellipse_fit_quality((y0, x0, a, b, theta), origin, (r0, r1),
+                                         sampling=int(sampling))
     _log(log, f"[{scan.name}] ellipse fit: a={a:.3f} b={b:.3f} "
-              f"theta={np.degrees(theta):.2f}deg shift={shift:.2f}px scale_ok={ok_scale}")
+              f"theta={np.degrees(theta):.2f}deg shift={shift:.2f}px scale_ok={ok_scale}"
+              + ("" if qc["ok"] else " -- would be REJECTED: " + "; ".join(qc["reasons"])))
     return {"ok": True, "img": img, "origin": origin, "p_ellipse": (y0, x0, a, b, theta),
             "a": a, "b": b, "theta": theta, "ab": (a / b if b else float("nan")),
-            "shift": shift, "ok_scale": ok_scale, "R": R, "r0": r0, "r1": r1}
+            "shift": shift, "ok_scale": ok_scale, "R": R, "r0": r0, "r1": r1,
+            "qc_ok": qc["ok"], "qc_reasons": qc["reasons"]}
 
 
 def apply_ellipse_fit(scan: Scan, p_ellipse, *, r_range=None,
@@ -2852,6 +2874,27 @@ def ensure_origin_for_qpixel(scan: Scan, *, log: Log = None) -> None:
             f"cannot fit Q-pixel. Re-run Origin (Apply calibration) and check the log.")
 
 
+#: Q-pixel fit sanity (M2): warn when the fit moves this far from the seed, or when
+#: it runs on a calibration ROI with fewer patterns than this.
+Q_FIT_MAX_REL_DEV = 0.05
+MIN_Q_ROI_PATTERNS = 1000
+
+
+def q_pixel_fit_warnings(*, px_guess: float, px_fit: float, use_roi: bool,
+                         n_patterns: int) -> list:
+    """Warnings for a calibrate_pixel_size result (empty list = nothing suspicious).
+    Scan01, 162 px ROI: 0.030512 vs seed 0.0224 (+41 %), a spurious fit."""
+    out = []
+    if px_guess > 0 and abs(px_fit / px_guess - 1.0) > Q_FIT_MAX_REL_DEV:
+        out.append(f"fitted {px_fit:.6g} is {100 * (px_fit / px_guess - 1):+.1f} % from the "
+                   f"seed {px_guess:.6g} (limit +-{100 * Q_FIT_MAX_REL_DEV:.0f} %): check the "
+                   f"crystal, k_max and the seed")
+    if use_roi and 0 < n_patterns < MIN_Q_ROI_PATTERNS:
+        out.append(f"fitted on a ROI of {n_patterns} patterns (< {MIN_Q_ROI_PATTERNS}); "
+                   f"q_use_roi = False uses the whole scan")
+    return out
+
+
 def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                       make_figure: bool = True, log: Log = None) -> float:
     """Calibrate the Q pixel size (notebook cell 37).
@@ -2860,8 +2903,9 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                 ``crystal.calibrate_pixel_size`` over braggpeaks (masked to the
                 shared ROI when ``q_use_roi``), and store the fitted px in
                 ``scan.params.q_px_fitted`` (the guess ``q_px`` is left untouched).
-                NOTE: calibrate_pixel_size fits from the structure factors — the
-                guess does not seed it, so the fitted value is what gets used.
+                NOTE: calibrate_pixel_size starts from the guess (it is pushed onto
+                the calibration first) and fits the structure factors; the fitted
+                value is what gets used. A fit far from the seed is warned about.
                 Requires a calibrated origin (auto-runs Origin from center_guess
                 when missing).
     refit=False : use ``params.q_px`` (the GUESS) directly as the pixel size, no
@@ -2917,6 +2961,11 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
     p.q_px_fitted = px_fit
     _log(log, f"[{scan.name}] Q-pixel refit ({p.cal_crystal}): guess={p.q_px:.6g} → "
               f"fitted={px_fit:.6g} A^-1/px (use_roi={p.q_use_roi})")
+    n_roi = (int(np.asarray(st.roi_mask).sum())
+             if getattr(st, "roi_mask", None) is not None else 0)
+    for w in q_pixel_fit_warnings(px_guess=float(p.q_px), px_fit=px_fit,
+                                  use_roi=bool(p.q_use_roi), n_patterns=n_roi):
+        _log(log, f"WARNING [{scan.name}] Q pixel: {w}")
     if make_figure:
         import threading
         if threading.current_thread() is threading.main_thread():
