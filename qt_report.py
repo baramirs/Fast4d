@@ -562,6 +562,10 @@ class ReportPanel(QtWidgets.QWidget):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
             sc = scans[scan_idx]
+            if E.scan_is_computing(sc):          # worker is still drawing/saving it
+                self._status.setText(f"{sc.name} is being computed — shown when it finishes.")
+                self._set_figure(None)
+                return
             if key == "indexing":
                 fig = self._resolve_indexing_figure(sc)
             else:

@@ -901,6 +901,11 @@ class ClickableFigureLabel(QtWidgets.QLabel):
         return self._fig
 
     def mousePressEvent(self, ev) -> None:
+        if self._scan is not None:
+            import engine as E
+            if E.scan_is_computing(self._scan):   # the worker is drawing/saving it now
+                self.setToolTip("Being computed — open it when the file finishes.")
+                return
         fig = self._resolve_fig()
         host = self.window()
         if host is not None and not hasattr(host, "_figure_windows"):

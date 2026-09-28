@@ -110,14 +110,39 @@ class _GroupTable(QtWidgets.QTableWidget):
                 row = n_param + fi
                 self.setRowHeight(row, 152)
                 for c, sc in enumerate(scans):
-                    fig = (sc.figures or {}).get(fk)
-                    spill = E.resolve_figure_path(sc, fk) if not fig else ""
-                    self.setCellWidget(row, c, ClickableFigureLabel(
-                        fig, spill_path=spill, title=f"{sc.name} — {fk}",
-                        scan=sc, fig_key=fk))
+                    self._make_fig_cell(row, c, sc, fk)
+
+    def _make_fig_cell(self, row: int, c: int, sc, fk: str) -> None:
+        if E.scan_is_computing(sc):
+            # the worker is creating/saving these figures right now;
+            # rendering them here raced savefig (shrunk strain window)
+            lab = QtWidgets.QLabel("computing…")
+            lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lab.setStyleSheet("color:#90A4AE;")
+            self.setCellWidget(row, c, lab)
+            return
+        fig = (sc.figures or {}).get(fk)
+        spill = E.resolve_figure_path(sc, fk) if not fig else ""
+        self.setCellWidget(row, c, ClickableFigureLabel(
+            fig, spill_path=spill, title=f"{sc.name} — {fk}",
+            scan=sc, fig_key=fk))
 
     def reload(self) -> None:
         self.build()
+
+    def refresh_column(self, c: int) -> None:
+        """Rebuild only file column ``c`` (params + figures). After one file of a
+        multi-file Compute this replaces a full rebuild, which re-rendered every
+        file's thumbnails on the GUI thread (5-12 s per file, growing with N)."""
+        scans = self._get_scans() or []
+        if not (0 <= c < len(scans)) or self.columnCount() != len(scans):
+            self.build()
+            return
+        sc = scans[c]
+        for r, (sk, spec) in enumerate(self._rows):
+            self._make_cell(r, c, sc, spec, sk)
+        for fi, fk in enumerate(self._fig_keys):
+            self._make_fig_cell(len(self._rows) + fi, c, sc, fk)
 
     # ── cells ──────────────────────────────────────────────────────────────
     def _readonly_item(self, text: str) -> QtWidgets.QTableWidgetItem:
@@ -402,6 +427,17 @@ class ParamTable(QtWidgets.QWidget):
         for tbl in self._tables.values():
             tbl.reload()
         self.report_refresh()
+
+    def refresh_scan(self, scan) -> None:
+        """Refresh one file's column in every step table (see _GroupTable.refresh_column)."""
+        scans = self._get_scans() or []
+        try:
+            c = next(i for i, s in enumerate(scans) if s is scan)
+        except StopIteration:
+            self.reload()
+            return
+        for tbl in self._tables.values():
+            tbl.refresh_column(c)
         self._status.setText("Reloaded from params.")
 
     @property

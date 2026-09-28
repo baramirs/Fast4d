@@ -208,6 +208,9 @@ def compute_scan(scan: E.Scan, opts: ComputeOptions | None = None, *,
     t0 = time.perf_counter()
     path = E.analysis_path(scan)
     out = ScanOutcome(scan=scan, ok=False, path=path)
+    # while "computing" the GUI must not draw this scan's figures: the worker creates
+    # and saves them (savefig changes fig.dpi) -- see engine.scan_is_computing
+    scan.status = "computing"
 
     E.set_figure_policy(
         mode=opts.figure_mode,

@@ -7237,9 +7237,13 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._console.log(
                 f"[{sc.name}] GUI updated after file finished "
                 f"({'OK' if getattr(outcome, 'ok', False) else 'FAILED'}).")
-        # Rebuild table figure cells now, so calibration/strain/stress images appear
-        # as each file finishes instead of waiting for the whole batch.
-        self._params.reload()
+        # Refresh ONLY this file's column so its calibration/strain/stress images appear
+        # as it finishes; a full reload re-rendered every file's thumbnails (5-12 s of
+        # frozen GUI per file, growing with the number of files).
+        if sc is not None:
+            self._params.refresh_scan(sc)
+        else:
+            self._params.reload()
         self._refresh_files()
         self._update_active_views()
         self._params.report_refresh()

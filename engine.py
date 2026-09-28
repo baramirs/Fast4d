@@ -2909,8 +2909,34 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
         if threading.current_thread() is threading.main_thread():
             register_q_pixel_fit_figure(scan, log=log)
         else:
-            scan._defer_qpixel_figure = True          # flushed on GUI thread after Compute
+            # Worker thread: build the overlay at the fitted px NOW, while braggpeaks
+            # are in RAM. Deferring the py4DSTEM FIT plot to the GUI thread made the GUI
+            # reload braggpeaks (freed after each file) and re-run the fit there:
+            # 38-87 s of frozen GUI per file in a multi-file Compute.
+            _register_q_pixel_overlay_in_worker(scan, px_fit, log=log)
     return px_fit
+
+
+def _register_q_pixel_overlay_in_worker(scan: Scan, px_fit: float, *, log: Log = None) -> None:
+    """Theory/experimental scattering overlay at the fitted px, with the guess/fit
+    box; no refit, and pyplot only under Agg (as the strain figures)."""
+    pl = _pipeline()
+    st = _set_q_crystal(scan)
+    p = scan.params
+    try:
+        fig = pl._with_plot_suppressed(lambda: pl.q_pixel_overlay_figure(
+            st, px=float(px_fit), k_max=float(p.q_kmax), bragg_k_power=float(p.q_kpow),
+            use_roi=bool(p.q_use_roi), log=log))
+        pl._annotate_q_pixel_fit(fig, float(p.q_px), float(px_fit), bool(p.q_use_roi),
+                                 float(p.q_kpow), float(p.q_kmax))
+        register_figure(scan, "q_pixel", fig, force=True)
+    except Exception as exc:
+        _log(log, f"[{scan.name}] q-pixel overlay figure skipped: {exc}")
+
+
+def scan_is_computing(scan) -> bool:
+    """True while a Compute worker is running this scan (driver.compute_scan)."""
+    return getattr(scan, "status", "") == "computing"
 
 
 def register_q_pixel_fit_figure(scan: Scan, *, log: Log = None) -> bool:
