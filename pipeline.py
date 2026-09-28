@@ -2551,11 +2551,20 @@ def build_origin_correction_result_figure(
 
 
 def _braggpeaks_for_roi_from_bp(braggpeaks, state: WorkflowState, use_roi: bool = True):
+    """The braggpeaks inside the calibration ROI (``use_roi`` and a ROI set), else all.
+    A ROI that cannot be applied raises: falling back to the whole scan would run a
+    ROI-based fit (Q pixel, ellipse) on other data without telling anybody."""
     if use_roi and state.roi_mask is not None:
+        roi = np.asarray(state.roi_mask, dtype=bool)
+        rshape = tuple(int(v) for v in (getattr(braggpeaks, "Rshape", None) or roi.shape))
+        if roi.shape != rshape:
+            raise RuntimeError(f"Calibration ROI mask shape {roi.shape} does not match the "
+                               f"scan {rshape}: set the ROI again on this scan.")
         try:
-            return braggpeaks.mask_in_R(mask=~state.roi_mask)
-        except Exception:
-            return braggpeaks
+            return braggpeaks.mask_in_R(mask=~roi)
+        except Exception as exc:
+            raise RuntimeError(f"Could not restrict the braggpeaks to the calibration ROI "
+                               f"(mask_in_R: {exc}).") from exc
     return braggpeaks
 
 
