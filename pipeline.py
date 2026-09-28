@@ -4631,6 +4631,11 @@ def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, lab
                            f"({CF.hkl_str(spec['g1_hkl'])}), ({CF.hkl_str(spec['g2_hkl'])})")
     try:
         g1, g2, src = _reference_g12_for_frame(strainmap, kwargs.get("gvects"))
+        # the auto basis may return any equivalent pair ({111} at 70.5 or 109.5 deg):
+        # fix the label signs from the measured angle, or x lands 90 deg off
+        spec, lab = CF.resolve_labels(g1, g2, spec)
+        if lab["changed"]:
+            _log(log, f"Crystal frame [{label}]: {lab['text']}")
         fr = CF.frame_from_g(g1, g2, spec)
     except Exception as exc:
         _log(log, f"Crystal frame: could not evaluate ({exc}); keeping the typed "
@@ -4664,6 +4669,7 @@ def _apply_crystal_frame(state: WorkflowState, strainmap: Any, kwargs: dict, lab
         g_angle_meas_deg=fr["g_angle_meas_deg"], g_angle_pred_deg=fr["g_angle_pred_deg"],
         label_err_deg=fr["label_err_deg"], label_ok=fr["label_ok"],
         qr_rotation=sbp.get("qr_rotation"), qr_flip=sbp.get("qr_flip"),
+        label_resolution=lab["text"],
         assumptions=assumptions)
     if manual and abs(card["residual_rotation_deg"]) > CF.ANGLE_TOL_DEG:
         _log(log, f"Crystal frame [{label}] (manual): coordinate_rotation {typed:.2f} deg is "

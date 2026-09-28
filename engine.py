@@ -3454,8 +3454,6 @@ def build_bvm_frame_figures(scan: Scan, *, label: str = "without_roi"):
     qx = np.asarray(bdd["qx"], float); qy = np.asarray(bdd["qy"], float)
     i1 = np.asarray(bdd["g1_ind"], int); i2 = np.asarray(bdd["g2_ind"], int)
     spec = scan.params.crystal_frame_spec()
-    g1_hkl = np.asarray(spec["g1_hkl"], float); g2_hkl = np.asarray(spec["g2_hkl"], float)
-
     card = (getattr(st, "crystal_frame_cards", {}) or {}).get(label) or {}
     if card.get("g1_ref_qxy") is not None:
         g1 = np.asarray(card["g1_ref_qxy"], float); g2 = np.asarray(card["g2_ref_qxy"], float)
@@ -3463,6 +3461,9 @@ def build_bvm_frame_figures(scan: Scan, *, label: str = "without_roi"):
     else:
         g1 = np.asarray(sm.g1, float).ravel()[:2]; g2 = np.asarray(sm.g2, float).ravel()[:2]
         g_src = "basis g1, g2"
+    # same label signs as the tensor (see crystal_frame.resolve_labels)
+    spec, lab = CF.resolve_labels(g1, g2, spec)
+    g1_hkl = np.asarray(spec["g1_hkl"], float); g2_hkl = np.asarray(spec["g2_hkl"], float)
     fr = CF.frame_from_g(g1, g2, spec)
 
     # log scale: the BVM spans orders of magnitude between (000) and the outer spots
@@ -3512,6 +3513,7 @@ def build_bvm_frame_figures(scan: Scan, *, label: str = "without_roi"):
     _arrow(g1, "#ef5350", f"g1 {_hkl_text(g1_hkl)}", lw=2.2)
     _arrow(g2, "#ff9800", f"g2 {_hkl_text(g2_hkl)}", lw=2.2)
     info = [f"g from: {g_src}",
+            *([lab["text"]] if lab["changed"] else []),
             f"x = {CF.combo_label(fr['x_combo'])},  y = {CF.combo_label(fr['y_combo'])}",
             f"coordinate_rotation = {fr['angle_deg']:.2f} deg",
             f"g1^g2 measured {fr['g_angle_meas_deg']:.2f} deg / predicted "

@@ -157,6 +157,46 @@ def frame_from_g(g1_qxy, g2_qxy, spec=None, B=None):
                               and abs(ratio_meas / ratio_pred - 1.0) < 0.05))
 
 
+def resolve_labels(g1_qxy, g2_qxy, spec=None, B=None):
+    """Signs of the g1 / g2 hkl labels that fit the MEASURED pair.
+
+    The automatic basis choice may return any pair of symmetry-equivalent spots:
+    on Si [110] the four {111} have the same length, and a pair at 70.5 deg gets
+    picked as readily as one at 109.5 deg. With fixed labels (-1 1 1), (1 -1 1)
+    the 70.5 deg pair made x = g1 - g2 point along [001], not [-110] (90 deg
+    off: exx and eyy swapped). The measured angle between g1 and g2 tells which
+    signs apply: (s1*g1_hkl, s2*g2_hkl) with s = +-1 is chosen to best match the
+    measured angle and length ratio, keeping the given labels on ties. Every
+    candidate that fits places x on the same crystal LINE, so the tensor is
+    determined (its sign along x is irrelevant).
+
+    Returns (spec_resolved, info) with info = dict(changed, signs, err_deg, text).
+    """
+    spec = dict(DEFAULT_SPEC if spec is None else spec)
+    g1 = np.asarray(g1_qxy, float).ravel()[:2]
+    g2 = np.asarray(g2_qxy, float).ravel()[:2]
+    ang_meas = _between(g1, g2)
+    ratio_meas = float(np.linalg.norm(g1) / np.linalg.norm(g2))
+    h1 = np.asarray(spec["g1_hkl"], float)
+    h2 = np.asarray(spec["g2_hkl"], float)
+    best = None
+    for s1, s2 in ((1, 1), (1, -1), (-1, 1), (-1, -1)):       # given labels first
+        v1, v2 = _v(s1 * h1, B), _v(s2 * h2, B)
+        err = (abs(ang_meas - _between(v1, v2))
+               + 100.0 * abs(ratio_meas / float(np.linalg.norm(v1) / np.linalg.norm(v2)) - 1.0))
+        if best is None or err < best[0] - 1e-9:
+            best = (err, s1, s2)
+    err, s1, s2 = best
+    out = dict(spec, g1_hkl=[int(round(v)) for v in s1 * h1],
+               g2_hkl=[int(round(v)) for v in s2 * h2])
+    changed = (s1, s2) != (1, 1)
+    text = ("labels as given" if not changed else
+            f"labels re-signed to fit g1^g2 = {ang_meas:.2f} deg: g1 ({hkl_str(out['g1_hkl'])}), "
+            f"g2 ({hkl_str(out['g2_hkl'])}) instead of ({hkl_str(h1)}), ({hkl_str(h2)})")
+    return out, dict(changed=bool(changed), signs=[int(s1), int(s2)], err_deg=float(err),
+                     text=text)
+
+
 def combo_label(ab, names=("g1", "g2")):
     """'g1 - g2' style text for a combination (direction only: the largest
     coefficient is scaled to 1)."""
