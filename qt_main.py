@@ -6296,6 +6296,15 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._console.log(
                 f"[{sc.name}] GUI updated after file finished "
                 f"({'OK' if getattr(outcome, 'ok', False) else 'FAILED'}).")
+            try:                                   # warn only: a frame ~90 deg off = mislabelled pair
+                for o in E.frame_rotation_outliers(self._scans):
+                    if o["name"] == sc.name:
+                        self._console.log(
+                            f"WARNING [{sc.name}] coordinate_rotation {o['angle_deg']:.2f} deg is "
+                            f"{o['diff_deg']:+.1f} deg from the session ({o['session_deg']:.2f} deg, "
+                            f"modulo 180) -- check the g1/g2 labels / indexing of this scan.")
+            except Exception:
+                pass
         # Refresh ONLY this file's column so its calibration/strain/stress images appear
         # as it finishes; a full reload re-rendered every file's thumbnails (5-12 s of
         # frozen GUI per file, growing with the number of files).

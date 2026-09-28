@@ -37,3 +37,17 @@ def test_scan01_gets_the_same_x_line_as_the_others():
 def test_resolved_labels_stay_in_zone():
     spec, _ = CF.resolve_labels(*SCAN01, SPEC)
     assert CF.check_spec(spec) == []
+
+
+def test_rotation_outlier_warning_ignores_180():
+    import engine as E
+    scans = []
+    for name, ang in (("a", 174.3), ("b", 175.5), ("c", 354.8), ("d", 264.3), ("e", 175.2)):
+        s = E.Scan(name=name)
+        s.params.coordinate_rotation = ang
+        s.status = "done"
+        scans.append(s)
+    out = E.frame_rotation_outliers(scans, tol_deg=10.0)
+    assert [o["name"] for o in out] == ["d"]              # 354.8 = 174.8 + 180 is fine
+    assert abs(abs(out[0]["diff_deg"]) - 90.0) < 2.0
+    assert E.frame_rotation_outliers(scans[:2]) == []      # too few scans to judge

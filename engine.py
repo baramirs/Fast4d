@@ -3427,6 +3427,34 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     return result
 
 
+def frame_rotation_outliers(scans: list, tol_deg: float = 10.0) -> list:
+    """Computed scans whose crystal-frame ``coordinate_rotation`` departs from the
+    session's by more than ``tol_deg``, ignoring 180 deg (x and -x give the same
+    tensor). The session value is the axial mean (mean of 2*theta, halved).
+    Needs >= 3 computed scans. Warning only: nothing is changed.
+    Returns [{name, angle_deg, session_deg, diff_deg}]."""
+    pts = []
+    for sc in scans or []:
+        p = getattr(sc, "params", None)
+        if (p is None or getattr(sc, "status", "") != "done"
+                or str(getattr(p, "frame_mode", "crystal") or "crystal") != "crystal"):
+            continue
+        try:
+            pts.append((sc.name, float(p.coordinate_rotation)))
+        except (TypeError, ValueError):
+            continue
+    if len(pts) < 3:
+        return []
+    two = np.deg2rad([2.0 * a for _n, a in pts])
+    ref = float(np.rad2deg(np.arctan2(np.sin(two).sum(), np.cos(two).sum())) / 2.0) % 180.0
+    out = []
+    for name, a in pts:
+        d = ((a - ref + 90.0) % 180.0) - 90.0
+        if abs(d) > float(tol_deg):
+            out.append({"name": name, "angle_deg": a, "session_deg": ref, "diff_deg": d})
+    return out
+
+
 def _hkl_text(hkl) -> str:
     """'(-1 1 1)' -- plain hyphen, spaces between indices."""
     return "(" + " ".join(str(int(round(v))) for v in hkl) + ")"
