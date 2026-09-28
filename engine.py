@@ -65,6 +65,11 @@ def _batch():
     return fast_batch
 
 
+def _figsave():
+    import figsave
+    return figsave
+
+
 def _new_state():
     from state import WorkflowState
     return WorkflowState()
@@ -1234,7 +1239,7 @@ def spill_figure_to_disk(scan: "Scan", key: str, fig, *, dpi: int | None = None,
     dpi = int(_figure_policy.spill_dpi if dpi is None else dpi)
     path = _spill_dir(scan) / f"{key}.png"
     try:
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        _figsave().savefig(fig, path, dpi=dpi, bbox_inches="tight")   # queued off the GUI thread
         scan.figure_spill[key] = str(path)
         _log(log, f"[{scan.name}] figure '{key}' spilled → {path.name} (dpi={dpi})")
         return str(path)
@@ -1550,7 +1555,9 @@ def save_figures(scan: "Scan", out_dir: str | "Path", *, dpi: int | None = None,
     for key, fig in collect_figures(scan).items():
         try:
             p = d / f"{key}.png"
-            fig.savefig(p, dpi=dpi, bbox_inches="tight")
+            # off the GUI thread this is queued (figsave): a worker savefig(dpi=300)
+            # on a figure the GUI shows left the strain window shrunk
+            _figsave().savefig(fig, p, dpi=dpi, bbox_inches="tight")
             written.append(p)
         except Exception as exc:
             _log(log, f"[{scan.name}] could not save figure {key}: {exc}")

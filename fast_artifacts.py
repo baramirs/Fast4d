@@ -39,6 +39,11 @@ from typing import Any, Callable
 
 import numpy as np
 
+try:  # the GUI shows these same figures: never savefig them from a worker thread
+    from figsave import savefig as _figsave_savefig
+except ImportError:
+    from .figsave import savefig as _figsave_savefig
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
@@ -479,7 +484,7 @@ def save_fast_artifacts(
                 safe = str(key).replace("/", "_").replace(" ", "_")
                 path = fig_dir / f"{prefix}_{safe}.png"
                 try:
-                    fig.savefig(path, dpi=200, bbox_inches="tight")
+                    _figsave_savefig(fig, path, dpi=200, bbox_inches="tight")  # queued off the GUI thread
                     written.append(path)
                 except Exception as exc:
                     _log(log, f"  note: could not save figure {key}: {exc}")
