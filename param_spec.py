@@ -64,7 +64,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
     ],
     "qpixel": [
         ParamSpec("cal_crystal", "Crystal", "enum", ("Si", "Au", "Custom", "CIF")),
-        ParamSpec("cif_path", "CIF path", "scan_path", readonly=True),
+        # cif_path: set by "Load CIF…" in the Calibration crystal dialog, only read when
+        # Crystal = CIF; the table row just repeated it, so it is not shown.
         ParamSpec("q_refit", "Refit px (off = use guess)", "bool"),
         ParamSpec("q_px", "px_guess (A^-1/px)", "float", decimals=5),
         ParamSpec("q_px_fitted", "px_fitted (A^-1/px)", "fitted", decimals=5, readonly=True),
