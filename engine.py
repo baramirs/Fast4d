@@ -3973,10 +3973,7 @@ def place_line_from_spec(scans: list, line_id: str, spec: dict, *,
     lid = str(line_id)
     for sc in scans:
         H, W = _scan_shape(sc)
-        if sc is template_scan:
-            dx = dy = 0.0
-        else:
-            dx, dy = _line_drift_shift(sc, use_drift=use_drift)
+        dx, dy = relative_drift_shift(sc, template_scan, use_drift=use_drift)
         seg = _spec_to_segment(spec, H, W, dx, dy)
         lines = dict(getattr(sc, "lines", None) or {})
         lines[lid] = seg
@@ -4234,10 +4231,12 @@ def _normalize_roi(v) -> list:
                 xs = [float(a[0]), float(b[0])]; ys = [float(a[1]), float(b[1])]
             else:
                 return []
-        elif isinstance(v, (list, tuple)) and len(v) == 4 \
-                and all(isinstance(t, (int, float)) for t in v):
-            return [float(min(v[0], v[1])), float(max(v[0], v[1])),
-                    float(min(v[2], v[3])), float(max(v[2], v[3]))]
+        elif isinstance(v, (list, tuple)) and len(v) in (4, 5) \
+                and all(isinstance(t, (int, float, np.integer, np.floating)) for t in v):
+            out = [float(min(v[0], v[1])), float(max(v[0], v[1])),
+                   float(min(v[2], v[3])), float(max(v[2], v[3]))]
+            ang = float(v[4]) if len(v) == 5 else 0.0
+            return out + [ang] if ang else out          # 5th value = rotation (deg)
         elif isinstance(v, (list, tuple)) and len(v) == 2 \
                 and all(isinstance(t, (list, tuple)) for t in v):       # corners
             xs = [float(v[0][0]), float(v[1][0])]; ys = [float(v[0][1]), float(v[1][1])]
@@ -4248,10 +4247,86 @@ def _normalize_roi(v) -> list:
     return [min(xs), max(xs), min(ys), max(ys)]
 
 
+def roi_angle(roi) -> float:
+    """Rotation (degrees) of an ROI [x0,x1,y0,y1(,angle)]; 4 values = 0."""
+    return float(roi[4]) if roi is not None and len(roi) >= 5 else 0.0
+
+
+def roi_corners(roi) -> "np.ndarray":
+    """(4,2) corners (x, y) of an ROI [x0,x1,y0,y1(,angle)], rotated about its
+    centre by ``angle`` (deg; +x toward +y, the image/pyqtgraph convention)."""
+    x0, x1, y0, y1 = (float(v) for v in roi[:4])
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    hw, hh = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+    a = np.deg2rad(roi_angle(roi))
+    c, s = np.cos(a), np.sin(a)
+    loc = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]])
+    return np.column_stack([cx + loc[:, 0] * c - loc[:, 1] * s,
+                            cy + loc[:, 0] * s + loc[:, 1] * c])
+
+
+def roi_mask(shape, roi) -> "np.ndarray":
+    """Boolean (H,W) mask of the pixels inside an ROI [x0,x1,y0,y1(,angle_deg)]
+    (x = column, y = row). Angle 0 is the inclusive rectangle clamped to the image
+    (identical to the pre-rotation behaviour); otherwise a pixel is inside when its
+    coordinates, in the ROI frame rotated about the centre, fall within the
+    half-sides. The single ROI definition for the live tool, roi_profiles,
+    summaries and the reproducibility plugin."""
+    H, W = int(shape[0]), int(shape[1])
+    m = np.zeros((H, W), dtype=bool)
+    if roi is None or len(roi) < 4 or H == 0 or W == 0:
+        return m
+    ang = roi_angle(roi)
+    if not ang:
+        x0, x1, y0, y1 = (int(round(float(b))) for b in roi[:4])
+        x0, x1 = sorted((max(0, min(x0, W - 1)), max(0, min(x1, W - 1))))
+        y0, y1 = sorted((max(0, min(y0, H - 1)), max(0, min(y1, H - 1))))
+        m[y0:y1 + 1, x0:x1 + 1] = True
+        return m
+    x0, x1, y0, y1 = (float(v) for v in roi[:4])
+    x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    hw, hh = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+    a = np.deg2rad(ang)
+    c, s = np.cos(a), np.sin(a)
+    yy, xx = np.mgrid[0:H, 0:W]
+    u = (xx - cx) * c + (yy - cy) * s
+    v = -(xx - cx) * s + (yy - cy) * c
+    eps = 1e-9
+    return (np.abs(u) <= hw + eps) & (np.abs(v) <= hh + eps)
+
+
+def _roi_patch(roi, **kw):
+    """A matplotlib Polygon outlining an (optionally rotated) ROI."""
+    from matplotlib.patches import Polygon
+    return Polygon(roi_corners(roi), closed=True, fill=False, **kw)
+
+
+LINE_WIDTH_MAX = 200
+
+
+def clamp_line_width(width) -> int:
+    """Line integration width in px, limited to 1..LINE_WIDTH_MAX."""
+    return int(max(1, min(int(float(width)), LINE_WIDTH_MAX)))
+
+
+def relative_drift_shift(scan: "Scan", template: "Scan", *, use_drift: bool) -> tuple:
+    """(dx, dy) that moves an element drawn on ``template`` onto ``scan``:
+    ``-(drift_scan - drift_template)``. A template without drift is the drift
+    reference (drift 0), which reduces to the old ``-drift_scan``."""
+    if not use_drift or scan is template or not getattr(scan, "drift", None):
+        return 0.0, 0.0
+    t = getattr(template, "drift", None) or (0.0, 0.0)
+    return (-(float(scan.drift[0]) - float(t[0])) + 0.0,
+            -(float(scan.drift[1]) - float(t[1])) + 0.0)
+
+
 def _roi_shift_clamp(bounds: list, H: int, W: int, dx: float = 0.0, dy: float = 0.0) -> list:
-    """Shift an ROI [x0,x1,y0,y1] by (dx,dy) and CLAMP to the image: x∈[0,W-1],
-    y∈[0,H-1] (same condition as the lines — never exceed the image limit)."""
-    x0, x1, y0, y1 = (float(b) for b in bounds)
+    """Shift an ROI [x0,x1,y0,y1(,angle)] by (dx,dy) and CLAMP to the image:
+    x∈[0,W-1], y∈[0,H-1] (same condition as the lines — never exceed the image
+    limit). The rotation angle, when present, is kept."""
+    ang = roi_angle(bounds)
+    x0, x1, y0, y1 = (float(b) for b in bounds[:4])
 
     def cx(x):
         return int(max(0, min(round(x), int(W) - 1)))
@@ -4261,7 +4336,8 @@ def _roi_shift_clamp(bounds: list, H: int, W: int, dx: float = 0.0, dy: float = 
 
     nx0, nx1 = cx(x0 + dx), cx(x1 + dx)
     ny0, ny1 = cy(y0 + dy), cy(y1 + dy)
-    return [min(nx0, nx1), max(nx0, nx1), min(ny0, ny1), max(ny0, ny1)]
+    out = [min(nx0, nx1), max(nx0, nx1), min(ny0, ny1), max(ny0, ny1)]
+    return out + [ang] if ang else out
 
 
 def propagate_template_roi(scans: list, roi_bounds: list, *, use_drift: bool = False,
@@ -4345,10 +4421,7 @@ def place_roi_from_spec(scans: list, roi_id: str, bounds: list, *,
         return
     for sc in scans:
         H, W = _scan_shape(sc)
-        if sc is template_scan:
-            dx = dy = 0.0
-        else:
-            dx, dy = _line_drift_shift(sc, use_drift=use_drift)
+        dx, dy = relative_drift_shift(sc, template_scan, use_drift=use_drift)
         rois = dict(scan_area_rois(sc))
         rois[rid] = _roi_shift_clamp(tpl, H, W, dx, dy)
         sc.area_rois = rois
@@ -4378,9 +4451,8 @@ def scan_area_roi_segments(scan: "Scan") -> dict:
     """Each ROI as 4 closed segments {roi_id: [[ [x0,y0],[x1,y0] ], …]} for overlays."""
     out: dict = {}
     for rid, b in scan_area_rois(scan).items():
-        x0, x1, y0, y1 = b
-        out[rid] = [[[x0, y0], [x1, y0]], [[x1, y0], [x1, y1]],
-                    [[x1, y1], [x0, y1]], [[x0, y1], [x0, y0]]]
+        c = [[float(x), float(y)] for x, y in roi_corners(b)]
+        out[rid] = [[c[i], c[(i + 1) % 4]] for i in range(4)]
     return out
 
 
@@ -4489,10 +4561,9 @@ def build_lines_overlay_figure(scan: "Scan"):
     rois = scan_area_rois(scan)                        # ALL multi analysis ROIs
     if rois:
         for i, rid in enumerate(sorted(rois)):
-            rx0, rx1, ry0, ry1 = rois[rid]
+            rx0, rx1, ry0, ry1 = rois[rid][:4]
             c = SIX_POINT_COLORS[i % len(SIX_POINT_COLORS)]
-            ax.add_patch(plt_Rectangle((rx0, ry0), rx1 - rx0, ry1 - ry0,
-                                       fill=False, edgecolor=c, lw=1.6))
+            ax.add_patch(_roi_patch(rois[rid], edgecolor=c, lw=1.6))
             ax.text(rx0 + 2, ry1 - 2, rid, color=c, fontsize=7, va="top")
     else:                                              # fallback: calibration ROI (dashed cyan)
         roi = scan_display_roi(scan)
@@ -4696,7 +4767,7 @@ def _line_samples(arr2d, seg, *, width: int = 3, n: int | None = None):
         px, py = -uy, ux                      # perpendicular unit
     else:
         px = py = 0.0
-    w = max(1, int(width))
+    w = clamp_line_width(width)                # 1..LINE_WIDTH_MAX px
     offs = np.arange(w) - (w - 1) / 2.0
     acc = np.zeros(npts, dtype=float)
     arr = np.asarray(arr2d, dtype=float)
@@ -5226,11 +5297,7 @@ def _roi_region_values(arr2d, bounds) -> "np.ndarray":
     a = np.asarray(arr2d, dtype=float)
     if a.ndim != 2:
         return np.zeros(0)
-    H, W = a.shape
-    x0, x1, y0, y1 = (int(round(float(b))) for b in bounds)
-    x0, x1 = sorted((max(0, min(x0, W - 1)), max(0, min(x1, W - 1))))
-    y0, y1 = sorted((max(0, min(y0, H - 1)), max(0, min(y1, H - 1))))
-    sub = a[y0:y1 + 1, x0:x1 + 1]
+    sub = a[roi_mask(a.shape, bounds)]          # angle 0 = the inclusive rectangle
     v = sub[np.isfinite(sub)]
     return v.ravel()
 
@@ -5301,9 +5368,8 @@ def build_roi_profiles_figure(scan: "Scan", label: str = "without_roi",
     means, stds, errn = [], [], []
     for i, rid in enumerate(ids):
         c = SIX_POINT_COLORS[i % len(SIX_POINT_COLORS)]
-        x0, x1, y0, y1 = scan_area_rois(scan)[rid]
-        ax_map.add_patch(plt_Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                       fill=False, edgecolor=c, lw=1.6))
+        x0, x1, y0, y1 = scan_area_rois(scan)[rid][:4]
+        ax_map.add_patch(_roi_patch(scan_area_rois(scan)[rid], edgecolor=c, lw=1.6))
         ax_map.text(x0 + 2, y0 - 2, rid, color=c, fontsize=7, va="bottom")
         st = prof.get(rid, {}).get(channel, {})
         means.append(st.get("mean", float("nan")))
@@ -5347,9 +5413,8 @@ def build_roi_distribution_figure(scan: "Scan", label: str = "without_roi",
             ax_map.imshow(base, cmap="RdBu_r", vmin=-mm, vmax=mm, origin="upper")
     for i, rid in enumerate(sorted(rois)):
         c = SIX_POINT_COLORS[i % len(SIX_POINT_COLORS)]
-        x0, x1, y0, y1 = rois[rid]
-        ax_map.add_patch(plt_Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                       fill=False, edgecolor=c, lw=1.6))
+        x0, x1, y0, y1 = rois[rid][:4]
+        ax_map.add_patch(_roi_patch(rois[rid], edgecolor=c, lw=1.6))
         ax_map.text(x0 + 2, y0 - 2, rid, color=c, fontsize=7, va="bottom")
     ax_map.set_title(f"{scan.name} — {ylab} ({label})", fontsize=9)
     ax_map.set_xticks([]); ax_map.set_yticks([])
@@ -5554,10 +5619,8 @@ def build_maps_with_rois_figure(scan: "Scan", label: str = "without_roi"):
                       if v.size else (float(m.min()), float(m.max() or 1)))
             ax.imshow(m, cmap=cmap, vmin=lo, vmax=hi, origin="upper")
         for j, rid in enumerate(sorted(rois)):
-            x0, x1, y0, y1 = rois[rid]
             c = SIX_POINT_COLORS[j % len(SIX_POINT_COLORS)]
-            ax.add_patch(plt_Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                       fill=False, edgecolor=c, lw=1.6))
+            ax.add_patch(_roi_patch(rois[rid], edgecolor=c, lw=1.6))
         ax.set_title(lab, fontsize=9); ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(f"{scan.name} — maps with ROIs ({label})", fontsize=10)
     return fig
@@ -5587,9 +5650,7 @@ def build_single_roi_map_figure(scan: "Scan", roi_id: str, channel: str = "eyy",
         lo, hi = ((float(np.percentile(v, 1)), float(np.percentile(v, 99)))
                   if v.size else (float(m.min()), float(m.max() or 1)))
         ax.imshow(m, cmap="gray", vmin=lo, vmax=hi, origin="upper")
-    x0, x1, y0, y1 = bounds
-    ax.add_patch(plt_Rectangle((x0, y0), x1 - x0, y1 - y0,
-                               fill=False, edgecolor="#e6194b", lw=2.0))
+    ax.add_patch(_roi_patch(bounds, edgecolor="#e6194b", lw=2.0))
     ax.set_title(f"{scan.name} — {clab} with {roi_id} ({label})", fontsize=9)
     ax.set_xticks([]); ax.set_yticks([])
     return fig

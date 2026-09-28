@@ -549,9 +549,10 @@ class AdfView(QtWidgets.QWidget):
         is checked; pass {} / [] to clear. Supersedes the single ``set_area_roi``."""
         if isinstance(rois, dict):
             self._rois_data = [(str(rid), list(b)) for rid, b in rois.items()
-                               if b and len(b) == 4]
+                               if b and len(b) in (4, 5)]
         else:
-            self._rois_data = [(None, list(b)) for b in (rois or []) if b and len(b) == 4]
+            self._rois_data = [(None, list(b)) for b in (rois or [])
+                               if b and len(b) in (4, 5)]
         self._redraw_segs()
 
     def _redraw_segs(self) -> None:
@@ -605,11 +606,13 @@ class AdfView(QtWidgets.QWidget):
         if show_roi and self._rois_data:                 # multi ROIs (colored + labeled)
             for i, (rid, b) in enumerate(self._rois_data):
                 try:
-                    x0, x1, y0, y1 = (float(v) for v in b)
+                    from engine import roi_corners
+                    cs = roi_corners(b)                  # rotated when b has an angle
                 except Exception:
                     continue
+                x0, y0 = float(cs[0][0]), float(cs[0][1])
                 c = _COLS[i % len(_COLS)]
-                it = self._pg.PlotDataItem([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+                it = self._pg.PlotDataItem(list(cs[:, 0]) + [x0], list(cs[:, 1]) + [y0],
                                            pen=self._pg.mkPen(c, width=1.7))
                 it.setZValue(10)
                 view.addItem(it)

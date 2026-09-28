@@ -4291,7 +4291,7 @@ class AreaRoiEditorDialog(QtWidgets.QDialog):
 
     def _make_rect(self, rid: str, bounds: list) -> dict:
         pg = self._pg
-        x0, x1, y0, y1 = [float(b) for b in bounds]
+        x0, x1, y0, y1 = [float(b) for b in bounds[:4]]
         color = self._color_for(len(self._entries))
         roi = pg.RectROI([x0, y0], [max(x1 - x0, 1), max(y1 - y0, 1)],
                          pen=pg.mkPen(color, width=2),
@@ -4306,7 +4306,9 @@ class AreaRoiEditorDialog(QtWidgets.QDialog):
         label.setPos(x0, y0)
         label.setZValue(11)
         self._vb.addItem(label)
-        ent = {"id": rid, "roi": roi, "label": label, "color": color}
+        # the rotation (set in the Line / ROI tool) is kept; this editor moves/resizes only
+        ent = {"id": rid, "roi": roi, "label": label, "color": color,
+               "angle": E.roi_angle(bounds)}
         roi.sigRegionChanged.connect(lambda _r, e=ent: self._on_rect_moved(e))
         self._entries.append(ent)
         return ent
@@ -4316,7 +4318,8 @@ class AreaRoiEditorDialog(QtWidgets.QDialog):
         size = ent["roi"].size()
         x0, y0 = float(pos.x()), float(pos.y())
         x1, y1 = x0 + float(size.x()), y0 + float(size.y())
-        return [round(x0, 1), round(x1, 1), round(y0, 1), round(y1, 1)]
+        out = [round(x0, 1), round(x1, 1), round(y0, 1), round(y1, 1)]
+        return out + [ent["angle"]] if ent.get("angle") else out
 
     def _on_rect_moved(self, ent: dict) -> None:
         if self._syncing:

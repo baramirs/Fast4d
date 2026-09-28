@@ -153,7 +153,13 @@ def shift_segment(seg, dx, dy):
 
 
 def _roi_mean(arr, bounds, dx=0.0, dy=0.0):
-    x0, x1, y0, y1 = [float(b) for b in bounds]
+    if len(bounds) >= 5 and float(bounds[4]):          # rotated ROI → the shared mask
+        import engine as _E
+        x0, x1, y0, y1, ang = [float(b) for b in bounds[:5]]
+        v = arr[_E.roi_mask(arr.shape, [x0 + dx, x1 + dx, y0 + dy, y1 + dy, ang])]
+        v = v[np.isfinite(v)]
+        return (float(v.mean()) if v.size else float("nan")), int(v.size)
+    x0, x1, y0, y1 = [float(b) for b in bounds[:4]]
     H, W = arr.shape
     xa, xb = sorted((x0 + dx, x1 + dx)); ya, yb = sorted((y0 + dy, y1 + dy))
     xa, ya = max(0, int(round(xa))), max(0, int(round(ya)))
