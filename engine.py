@@ -6295,7 +6295,9 @@ def _scan_metadata_dict(scan: "Scan") -> dict:
     return {
         "fast4d_version": 1,
         "name": scan.name,
-        "status": scan.status,
+        # "computing" is transient (driver.compute_scan saves before marking done):
+        # never persist it, or a reopened file stays "computing…" forever
+        "status": "done" if scan.status == "computing" else scan.status,
         "params": scan.params.to_dict(),          # all calibrations, ROI, q_px, QR,
                                                   # detection, vrange (strain ranges),
                                                   # stress, custom_crystal, 6 points…
@@ -6398,7 +6400,8 @@ def apply_metadata_to_scan(scan: "Scan", meta: dict) -> bool:
     if meta.get("drift"):
         scan.drift = tuple(meta["drift"])
     if meta.get("status"):
-        scan.status = meta["status"]
+        # heal files written while "computing" leaked into the metadata (1e197da)
+        scan.status = "done" if meta["status"] == "computing" else meta["status"]
     return True
 
 

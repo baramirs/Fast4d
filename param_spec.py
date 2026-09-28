@@ -85,16 +85,14 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("edge_boundary", "edgeBoundary", "int"),
         ParamSpec("vis_vmin", "vis vmin", "float", decimals=3),
         ParamSpec("vis_vmax", "vis vmax", "float", decimals=3),
-        ParamSpec("zone_axis", "Zone axis [uvw]", "list3"),
-        ParamSpec("real_axis_h", "Real axis H (+ry)", "list3"),
-        ParamSpec("real_axis_v", "Real axis V (+rx)", "list3"),
-        ParamSpec("indexing_orientation_mode", "Index orientation", "enum",
-                  ("unknown", "known")),
-        ParamSpec("indexing_seed", "Indexing RANSAC seed", "int"),
+        # real_axis_h/v, indexing_orientation_mode, indexing_seed belonged to the BVM
+        # indexer (not in this tree): kept on CalibrationParams for old sessions, not
+        # shown. The indexing that IS used (zone + hkl labels) lives in the Strain tab.
     ],
     "strain": [
         ParamSpec("frame_mode", "Tensor frame (crystal = auto angle)", "enum",
                   ("crystal", "manual")),
+        ParamSpec("zone_axis", "Zone axis [uvw]", "list3"),
         ParamSpec("frame_x_hkl", "Frame x || [hkl]", "list3"),
         ParamSpec("frame_y_hkl", "Frame y || [hkl]", "list3"),
         ParamSpec("frame_g1_hkl", "g1 label (hkl)", "list3"),
