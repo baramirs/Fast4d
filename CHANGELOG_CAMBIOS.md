@@ -63,5 +63,7 @@ con un generador sintetico chico (`tests/synthetic_si110.py`).
   silencio).
 - M5: las figuras de strain eligen la escala por panel (antes salian en blanco con strain
   uniaxial).
-- D1 (sin cambiar valores por defecto): medida aparte la deteccion con minRelativeIntensity
-  0.001 / q_kmax 1.6 contra los valores por defecto 0.05 / 1.0.
+- D1: nuevos valores por defecto de deteccion minRelativeIntensity 0.001 (antes 0.05) y
+  q_kmax 1.6 (antes 1.0). Medido en Scan01: con 0.05 / 1.0 el Q salia +57 % y el eje del
+  tensor girado 35 deg; con 0.001 / 1.6 se reproduce el resultado bueno. Las sesiones y .h5
+  guardados conservan sus propios valores.

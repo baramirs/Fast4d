@@ -330,7 +330,7 @@ class CalibrationParams:
     six_points: list = field(default_factory=list)   # 6 (rx, ry) on the ADF
     # find_Bragg_disks params (distinct from the basis params below)
     detect_min_absolute_intensity: int = 3
-    detect_min_relative_intensity: float = 0.05
+    detect_min_relative_intensity: float = 0.001   # notebook value; 0.05 kept only 111 / 220
     detect_min_peak_spacing: int = 10
     detect_edge_boundary: int = 10
     detect_sigma: float = 0.0
@@ -363,7 +363,7 @@ class CalibrationParams:
                                   # factors (calibrate_pixel_size; the guess seeds it). The
                                   # q-pixel figure's blue box shows guess vs fitted + delta.
                                   # False → use the guess px directly (no fit).
-    q_kmax: float = 1.0           # k_max (Å⁻¹)
+    q_kmax: float = 1.6           # k_max (Å⁻¹); 1.0 left only 111 / 220 for the Q fit
     q_kpow: float = 1.0           # bragg_k_power
     q_use_roi: bool = False       # uses the shared ROI when True
 

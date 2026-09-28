@@ -131,7 +131,7 @@ class WorkflowState:
 
     detect_params: dict[str, Any] = field(default_factory=lambda: {
         "minAbsoluteIntensity": 3,
-        "minRelativeIntensity": 0.05,
+        "minRelativeIntensity": 0.001,
         "minPeakSpacing": 10,
         "edgeBoundary": 10,
         "sigma": 0.0,
