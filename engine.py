@@ -2135,6 +2135,24 @@ def _push_detect_params(scan: Scan) -> None:
     }
 
 
+#: Above this minRelativeIntensity the detection tends to keep only the low-order disks.
+DETECT_MIN_REL_WARN = 0.01
+
+
+def detection_param_warnings(p: "CalibrationParams") -> list:
+    """Warnings for detection settings the user typed (their choice: nothing is changed).
+    Scan01 route B: minRelativeIntensity 0.05 kept 6.9 peaks / pattern (mostly 111, 220):
+    Q-pixel fit +57 %, BVM indexing 12.5 % off, strain frame turned 35 deg; 0.001 (the
+    notebook's value) kept 24.7 and reproduced the reference result."""
+    out = []
+    mr = float(p.detect_min_relative_intensity)
+    if mr > DETECT_MIN_REL_WARN:
+        out.append(f"minRelativeIntensity = {mr:g} keeps only the brightest (low-order) disks; "
+                   f"the Q-pixel fit, the BVM indexing and the strain frame can fail with too few "
+                   f"reflections. The notebook uses 0.001 (check the 6-point preview).")
+    return out
+
+
 def detect_preview(scan: Scan, *, make_figure: bool = True, log: Log = None):
     """Preview detection at the 6 points with current detect_params (tuning).
 
@@ -2142,6 +2160,8 @@ def detect_preview(scan: Scan, *, make_figure: bool = True, log: Log = None):
     the 6-point comparison shows up in the Report.
     """
     _push_detect_params(scan)
+    for w in detection_param_warnings(scan.params):
+        _log(log, f"WARNING [{scan.name}] detection: {w}")
     st = scan.ensure_state()
     _sync_six_points(scan, log=log)        # ensure the picked points are in the state
     if make_figure:
@@ -2303,6 +2323,8 @@ def compute_braggpeaks(scan: Scan, save_path: str | None = None,
     """
     st = scan.ensure_state()
     _push_detect_params(scan)
+    for w in detection_param_warnings(scan.params):
+        _log(log, f"WARNING [{scan.name}] detection: {w}")
     _pipeline().compute_braggpeaks_step(st, save_path=save_path, log=log)
     if save_path:
         scan.braggpeaks_path = str(save_path)
