@@ -854,10 +854,20 @@ def find_sidecar_braggpeaks(raw_path: str) -> str | None:
     folder = p.parent
     if not folder.is_dir():
         return None
-    exact = folder / f"{p.stem}braggpeaks.h5"
-    if exact.is_file():
-        return str(exact)
+    # "_" first (Fast4D writes <stem>_braggpeaks.h5): with "Scan02-4ms" and
+    # "Scan02-4ms_" in one folder, "Scan02-4ms_braggpeaks.h5" belongs to the first
+    for sep in ("_", "-", ""):
+        exact = folder / f"{p.stem}{sep}braggpeaks.h5"
+        if exact.is_file():
+            return str(exact)
+    # prefix fallback: skip files that belong to another scan whose name extends
+    # this one ("Scan02-4ms" must not take "Scan02-4ms__braggpeaks.h5" of "Scan02-4ms_")
+    others = [q.stem for q in folder.iterdir()
+              if q.is_file() and q.suffix.lower() in (".mib", ".emd", ".dm4", ".raw")
+              and q.stem != p.stem and q.stem.startswith(p.stem)]
     for g in sorted(folder.glob(f"{p.stem}*braggpeaks*.h5")):
+        if any(g.name.startswith(o) for o in others):
+            continue
         return str(g)
     return None
 
