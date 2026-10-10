@@ -406,6 +406,7 @@ class CalibrationParams:
     vrange: list = field(default_factory=lambda: [-5.0, 5.0])
     vrange_theta: list = field(default_factory=lambda: [-5.0, 5.0])
     strain_scan_roi_bounds: list | None = None   # ROI for the "with ROI" pass
+    strain_roi_only_map: bool = False     # with-ROI pass fits only the ROI (py4DSTEM fit_basis_vectors(mask))
     strain_cmap: str = "RdBu_r"           # colormap for exx/eyy/exy (py4DSTEM show_strain)
     strain_cmap_theta: str = "PRGn"       # colormap for theta (py4DSTEM show_strain)
     strain_layout: str = "horizontal"     # "horizontal" | "vertical" | "square" (py4DSTEM show_strain)
@@ -2389,6 +2390,7 @@ def _params_to_batch_scan_cfg(scan: Scan):
             "cmap_theta":          str(p.strain_cmap_theta),
             "show_orientation":    bool(p.strain_show_orientation),
             "scan_roi_bounds":     p.strain_scan_roi_bounds,
+            "roi_only_map":        bool(p.strain_roi_only_map),
         },
         stress_cfg={},
         line_positions={},
@@ -3457,6 +3459,7 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     label = "with_roi" if use_roi else "without_roi"
 
     gvects = None
+    fit_mask = None
     if use_roi:
         sm = getattr(st, "strainmap_full", None)
         if sm is None:                       # need the global map for the reference
@@ -3472,6 +3475,10 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
         mask = _reference_roi_mask(scan, rshape)
         g1, g2 = pl.capture_reference_g12_from_strainmap(sm, mask, log=log)
         gvects = (g1, g2)
+        if p.strain_roi_only_map:            # map of the ROI only: fit g1, g2 there alone
+            fit_mask = mask
+            _log(log, f"[{scan.name}] with-ROI map limited to the ROI "
+                      f"({int(mask.sum())} of {mask.size} scan positions).")
 
     # crystal frame: validated here so a bad spec fails before the heavy step
     spec = p.crystal_frame_spec()
@@ -3494,7 +3501,7 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     # use_roi=False here on purpose: we pass the reference via gvects, keeping the
     # FULL calibrated braggpeaks (not a masked, default-calibration copy).
     result = pl.compute_strain_map_step(
-        st, use_roi=False, gvects=gvects, label_override=label, log=log)
+        st, use_roi=False, gvects=gvects, label_override=label, fit_mask=fit_mask, log=log)
     card = (getattr(st, "crystal_frame_cards", {}) or {}).get(label)
     if card and card.get("mode") == "crystal":
         # coordinate_rotation is an output in crystal mode: show what was used
@@ -6270,6 +6277,7 @@ def params_from_template_scan(sc_cfg) -> CalibrationParams:
         strain_cmap_theta=str(s13.get("cmap_theta", "PRGn")),
         strain_show_orientation=bool(s13.get("show_orientation", True)),
         strain_scan_roi_bounds=s13.get("scan_roi_bounds"),
+        strain_roi_only_map=bool(s13.get("roi_only_map", False)),
         **_frame_fields_from(s13.get("crystal_frame") or {}),
     )
 
@@ -6431,6 +6439,7 @@ def save_params_template(scans: list[Scan], path: str, *, template_index: int = 
                        "show_orientation": bool(p.strain_show_orientation),
                        "scan_roi_bounds": (list(p.strain_scan_roi_bounds)
                                            if p.strain_scan_roi_bounds else None),
+                       "roi_only_map": bool(p.strain_roi_only_map),
                        "crystal_frame": p.crystal_frame_spec()},
             "stress": {"mode": "plane_stress", "c11_gpa": float(c11),
                        "c12_gpa": float(c12), "c44_gpa": float(c44)},

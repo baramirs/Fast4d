@@ -4842,9 +4842,13 @@ def compute_strain_map_step(
     gvects=None,
     label_override: str | None = None,
     mask_braggpeaks_outside_scan_roi: bool = False,
+    fit_mask: np.ndarray | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Compute strain mapping and capture a figure + a primary 2D array.
+
+    ``fit_mask`` (real-space bool, StrainMap.rshape): fit g1, g2 only there
+    (py4DSTEM ``fit_basis_vectors(mask=...)``); the other positions have no fit.
 
     IMPORTANT: In Tk apps on Windows, plotting via pyplot/TkAgg inside py4DSTEM
     can raise "main thread is not in main loop". We therefore try to run
@@ -4880,7 +4884,10 @@ def compute_strain_map_step(
     # our own figure afterwards.
     _with_plot_suppressed(lambda: _choose_basis_vectors_safely(strainmap, state.strain_basis_params["choose_basis_vectors"]))
     _with_plot_suppressed(lambda: strainmap.set_max_peak_spacing(**state.strain_params["set_max_peak_spacing"]))
-    _with_plot_suppressed(lambda: strainmap.fit_basis_vectors(**state.strain_params["fit_basis_vectors"]))
+    fit_kwargs = dict(state.strain_params["fit_basis_vectors"])
+    if fit_mask is not None:
+        fit_kwargs["mask"] = np.asarray(fit_mask, dtype=bool)
+    _with_plot_suppressed(lambda: strainmap.fit_basis_vectors(**fit_kwargs))
     def _run_get_strain():
         kwargs = dict(state.strain_params["get_strain"])
         if gvects is not None:

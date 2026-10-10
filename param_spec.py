@@ -104,6 +104,7 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("vrange", "vrange (min, max) %", "list2"),
         ParamSpec("vrange_theta", "vrange_theta (min, max) deg", "list2"),
         ParamSpec("strain_scan_roi_bounds", "strain ROI [x0,x1,y0,y1]", "list4"),
+        ParamSpec("strain_roi_only_map", "with-ROI map: only the ROI", "bool"),
         ParamSpec("strain_cmap", "Colormap (exx,eyy,exy)", "enum",
                   ("RdBu_r", "coolwarm", "seismic", "PuOr", "bwr")),
         ParamSpec("strain_cmap_theta", "Colormap (theta)", "enum",
