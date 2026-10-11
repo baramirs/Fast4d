@@ -2817,7 +2817,11 @@ def ellipse_source_image(scan: Scan, source: str = "area", *, areas=None, recent
     rshape = tuple(int(v) for v in data.shape[:2])
     mask = area_mask(rshape, areas)
     if not mask.any():
-        raise ValueError(f"[{scan.name}] the drawn areas contain no scan position")
+        n_ex = sum(1 for a in areas if isinstance(a, dict) and a.get("exclude"))
+        raise ValueError(f"[{scan.name}] the drawn areas contain no scan position "
+                         f"({len(areas)} area(s), {n_ex} marked exclude; scan {rshape[1]} x "
+                         f"{rshape[0]} positions): use at least one non-excluded area inside "
+                         f"the scan")
     origins, osrc = None, None
     if fit is not None and np.shape(fit[0]) == rshape:
         origins, osrc = (np.asarray(fit[0], float), np.asarray(fit[1], float)), "origin_fit"
@@ -4625,7 +4629,11 @@ def _area_shape_mask(H: int, W: int, area: dict) -> "np.ndarray":
         if len(b) != 4:
             raise ValueError(f"rect area needs bounds [x0, x1, y0, y1], got {b!r}")
         ang = float(area.get("angle", 0.0) or 0.0)
-        return roi_mask((H, W), [float(v) for v in b] + ([ang] if ang else []))
+        roi = [float(v) for v in b] + ([ang] if ang else [])
+        xs, ys = roi_corners(roi)[:, 0], roi_corners(roi)[:, 1]
+        if xs.max() < -0.5 or xs.min() > W - 0.5 or ys.max() < -0.5 or ys.min() > H - 0.5:
+            return np.zeros((H, W), dtype=bool)        # fully off the image: roi_mask would
+        return roi_mask((H, W), roi)                   # clamp it onto the edge pixels
     yy, xx = np.mgrid[0:H, 0:W]
     xx = xx.astype(float); yy = yy.astype(float)
     if kind == "ellipse":

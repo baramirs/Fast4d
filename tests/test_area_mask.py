@@ -101,6 +101,12 @@ def test_union_and_exclusion():
 
 def test_outside_and_clipping():
     assert E.area_mask(SHAPE, [{"kind": "ellipse", "center": [500, 500], "radii": [3, 3]}]).sum() == 0
+    # a rectangle fully off the image is EMPTY (roi_mask clamps it onto the edge row/column)
+    for b in ([500, 520, 500, 520], [-30, -5, 2, 8], [3, 9, 60, 70]):
+        assert E.area_mask(SHAPE, [{"kind": "rect", "bounds": b}]).sum() == 0
+        assert E.area_mask(SHAPE, [{"kind": "rect", "bounds": b, "angle": 20.0}]).sum() == 0
+    part = E.area_mask(SHAPE, [{"kind": "rect", "bounds": [45, 60, 0, 3]}])
+    assert part.sum() == 5 * 4                             # columns 45-49, rows 0-3
     m = E.area_mask(SHAPE, [{"kind": "polygon", "points": [[-10, -10], [5, -10], [5, 5], [-10, 5]]}])
     assert m.sum() == 36                                   # columns 0-5, rows 0-5
     assert E.area_mask(SHAPE, []).sum() == 0

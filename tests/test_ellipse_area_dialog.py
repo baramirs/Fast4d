@@ -119,6 +119,37 @@ def test_exclude_flag_and_delete(dlg):
     assert [x["kind"] for x in dlg.areas()] == ["ellipse"]
 
 
+def test_areas_are_used_by_default_and_exclude_is_explicit(dlg):
+    dlg.add_area("rect", [0.0, 10.0, 0.0, 10.0, 0.0])
+    it = dlg._list.item(0)
+    assert not (it.flags() & QtCore_ItemIsUserCheckable())   # no ambiguous tick box
+    assert dlg.areas()[0]["exclude"] is False
+    dlg._list.setCurrentRow(0)
+    dlg._toggle_exclude_selected()
+    assert dlg.areas()[0]["exclude"] is True and "EXCLUDE" in dlg._list.item(0).text()
+    dlg._toggle_exclude_selected()
+    assert dlg.areas()[0]["exclude"] is False and "EXCLUDE" not in dlg._list.item(0).text()
+
+
+def test_build_refuses_an_empty_selection_with_a_reason(dlg, monkeypatch):
+    called = []
+    monkeypatch.setattr(E, "ellipse_source_image", lambda *a, **k: called.append(1))
+    dlg.add_area("rect", [0.0, 10.0, 0.0, 10.0, 0.0])
+    dlg.set_exclude(0, True)
+    dlg.build_image()
+    assert not called and "EXCLUDE" in dlg._status.text()
+    dlg.set_exclude(0, False)
+    dlg.delete_area(0)
+    dlg.add_area("rect", [500.0, 520.0, 500.0, 520.0, 0.0])     # outside the 32 x 32 ADF
+    dlg.build_image()
+    assert not called and "outside" in dlg._status.text()
+
+
+def QtCore_ItemIsUserCheckable():
+    from PySide6 import QtCore
+    return QtCore.Qt.ItemFlag.ItemIsUserCheckable
+
+
 def test_dp_sources_disable_recentring(dlg):
     dlg.set_source("dp_mean")
     assert not dlg._chk_recenter.isEnabled()

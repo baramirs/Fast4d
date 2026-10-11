@@ -71,13 +71,20 @@ class EllipseAreaDialog(QtWidgets.QDialog):
             row.addWidget(b)
         left.addLayout(row)
         self._list = QtWidgets.QListWidget()
-        self._list.setToolTip("Ticked = EXCLUDE this area (e.g. a crystal inside the amorphous zone)")
-        self._list.itemChanged.connect(self._on_item_changed)
+        self._list.setToolTip("Every area is USED. Double-click (or the button) to mark it "
+                              "EXCLUDE: it is then subtracted, e.g. a crystal inside the "
+                              "amorphous zone.")
+        self._list.itemDoubleClicked.connect(lambda *_: self._toggle_exclude_selected())
         self._list.setMaximumHeight(120)
         left.addWidget(self._list)
-        b_del = QtWidgets.QPushButton("Delete selected area")
+        row2 = QtWidgets.QHBoxLayout()
+        b_exc = QtWidgets.QPushButton("Exclude / include selected")
+        b_exc.clicked.connect(self._toggle_exclude_selected)
+        b_del = QtWidgets.QPushButton("Delete selected")
         b_del.clicked.connect(lambda: self.delete_area(self._list.currentRow()))
-        left.addWidget(b_del)
+        row2.addWidget(b_exc)
+        row2.addWidget(b_del)
+        left.addLayout(row2)
         lay.addLayout(left, 3)
 
         mid = QtWidgets.QVBoxLayout()
@@ -233,13 +240,12 @@ class EllipseAreaDialog(QtWidgets.QDialog):
         else:
             raise ValueError(f"unknown area kind {kind!r}")
         self._vb_adf.addItem(roi)
-        self._areas.append({"kind": kind, "roi": roi, "exclude": False})
-        it = QtWidgets.QListWidgetItem(f"A{len(self._areas)}  {kind}")
-        it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-        it.setCheckState(QtCore.Qt.CheckState.Unchecked)
-        self._list.blockSignals(True)
+        self._areas.append({"kind": kind, "roi": roi, "exclude": False,
+                            "label": f"A{len(self._areas) + 1}  {kind}"})
+        it = QtWidgets.QListWidgetItem(self._areas[-1]["label"])
+        it.setFlags(it.flags() & ~QtCore.Qt.ItemFlag.ItemIsUserCheckable)   # no tick box
         self._list.addItem(it)
-        self._list.blockSignals(False)
+        self._list.setCurrentRow(len(self._areas) - 1)
         return len(self._areas) - 1
 
     def areas(self) -> list:
@@ -262,32 +268,28 @@ class EllipseAreaDialog(QtWidgets.QDialog):
         return out
 
     def set_exclude(self, i: int, flag: bool) -> None:
-        self._areas[i]["exclude"] = bool(flag)
-        it = self._list.item(i)
-        self._list.blockSignals(True)
-        it.setCheckState(QtCore.Qt.CheckState.Checked if flag else QtCore.Qt.CheckState.Unchecked)
-        self._list.blockSignals(False)
-        pen = self._areas[i]["roi"].pen
+        a = self._areas[i]
+        a["exclude"] = bool(flag)
+        self._list.item(i).setText(a["label"] + ("   [EXCLUDE]" if flag else ""))
+        pen = a["roi"].pen
         style = QtCore.Qt.PenStyle.DashLine if flag else QtCore.Qt.PenStyle.SolidLine
         try:
             pen.setStyle(style)
-            self._areas[i]["roi"].setPen(pen)
+            a["roi"].setPen(pen)
         except Exception:
             pass
 
-    def _on_item_changed(self, item) -> None:
-        i = self._list.row(item)
+    def _toggle_exclude_selected(self) -> None:
+        i = self._list.currentRow()
         if 0 <= i < len(self._areas):
-            self.set_exclude(i, item.checkState() == QtCore.Qt.CheckState.Checked)
+            self.set_exclude(i, not self._areas[i]["exclude"])
 
     def delete_area(self, i: int) -> None:
         if not (0 <= i < len(self._areas)):
             return
         self._vb_adf.removeItem(self._areas[i]["roi"])
         self._areas.pop(i)
-        self._list.blockSignals(True)
         self._list.takeItem(i)
-        self._list.blockSignals(False)
 
     # ── source / image ────────────────────────────────────────────────────────
     def _source(self) -> str:
@@ -310,6 +312,17 @@ class EllipseAreaDialog(QtWidgets.QDialog):
         rec = self._chk_recenter.isChecked() if src == "area" else False
         if src == "area" and not areas:
             self._status.setText("Draw at least one area first.")
+            return
+        if src == "area" and self._adf_shape is not None \
+                and not E.area_mask(self._adf_shape, areas).any():
+            if all(a["exclude"] for a in areas):
+                why = ("every area is marked EXCLUDE: select one and press 'Exclude / include "
+                       "selected' (or double-click it) to use it")
+            else:
+                H, W = self._adf_shape
+                why = (f"the areas are outside the {W} x {H} ADF, or the EXCLUDE areas cover "
+                       f"them completely")
+            self._status.setText(f"No scan position selected: {why}.")
             return
         self._status.setText("Building the image...")
 
