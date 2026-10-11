@@ -4450,6 +4450,78 @@ def roi_mask(shape, roi) -> "np.ndarray":
     return (np.abs(u) <= hw + eps) & (np.abs(v) <= hh + eps)
 
 
+AREA_KINDS = ("rect", "ellipse", "polygon")
+
+
+def _area_shape_mask(H: int, W: int, area: dict) -> "np.ndarray":
+    """Mask of ONE area dict (see :func:`area_mask`); raises ValueError if malformed."""
+    kind = str(area.get("kind", "")).lower()
+    eps = 1e-9
+    if kind == "rect":
+        b = list(area.get("bounds") or [])
+        if len(b) != 4:
+            raise ValueError(f"rect area needs bounds [x0, x1, y0, y1], got {b!r}")
+        ang = float(area.get("angle", 0.0) or 0.0)
+        return roi_mask((H, W), [float(v) for v in b] + ([ang] if ang else []))
+    yy, xx = np.mgrid[0:H, 0:W]
+    xx = xx.astype(float); yy = yy.astype(float)
+    if kind == "ellipse":
+        c = list(area.get("center") or [])
+        r = list(area.get("radii") or [])
+        if len(c) != 2 or len(r) != 2 or min(float(r[0]), float(r[1])) <= 0:
+            raise ValueError(f"ellipse area needs center [x, y] and radii [rx, ry] > 0, got {area!r}")
+        cx, cy = float(c[0]), float(c[1])
+        rx, ry = float(r[0]), float(r[1])
+        t = np.deg2rad(float(area.get("angle", 0.0) or 0.0))
+        u = (xx - cx) * np.cos(t) + (yy - cy) * np.sin(t)
+        v = -(xx - cx) * np.sin(t) + (yy - cy) * np.cos(t)
+        return (u / rx) ** 2 + (v / ry) ** 2 <= 1.0 + eps
+    if kind == "polygon":
+        pts = np.asarray(area.get("points") or [], dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] != 2:
+            raise ValueError(f"polygon area needs >= 3 points [[x, y], ...], got {area.get('points')!r}")
+        inside = np.zeros((H, W), dtype=bool)
+        on_edge = np.zeros((H, W), dtype=bool)
+        for (x0, y0), (x1, y1) in zip(pts, np.roll(pts, -1, axis=0)):
+            # crossing number (half-open rule on y), then the edge itself counts as inside
+            cross = (y0 > yy) != (y1 > yy)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                xi = x0 + (yy - y0) * (x1 - x0) / (y1 - y0)
+            inside ^= cross & (xx < xi)
+            dx, dy = x1 - x0, y1 - y0
+            L2 = dx * dx + dy * dy
+            if L2 > 0:
+                tt = np.clip(((xx - x0) * dx + (yy - y0) * dy) / L2, 0.0, 1.0)
+                on_edge |= np.hypot(xx - (x0 + tt * dx), yy - (y0 + tt * dy)) <= eps
+        return inside | on_edge
+    raise ValueError(f"unknown area kind {kind!r}; expected one of {AREA_KINDS}")
+
+
+def area_mask(shape, areas) -> "np.ndarray":
+    """Boolean (H, W) mask of user-drawn scan areas (x = column, y = row).
+
+    ``areas`` is one dict or a list of dicts:
+      {"kind": "rect", "bounds": [x0, x1, y0, y1], "angle": deg}   (same pixels as roi_mask)
+      {"kind": "ellipse", "center": [x, y], "radii": [rx, ry], "angle": deg}
+      {"kind": "polygon", "points": [[x, y], ...]}                 (>= 3 vertices)
+    A pixel is inside when its centre lies inside the shape, boundary included. The result is
+    the union of the areas, minus every area with ``"exclude": True`` (applied last).
+    Areas outside the image are clipped; a malformed area raises ValueError."""
+    H, W = int(shape[0]), int(shape[1])
+    items = [areas] if isinstance(areas, dict) else list(areas or [])
+    keep = np.zeros((H, W), dtype=bool)
+    drop = np.zeros((H, W), dtype=bool)
+    for a in items:
+        if not isinstance(a, dict):
+            raise ValueError(f"area must be a dict, got {type(a).__name__}")
+        m = _area_shape_mask(H, W, a)
+        if a.get("exclude"):
+            drop |= m
+        else:
+            keep |= m
+    return keep & ~drop
+
+
 def _roi_patch(roi, **kw):
     """A matplotlib Polygon outlining an (optionally rotated) ROI."""
     from matplotlib.patches import Polygon
