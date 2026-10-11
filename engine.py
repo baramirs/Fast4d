@@ -2742,6 +2742,71 @@ def ellipse_bvm(scan: Scan, *, sampling: int = 1, use_roi: bool = False, log: Lo
     return img, origin, bvm
 
 
+ELLIPSE_SOURCES = ("area", "dp_mean", "dp_max")
+
+
+def ellipse_source_image(scan: Scan, source: str = "area", *, areas=None, recenter: bool = True,
+                         com_radius: float = 10.0, log: Log = None) -> dict:
+    """Diffraction image the "Ellipse from area" tool fits the detector ellipse on.
+
+    ``source``:
+      "area"     mean of the raw patterns inside ``areas`` (engine.area_mask: amorphous or
+                 polycrystalline regions drawn on the ADF), read from the memory-mapped raw
+                 file; with ``recenter`` each pattern is shifted to the mean beam centre first.
+                 Beam centres: the Origin calibration (state.origin_fit) when present, else the
+                 centre of mass of the direct beam from ``params.center_guess``.
+      "dp_mean" / "dp_max"  the precomputed whole-scan images (no per-pattern recentring).
+    Returns {image, center (qx, qy), n_patterns, recentered, source, origin_source}."""
+    import ellipse_area as EA
+    src = str(source).lower()
+    if src not in ELLIPSE_SOURCES:
+        raise ValueError(f"ellipse source must be one of {ELLIPSE_SOURCES}, got {source!r}")
+    st = scan.ensure_state()
+    fit = getattr(st, "origin_fit", None)
+    guess = tuple(float(v) for v in (scan.params.center_guess or (0.0, 0.0)))   # (qx, qy)
+    if src in ("dp_mean", "dp_max"):
+        node = (getattr(st, "virtual_images", None) or {}).get(src)
+        if node is None:
+            load_adf(scan, log=log)
+            node = (getattr(st, "virtual_images", None) or {}).get(src)
+        if node is None:
+            raise RuntimeError(f"[{scan.name}] no {src} image: create the virtual images "
+                               f"(ADF/BF + DP mean/max) first")
+        img = np.asarray(getattr(node, "data", node), dtype=float)
+        if fit is not None:
+            center = (float(np.nanmean(fit[0])), float(np.nanmean(fit[1])))
+            osrc = "origin_fit_mean"
+        else:
+            center = EA.com_center(img, np.unravel_index(int(np.argmax(img)), img.shape), com_radius)
+            osrc = "beam_com"
+        _log(log, f"[{scan.name}] ellipse source {src} (whole scan, not re-centred), "
+                  f"beam centre ({center[0]:.2f}, {center[1]:.2f})")
+        return dict(image=img, center=center, n_patterns=None, recentered=False, source=src,
+                    origin_source=osrc)
+    if not areas:
+        raise ValueError("ellipse source 'area' needs at least one area drawn over amorphous / "
+                         "polycrystalline material")
+    if not scan.raw_path:
+        raise RuntimeError(f"[{scan.name}] the 'area' source needs the raw 4D file")
+    dc = _pipeline()._load_raw_datacube(Path(scan.raw_path), mem="memmap", log=log)
+    data = dc.data
+    rshape = tuple(int(v) for v in data.shape[:2])
+    mask = area_mask(rshape, areas)
+    if not mask.any():
+        raise ValueError(f"[{scan.name}] the drawn areas contain no scan position")
+    origins, osrc = None, None
+    if fit is not None and np.shape(fit[0]) == rshape:
+        origins, osrc = (np.asarray(fit[0], float), np.asarray(fit[1], float)), "origin_fit"
+    elif recenter:
+        origins = EA.beam_centers_com(data, mask, guess, com_radius)
+        osrc = "beam_com"
+    res = EA.mean_dp(data, mask, origins=origins, recenter=recenter)
+    res.update(source="area", origin_source=osrc)
+    _log(log, f"[{scan.name}] ellipse source: mean of {res['n_patterns']} patterns "
+              f"({'re-centred on ' + osrc if recenter else 'not re-centred'})")
+    return res
+
+
 def fit_ellipse_preview(scan: Scan, r0, r1, *, sampling: int = 1,
                         use_roi: bool = False, bvm=None,
                         center: tuple[float, float] | None = None,
