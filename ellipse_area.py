@@ -104,6 +104,70 @@ def residual_ellipse(p_measured, p_applied) -> dict:
                 theta_deg=float(np.degrees(np.arctan2(U[1, 0], U[0, 0])) % 180.0))
 
 
+def radial_profile(image, center, p_ellipse=None, step: float = 0.5, r_max: float | None = None):
+    """Azimuthal average of ``image`` around ``center`` (qx, qy), in bins of ``step`` px.
+    With ``p_ellipse`` the radius is measured after undoing that ellipse (area-preserving), so
+    a correct ellipse turns an elliptical ring into a sharp one. Returns (r, mean intensity)."""
+    a = np.asarray(image, dtype=float)
+    qx, qy = np.meshgrid(np.arange(a.shape[0], dtype=float), np.arange(a.shape[1], dtype=float),
+                         indexing="ij")
+    d = np.stack([qx - float(center[0]), qy - float(center[1])])
+    if p_ellipse is not None:
+        Mi = np.linalg.inv(ellipse_matrix(p_ellipse))
+        d = np.tensordot(Mi, d, axes=1)
+    r = np.hypot(d[0], d[1]).ravel()
+    rmax = float(r_max) if r_max is not None else float(min(a.shape) / 2.0)
+    ok = r <= rmax
+    k = np.floor(r[ok] / step).astype(int)
+    s = np.bincount(k, a.ravel()[ok])
+    n = np.bincount(k)
+    good = n > 0
+    return (np.arange(len(n))[good] + 0.5) * step, s[good] / n[good]
+
+
+def peak_fwhm(r, prof, r_range) -> float:
+    """Full width at half maximum (px) of the peak of ``prof`` inside ``r_range``, above the
+    lowest value of that window; NaN if no peak."""
+    r = np.asarray(r, float); p = np.asarray(prof, float)
+    lo, hi = sorted(float(v) for v in r_range)
+    w = (r >= lo) & (r <= hi)
+    if w.sum() < 3:
+        return float("nan")
+    rr, pp = r[w], p[w]
+    k = int(np.argmax(pp))
+    half = pp.min() + 0.5 * (pp[k] - pp.min())
+    i = k
+    while i > 0 and pp[i - 1] > half:
+        i -= 1
+    j = k
+    while j < len(pp) - 1 and pp[j + 1] > half:
+        j += 1
+    if i == 0 or j == len(pp) - 1:
+        return float("nan")
+    left = rr[i - 1] + (half - pp[i - 1]) * (rr[i] - rr[i - 1]) / (pp[i] - pp[i - 1])
+    right = rr[j] + (pp[j] - half) * (rr[j + 1] - rr[j]) / (pp[j] - pp[j + 1])
+    return float(right - left)
+
+
+def suggest_ring(r, prof, r_min: float, half_width: float = 6.0) -> tuple[float, float]:
+    """Ring radii (r0, r1) around the most prominent local maximum of the profile beyond
+    ``r_min`` (outside the direct beam); prominence = height above the lowest value within
+    ``half_width``. Falls back to the global maximum beyond r_min."""
+    r = np.asarray(r, float); p = np.asarray(prof, float)
+    idx = np.nonzero(r >= r_min)[0]
+    if idx.size < 3:
+        raise ValueError("profile too short to suggest a ring")
+    best, best_prom = int(idx[np.argmax(p[idx])]), -np.inf
+    for k in idx[1:-1]:
+        if p[k] > p[k - 1] and p[k] >= p[k + 1]:
+            win = (r >= r[k] - half_width) & (r <= r[k] + half_width)
+            prom = p[k] - p[win].min()
+            if prom > best_prom:
+                best, best_prom = int(k), prom
+    rc = float(r[best])
+    return max(0.0, rc - half_width), rc + half_width
+
+
 def mean_dp(data, mask, origins=None, recenter: bool = True) -> dict:
     """Mean diffraction pattern over the masked scan positions.
 

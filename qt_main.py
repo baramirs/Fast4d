@@ -1123,6 +1123,11 @@ class EllipseDialog(QtWidgets.QDialog):
                                    "(the calibrated probe origin).")
         b_center_reset.clicked.connect(self._reset_center_to_origin)
         v.addWidget(b_center_reset)
+        b_area = QtWidgets.QPushButton("Ellipse from area…")
+        b_area.setToolTip("Fit the detector ellipse on amorphous / polycrystalline areas (or the "
+                          "DP mean / max) instead of the BVM of a single crystal.")
+        b_area.clicked.connect(host._open_ellipse_area_tool)
+        v.addWidget(b_area)
 
         for txt, fn, tip in ((LBL_FIT, self._fit_ellipse, TIP_FIT_ELLIPSE),
                                (LBL_TO_TABLE, self._to_params, TIP_TO_TABLE_ELLIPSE),
@@ -4253,6 +4258,11 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             "One tool for line profiles and (rotatable) ROI statistics on any map.")
         act_measure.triggered.connect(self._open_live_line)
         tools.addAction(act_measure)
+        act_ell_area = QtGui.QAction("Ellipse from area…", self)
+        act_ell_area.setToolTip("Detector ellipse from amorphous / polycrystalline areas, "
+                                "or from the DP mean / max.")
+        act_ell_area.triggered.connect(self._open_ellipse_area_tool)
+        tools.addAction(act_ell_area)
         tools.addSeparator()
         act_setup = QtGui.QAction("Set up Lines & ROI…", self)
         act_setup.setToolTip(
@@ -5577,6 +5587,14 @@ class Fast4DWindow(QtWidgets.QMainWindow):
         if sc is None:
             return
         self._show_tool(EllipseDialog(self))
+
+    def _open_ellipse_area_tool(self) -> None:
+        """Ellipse from area: fit the detector ellipse on amorphous / polycrystalline areas."""
+        sc = self._need_active()
+        if sc is None:
+            return
+        from qt_ellipse_area import EllipseAreaDialog
+        self._show_tool(EllipseAreaDialog(self))
 
     def _open_qpixel_tool(self) -> None:
         """Interactive Q-pixel window (Update overlay / Test / Finalize REFIT)."""
