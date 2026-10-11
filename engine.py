@@ -355,6 +355,14 @@ class CalibrationParams:
                                          # None / [0, 0] / off-map = use bvm.origin
     ellipse_p_fitted: list | None = None  # fitted OUTPUT [a, b, theta_rad] actually applied
                                           # ('apply' mode re-applies it; None = no fit)
+    # "Ellipse from area" tool: where the applied ellipse came from. "bvm" = fitted on the
+    # BVM in the calibration sequence (the original behaviour); "area" / "dp_mean" /
+    # "dp_max" = fitted on raw diffraction by the tool and re-applied as stored (no refit).
+    ellipse_source: str = "bvm"
+    ellipse_source_rois: list | None = None   # the drawn areas (engine.area_mask dicts)
+    ellipse_fit_method: str = ""              # "amorphous" | "ring"
+    ellipse_recenter: bool = True             # patterns re-centred before averaging
+    ellipse_source_file: str = ""             # scan the ellipse was measured on
 
     # ── Q pixel size (cell 37) — always fits: px_guess in → fitted px out ──────
     q_px: float = 0.0137          # px_guess (editable INPUT; never overwritten)
@@ -2691,6 +2699,22 @@ def calibrate_ellipse(scan: Scan, *, make_figure: bool = True, log: Log = None) 
         return
     pl = _pipeline()
     st = scan.ensure_state()
+    src = str(getattr(p, "ellipse_source", "bvm") or "bvm").lower()
+    if src != "bvm":                       # measured by the "Ellipse from area" tool: re-apply
+        if not p.ellipse_p_fitted:
+            raise RuntimeError(f"[{scan.name}] the ellipse source is '{src}' but no ellipse is "
+                               f"stored: run Ellipse from area, or set the source to 'bvm'.")
+        a, b, th = (float(v) for v in p.ellipse_p_fitted)
+        ab = max(abs(a), abs(b)) / min(abs(a), abs(b))
+        if abs(ab - 1.0) > pl.ELLIPSE_MAX_AXIS_RATIO_DEV:
+            raise RuntimeError(f"[{scan.name}] stored ellipse a/b = {ab:.3f} outside 1 +- "
+                               f"{pl.ELLIPSE_MAX_AXIS_RATIO_DEV:.2f}: NOT applied.")
+        st.p_ellipse = (0.0, 0.0, a, b, th)
+        pl.apply_ellipse_step(st, log=log)
+        _log(log, f"[{scan.name}] ellipse from {src} applied as stored (no BVM refit): "
+                  f"a/b = {ab:.4f}, theta = {np.degrees(th) % 180.0:.2f} deg, measured on "
+                  f"'{p.ellipse_source_file or '?'}' ({p.ellipse_fit_method or '?'} fit)")
+        return
     r0, r1 = sorted(int(v) for v in p.ellipse_q_range)
     center = getattr(p, "ellipse_center", None) or None   # [0, 0] / off-map: fit_ellipse_step
     if p.ellipse_use_roi:
@@ -2805,6 +2829,80 @@ def ellipse_source_image(scan: Scan, source: str = "area", *, areas=None, recent
     _log(log, f"[{scan.name}] ellipse source: mean of {res['n_patterns']} patterns "
               f"({'re-centred on ' + osrc if recenter else 'not re-centred'})")
     return res
+
+
+ELLIPSE_RESIDUAL_TOL = 0.003     # |a/b - 1| left on another file after the applied ellipse
+
+
+def fit_ellipse_from_source(scan: Scan, src: dict, r_range, method: str = "amorphous", *,
+                            log: Log = None) -> dict:
+    """Fit the detector ellipse on an ``ellipse_source_image`` result and run the existing
+    quality control (a/b, centre, scale). Nothing is applied; the result is kept on
+    ``state.ellipse_area_fit`` for apply_area_ellipse."""
+    import ellipse_area as EA
+    img = np.asarray(src["image"], dtype=float)
+    center = src.get("center") or (img.shape[0] / 2.0, img.shape[1] / 2.0)
+    r = EA.fit_ellipse(img, center, r_range, method=method)
+    r["quality"] = _pipeline().ellipse_fit_quality(r["p_ellipse"], center, r["r_range"], sampling=1)
+    r["source"] = src.get("source")
+    scan.ensure_state().ellipse_area_fit = r
+    q = r["quality"]
+    _log(log, f"[{scan.name}] ellipse fit on {r['source']} ({r['method']}, r {r['r_range'][0]:.0f}-"
+              f"{r['r_range'][1]:.0f} px): a/b = {r['a_over_b']:.4f}, theta = {r['theta_deg']:.2f} deg"
+              + ("" if q["ok"] else " -- REJECTED: " + "; ".join(q["reasons"])))
+    return r
+
+
+def apply_area_ellipse(scans: list, fit: dict, src: dict, *, areas=None, source_scan=None,
+                       log: Log = None) -> list:
+    """Store an ellipse from the tool on every scan in ``scans`` (one calibration for the files
+    taken in the same optical conditions), with its provenance. Scans whose braggpeaks are
+    loaded and origin-calibrated get it applied now; the others when they are calibrated
+    (calibrate_ellipse re-applies it, no BVM refit). Returns the names applied now."""
+    p = tuple(float(v) for v in fit["p_ellipse"])
+    applied_now = []
+    for sc in scans:
+        prm = sc.params
+        prm.ellipse_enabled = True
+        prm.ellipse_p_fitted = [p[2], p[3], p[4]]
+        prm.ellipse_source = str(src.get("source", "area"))
+        prm.ellipse_source_rois = [dict(a) for a in (areas or [])] or None
+        prm.ellipse_fit_method = str(fit.get("method", ""))
+        prm.ellipse_recenter = bool(src.get("recentered", False))
+        prm.ellipse_source_file = str(getattr(source_scan, "name", "") or "")
+        st = sc.ensure_state()
+        bp = getattr(st, "braggpeaks", None)
+        try:
+            has_origin = bp is not None and bp.calibration.get_origin() is not None
+        except Exception:
+            has_origin = False
+        if has_origin:
+            st.p_ellipse = p
+            _pipeline().apply_ellipse_step(st, log=log)
+            applied_now.append(sc.name)
+    _log(log, f"Ellipse from {src.get('source', 'area')} (a/b = {fit.get('a_over_b', float('nan')):.4f}, "
+              f"theta = {fit.get('theta_deg', float('nan')):.2f} deg) stored on {len(scans)} file(s); "
+              f"applied now on {len(applied_now)}")
+    return applied_now
+
+
+def verify_area_ellipse(scan: Scan, areas, applied_p, r_range, method: str = "amorphous", *,
+                        tol: float = ELLIPSE_RESIDUAL_TOL, log: Log = None) -> dict:
+    """Does an ellipse measured elsewhere hold for ``scan``? Fits the ellipse on this scan's own
+    area image and reports what the applied one leaves: residual a/b (1 = same distortion)."""
+    import ellipse_area as EA
+    src = ellipse_source_image(scan, "area", areas=areas, log=log)
+    img = np.asarray(src["image"], dtype=float)
+    center = src.get("center") or (img.shape[0] / 2.0, img.shape[1] / 2.0)
+    fit = EA.fit_ellipse(img, center, r_range, method=method)
+    res = EA.residual_ellipse(fit["p_ellipse"], applied_p)
+    ok = bool(abs(res["a_over_b"] - 1.0) <= tol)
+    _log(log, f"[{scan.name}] ellipse check: own a/b = {fit['a_over_b']:.4f}; residual after the "
+              f"applied ellipse a/b = {res['a_over_b']:.4f} at {res['theta_deg']:.1f} deg "
+              f"({'OK' if ok else 'DOES NOT HOLD for this file'}, tol {tol})")
+    return dict(measured_a_over_b=fit["a_over_b"], measured_theta_deg=fit["theta_deg"],
+                residual_a_over_b=res["a_over_b"], residual_theta_deg=res["theta_deg"],
+                ok=ok, tol=tol)
 
 
 def fit_ellipse_preview(scan: Scan, r0, r1, *, sampling: int = 1,

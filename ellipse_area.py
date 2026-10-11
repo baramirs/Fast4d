@@ -51,6 +51,59 @@ def beam_centers_com(data, mask, guess, radius: float = 10.0) -> tuple[np.ndarra
     return qx0, qy0
 
 
+FIT_METHODS = ("amorphous", "ring")
+
+
+def fit_ellipse(image, center, r_range, method: str = "amorphous") -> dict:
+    """Fit the detector ellipse on a ring of ``image`` between radii ``r_range`` (px).
+
+    method "amorphous": py4DSTEM fit_ellipse_amorphous_ring (broad halo, double-sided
+    Gaussian); "ring": py4DSTEM fit_ellipse_1D (sharp polycrystalline ring).
+    Returns {p_ellipse (qx0, qy0, a, b, theta_rad), a_over_b (>= 1), theta_deg (angle of the
+    MAJOR axis from +qx towards +qy, in [0, 180)), method, r_range, center}."""
+    from py4DSTEM.process.calibration import fit_ellipse_1D, fit_ellipse_amorphous_ring
+    m = str(method).lower()
+    if m not in FIT_METHODS:
+        raise ValueError(f"ellipse fit method must be one of {FIT_METHODS}, got {method!r}")
+    img = np.asarray(image, dtype=float)
+    r0, r1 = sorted(float(v) for v in r_range)
+    if not (0 <= r0 < r1):
+        raise ValueError(f"ring radii must satisfy 0 <= r0 < r1, got {r_range!r}")
+    c = (float(center[0]), float(center[1]))
+    if m == "amorphous":
+        out = fit_ellipse_amorphous_ring(img, center=c, fitradii=(r0, r1))
+        p = out[0] if isinstance(out, tuple) else out
+    else:
+        p = fit_ellipse_1D(img, center=c, fitradii=(r0, r1))
+    p = tuple(float(v) for v in np.ravel(p)[:5])
+    a, b, th = abs(p[2]), abs(p[3]), p[4]
+    major = th if a >= b else th + np.pi / 2.0
+    return dict(p_ellipse=p, a_over_b=float(max(a, b) / min(a, b)),
+                theta_deg=float(np.degrees(major) % 180.0), method=m, r_range=(r0, r1),
+                center=c)
+
+
+def ellipse_matrix(p_ellipse) -> np.ndarray:
+    """Area-normalised 2x2 distortion R(theta) diag(a, b) R(-theta) of an ellipse
+    (qx0, qy0, a, b, theta) or (a, b, theta); None = identity."""
+    if p_ellipse is None:
+        return np.eye(2)
+    p = list(p_ellipse)[-3:]
+    a, b, t = abs(float(p[0])), abs(float(p[1])), float(p[2])
+    R = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    return R @ np.diag([a, b]) @ R.T / np.sqrt(a * b)
+
+
+def residual_ellipse(p_measured, p_applied) -> dict:
+    """Ellipticity left on a pattern whose measured ellipse is ``p_measured`` after the
+    correction of ``p_applied``: D_res = D_measured D_applied^-1. Returns {a_over_b,
+    theta_deg (major axis, [0, 180))}; a_over_b = 1 when the applied ellipse matches."""
+    Dr = ellipse_matrix(p_measured) @ np.linalg.inv(ellipse_matrix(p_applied))
+    U, S, _ = np.linalg.svd(Dr)
+    return dict(a_over_b=float(S[0] / S[1]),
+                theta_deg=float(np.degrees(np.arctan2(U[1, 0], U[0, 0])) % 180.0))
+
+
 def mean_dp(data, mask, origins=None, recenter: bool = True) -> dict:
     """Mean diffraction pattern over the masked scan positions.
 
