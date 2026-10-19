@@ -195,7 +195,8 @@ class BatchOutcome:
 def compute_scan(scan: E.Scan, opts: ComputeOptions | None = None, *,
                  log: Log = None, progress: Progress = None,
                  scan_index: int = 0, n_scans: int = 1,
-                 cancel: Callable[[], bool] | None = None) -> ScanOutcome:
+                 cancel: Callable[[], bool] | None = None,
+                 confirm: Callable[[E.Scan, str], bool] | None = None) -> ScanOutcome:
     """Full COMPUTE for ONE scan, auto-branching Path A vs Path B.
 
     Never raises: any failure is captured into ``ScanOutcome.error`` so a multi
@@ -263,6 +264,14 @@ def compute_scan(scan: E.Scan, opts: ComputeOptions | None = None, *,
             E.run_calibration_sequence(
                 scan, make_figures=eff_make_figures, log=log,
                 progress_step=lambda step: emit(f"calibrate:{step}", f"{step} done"))
+            # Q-pixel global search flagged this fit (differs / ambiguous): ask the user
+            # before the heavy strain step. No ``confirm`` (batch, tests, benchmark):
+            # the WARNING is already in the log and the run continues.
+            chk = getattr(scan.params, "q_px_check", None) or {}
+            if chk.get("status") in ("differs", "ambiguous") and confirm is not None:
+                if not confirm(scan, f"Q pixel: {chk.get('message', '')}"):
+                    _log(log, f"[{scan.name}] stopped by the user after the Q-pixel check.")
+                    raise _Cancelled()
         ck()
 
         # ── strain (heavy) ─────────────────────────────────────────────────────
@@ -335,7 +344,8 @@ def compute_scan(scan: E.Scan, opts: ComputeOptions | None = None, *,
 def compute_all(scans: list[E.Scan], opts: ComputeOptions | None = None, *,
                 log: Log = None, progress: Progress = None,
                 on_scan_done: Callable[[ScanOutcome], None] | None = None,
-                cancel: Callable[[], bool] | None = None) -> BatchOutcome:
+                cancel: Callable[[], bool] | None = None,
+                confirm: Callable[[E.Scan, str], bool] | None = None) -> BatchOutcome:
     """Serial COMPUTE over N scans (N == 1 is just "single"). Times the whole run.
 
     ``on_scan_done(outcome)`` fires after each scan so the GUI can update its
@@ -354,7 +364,7 @@ def compute_all(scans: list[E.Scan], opts: ComputeOptions | None = None, *,
             _log(log, f"CANCELLED — stopped before '{scan.name}' ({i}/{n} done).")
             break
         out = compute_scan(scan, opts, log=log, progress=progress,
-                           scan_index=i, n_scans=n, cancel=cancel)
+                           scan_index=i, n_scans=n, cancel=cancel, confirm=confirm)
         result.outcomes.append(out)
         _log(log, f"[{scan.name}] {'OK' if out.ok else 'FAILED'} "
                   f"({_fmt_elapsed(out.elapsed_s)})"

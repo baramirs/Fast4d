@@ -69,6 +69,8 @@ PARAM_SPEC: dict[str, list[ParamSpec]] = {
         ParamSpec("q_refit", "Refit px (off = use guess)", "bool"),
         ParamSpec("q_px", "px_guess (A^-1/px)", "float", decimals=5),
         ParamSpec("q_px_fitted", "px_fitted (A^-1/px)", "fitted", decimals=5, readonly=True),
+        ParamSpec("q_search_span", "Search span (+- fraction)", "float", decimals=2),
+        ParamSpec("q_search_tol", "Ring-match tol (fraction)", "float", decimals=3),
         ParamSpec("q_kmax", "k_max", "float", decimals=2),
         ParamSpec("q_kpow", "bragg_k_power", "float", decimals=2),
         ParamSpec("q_use_roi", "Use ROI", "bool"),

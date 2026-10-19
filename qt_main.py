@@ -1457,6 +1457,18 @@ class QPixelDialog(QtWidgets.QDialog):
         self._sp_kpow = self._dspin(v, "bragg_k_power", 0.1, 6.0, float(p.q_kpow), 0.1, 2)
         self._use_roi = QtWidgets.QCheckBox("Use ROI"); self._use_roi.setChecked(bool(p.q_use_roi))
         v.addWidget(self._use_roi)
+        rowm = QtWidgets.QHBoxLayout()
+        rowm.addWidget(QtWidgets.QLabel("Test mode:"))
+        self._test_mode = QtWidgets.QComboBox()
+        self._test_mode.addItems(["Global search", "Fine sweep (2N+1)"])
+        self._test_mode.setToolTip(
+            "Global search: ring-match score over guess x (1 +- search span) + local fits "
+            "from the best points; the best value is put in the guess box.\n"
+            "Fine sweep: the previous 2N+1 refit sensitivity test around the guess.")
+        rowm.addWidget(self._test_mode, 1)
+        v.addLayout(rowm)
+        self._sp_span = self._dspin(v, "search span (+- fraction)", 0.02, 0.8,
+                                    float(getattr(p, "q_search_span", 0.30)), 0.05, 2)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Test span:"))
         self._n_fig = QtWidgets.QComboBox(); self._n_fig.addItems(["3", "5", "7"])
@@ -1466,7 +1478,8 @@ class QPixelDialog(QtWidgets.QDialog):
         self._sp_step = self._dspin(v, "test step (Δpx)", 1e-6, 1e-3, 1e-4, 1e-5, 7)
 
         for txt, fn, tip in (("Update", self._update, "Refresh the scattering overlay (preview only)."),
-                             ("Test", self._test, "2N+1 refit sensitivity sweep around the px guess."),
+                             ("Test", self._test, "Global search (default) or 2N+1 fine sweep; "
+                                                  "never changes the applied calibration."),
                              (LBL_TO_TABLE, self._to_params, TIP_TO_TABLE_QPIXEL),
                              (LBL_APPLY_CALIB, self._finalize, "Crystal pixel-size refit; resets pre-Q-pixel baseline first."),
                              (LBL_RESET, self._reset, TIP_RESET)):
@@ -1546,6 +1559,9 @@ class QPixelDialog(QtWidgets.QDialog):
     def _test(self):
         if self._sc is None:
             return
+        if self._test_mode.currentIndex() == 0:
+            self._test_global()
+            return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
             vv = self._vals()
@@ -1563,6 +1579,32 @@ class QPixelDialog(QtWidgets.QDialog):
             QtWidgets.QApplication.restoreOverrideCursor()
             self._host._maybe_tidy_figures()
 
+    def _test_global(self):
+        """Global search (benchmark findings 1-2): score the ring match over the span,
+        local-fit from the best points and from the guess, show the curve and put the
+        best fitted px in the guess box. Does NOT change the applied calibration."""
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            vv = self._vals()
+            res = E.q_pixel_global_search(
+                self._sc, px_guess=vv["px"], span_rel=self._sp_span.value(),
+                tol_rel=float(self._sc.params.q_search_tol), k_max=vv["k_max"],
+                kpow=vv["kpow"], use_roi=vv["use_roi"], apply=False,
+                log=self._host._console.log)
+            self._show_fig(E.q_pixel_search_figure(res, title=f"{self._sc.name}: Q-pixel "
+                                                              f"global search ({res['status']})"))
+            best = float(res["best"]["px_fit"])
+            self._sp_px.setValue(best)
+            self._sc.params.q_search_span = float(self._sp_span.value())
+            self._status.setText(f"Global search [{res['status']}]: {res['message']} "
+                                 f"Guess box set to {best:.7g}; press "
+                                 f"'{LBL_APPLY_CALIB}' to fit and apply.")
+        except Exception as exc:
+            self._status.setText(f"Test error: {exc}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._host._maybe_tidy_figures()
+
     def _to_params(self):
         """Push the chosen guess px / k_max / bragg_k_power / ROI into scan.params
         (→ parameter table) so a later Compute uses exactly what was tuned here."""
@@ -1574,6 +1616,7 @@ class QPixelDialog(QtWidgets.QDialog):
         p.q_kmax = float(vv["k_max"])
         p.q_kpow = float(vv["kpow"])
         p.q_use_roi = bool(vv["use_roi"])
+        p.q_search_span = float(self._sp_span.value())
         self._host._params.reload()
         self._status.setText(f"Sent to table: q_px(guess)={p.q_px:.7g} k_max={p.q_kmax:.2f} "
                              f"bragg_k_power={p.q_kpow:.2f} useROI={p.q_use_roi}")
@@ -6223,7 +6266,8 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             lambda: D.compute_all(pool, opts, log=self._console.log,
                                   progress=self.sig_progress.emit,
                                   on_scan_done=self.sig_scan_done.emit,
-                                  cancel=self._cancel_event.is_set),
+                                  cancel=self._cancel_event.is_set,
+                                  confirm=self._confirm_from_worker),
             label=f"Compute {len(pool)} scan(s)",
             on_done=self.sig_finished.emit)
 
@@ -6372,6 +6416,31 @@ class Fast4DWindow(QtWidgets.QMainWindow):
             self._status.showMessage("Done.")
 
     # ── threading ────────────────────────────────────────────────────────────
+    def _confirm_from_worker(self, scan, message: str) -> bool:
+        """Ask Yes/No on the GUI thread from a worker thread (blocks the worker until
+        the user answers). Used by the driver after a flagged Q-pixel calibration."""
+        done = threading.Event()
+        answer = {"ok": False}
+
+        def ask():
+            try:
+                ans = QtWidgets.QMessageBox.question(
+                    self, f"Calibration check - {scan.name}",
+                    f"{message}\n\nContinue to the strain maps with this calibration?\n"
+                    f"(No = stop this file and review it in the Q-pixel tool.)",
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No)
+                answer["ok"] = ans == QtWidgets.QMessageBox.StandardButton.Yes
+            finally:
+                done.set()
+
+        self.sig_call.emit(ask)
+        done.wait()
+        self._console.log(f"[{scan.name}] Q-pixel check: user chose "
+                          f"{'continue' if answer['ok'] else 'stop'}.")
+        return bool(answer["ok"])
+
     def _run_async(self, work, *, label: str, on_done=None) -> None:
         self._set_busy(True, label)
         self._run_gen += 1

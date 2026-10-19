@@ -1,0 +1,98 @@
+{
+  "_doc": "Level 2, stage A: acquisition x detection full factorial. Strain (physical, crystal frame) exx -0.3 %, eyy +0.6 %, exy +0.2 %. q_px 0.0224 = CL98, 0.0130 = CL160 (ronda 2). detect presets: Fast4D default (minAbs 3, minRel 0.05) / sensitive (0, 0.001) x poly / multicorr. detect_cuda false = cloud CPU; for the official Windows run set true to match the GUI.",
+  "reference": {
+    "py4dstem_version": "0.14.19",
+    "py4dstem_sha256": "de2defff32f2448a51724d5b26019633b3f7ad46eaa3eae44f3d8710d5f4b499",
+    "_source": "conda env py4dstem-01419 (GUI), git dev 990d563"
+  },
+  "output_dir": "benchmark_results",
+  "workdir": "benchmark_work_l2",
+  "keep_raw": false,
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "base": {
+    "n": 12,
+    "det": 256,
+    "q_px": 0.0224,
+    "alpha_mrad": 2.1,
+    "dose": 100000,
+    "strain_phys": [
+      [
+        -0.003,
+        0.002
+      ],
+      [
+        0.002,
+        0.006
+      ]
+    ],
+    "phi_deg": 0.0,
+    "phi_grad_deg": 0.0,
+    "qr_deg": 0.0,
+    "flip": false,
+    "qr_deg_analysis": 0.0,
+    "flip_analysis": false,
+    "frame_mode": "crystal",
+    "q_guess_factor": 1.03,
+    "detect": {
+      "detect_cuda": false,
+      "detect_min_absolute_intensity": 3,
+      "detect_min_relative_intensity": 0.05,
+      "detect_subpixel": "poly"
+    },
+    "n_vacuum": 32,
+    "vacuum_dose": 1000000,
+    "manual_rot_err_deg": 0.0
+  },
+  "sweeps": [
+    {
+      "name": "acq_x_detect",
+      "set": {},
+      "grid": {
+        "q_px": [
+          0.0224,
+          0.013
+        ],
+        "alpha_mrad": [
+          1.5,
+          2.1,
+          3.0
+        ],
+        "dose": [
+          10000,
+          100000,
+          1000000
+        ],
+        "detect": [
+          {
+            "detect_cuda": false,
+            "detect_min_absolute_intensity": 3,
+            "detect_min_relative_intensity": 0.05,
+            "detect_subpixel": "poly"
+          },
+          {
+            "detect_cuda": false,
+            "detect_min_absolute_intensity": 0,
+            "detect_min_relative_intensity": 0.001,
+            "detect_subpixel": "poly"
+          },
+          {
+            "detect_cuda": false,
+            "detect_min_absolute_intensity": 3,
+            "detect_min_relative_intensity": 0.05,
+            "detect_subpixel": "multicorr"
+          },
+          {
+            "detect_cuda": false,
+            "detect_min_absolute_intensity": 0,
+            "detect_min_relative_intensity": 0.001,
+            "detect_subpixel": "multicorr"
+          }
+        ]
+      }
+    }
+  ]
+}
