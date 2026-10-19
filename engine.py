@@ -371,6 +371,10 @@ class CalibrationParams:
                                   # factors (calibrate_pixel_size; the guess seeds it). The
                                   # q-pixel figure's blue box shows guess vs fitted + delta.
                                   # False → use the guess px directly (no fit).
+    q_search_span: float = 0.30   # global search window: guess*(1 +- span) before the
+                                  # local fit (benchmark finding 2: guess 10-25 % off)
+    q_search_tol: float = 0.01    # ring-match tolerance (relative |g| distance)
+    q_px_check: dict | None = None  # OUTPUT of the search: status ok/differs/ambiguous
     q_kmax: float = 1.0           # k_max (Å⁻¹)
     q_kpow: float = 1.0           # bragg_k_power
     q_use_roi: bool = False       # uses the shared ROI when True
@@ -3111,6 +3115,181 @@ def q_pixel_fit_warnings(*, px_guess: float, px_fit: float, use_roi: bool,
     return out
 
 
+# ── Q-pixel global search (benchmark findings 1, 2, 4; docs/PLAN_CORRECCION_...) ────
+# py4DSTEM calibrate_pixel_size is a LOCAL curve_fit seeded with the guess: from a guess
+# 10-25 % off it lands in another ring family (+55..+92 %), and on an unstrained crystal
+# it barely moves (0.021 -> 0.020938 for a true 0.020). The search below scores every px
+# on a grid by how much of the radial Bragg histogram falls on the theoretical rings,
+# then runs the same py4DSTEM local fit from the best grid points (and from the guess).
+Q_SEARCH_DISTINCT_REL = 0.02     # two fits closer than this are the same solution
+Q_SEARCH_AMBIGUOUS_FRAC = 0.90   # a distinct solution with >= 90 % of the best match
+Q_SEARCH_KEEP_FRAC = 0.95        # a local fit replaces the winner only if it keeps 95 % of
+                                 # its ring match (else the fit walked off the coincidence)
+
+
+def _q_ring_lengths(crystal, k_max: float) -> np.ndarray:
+    g = np.asarray(crystal.g_vec_leng, float)
+    inten = np.asarray(crystal.struct_factors_int, float)
+    keep = (g > 0) & (g <= float(k_max)) & (inten > 1e-3 * float(inten.max()))
+    rings = np.unique(np.round(g[keep], 6))
+    if rings.size == 0:
+        raise RuntimeError(f"no theoretical ring below k_max = {k_max} 1/A: raise k_max")
+    return rings
+
+
+def _q_ring_match(r_px, w, rings, px: float, k_max: float, tol_rel: float) -> float:
+    """Weighted fraction of the radial histogram (r in px, weights w) inside +-tol_rel
+    of a theoretical ring when 1 px = ``px`` 1/A (only k <= k_max counts)."""
+    k = r_px * float(px)
+    inside = (k > 0) & (k <= float(k_max))
+    tot = float(w[inside].sum())
+    if tot <= 0:
+        return 0.0
+    rel = np.min(np.abs(k[inside, None] - rings[None, :]) / rings[None, :], axis=1)
+    return float(w[inside][rel < float(tol_rel)].sum() / tot)
+
+
+def q_pixel_global_search(scan: Scan, *, px_guess: float, span_rel: float, tol_rel: float,
+                          k_max: float, kpow: float, use_roi: bool, n_grid: int = 301,
+                          n_starts: int = 3, apply: bool, log: Log = None) -> dict:
+    """Grid ring-match score over px_guess*(1 +- span_rel), then the py4DSTEM local fit
+    from the ``n_starts`` best distinct grid maxima AND from the guess.
+
+    Returns dict: grid (px), match (score per grid px), candidates [{start, px_fit,
+    match, source, error}], best (the candidate with the highest match), from_guess
+    (fit seeded with the guess), status ("ok" | "differs" | "ambiguous"), message.
+    ``apply=True`` leaves the best px set on the braggpeaks; False restores the px
+    that was set before the call (Test button)."""
+    if not (0.0 < span_rel < 0.9):
+        raise ValueError(f"q search span must be in (0, 0.9), got {span_rel}")
+    pl = _pipeline()
+    st = scan.ensure_state()
+    ensure_origin_for_qpixel(scan, log=log)
+    bragg_use = pl._braggpeaks_for_roi(st, use_roi=bool(use_roi))
+    px_before = float(pl._get_q_pixel_size(bragg_use.calibration))
+    crystal = _build_crystal(scan)
+    crystal.calculate_structure_factors(float(k_max))
+    rings = _q_ring_lengths(crystal, k_max)
+
+    lo, hi = px_guess * (1.0 - span_rel), px_guess * (1.0 + span_rel)
+    pl._sync_q_pixel_to_objects(st, bragg_use, 1.0)            # histogram in px units
+    r_px, w = crystal.calculate_bragg_peak_histogram(
+        bragg_use, bragg_k_power=float(kpow), bragg_intensity_power=1.0,
+        k_min=0.0, k_max=float(k_max) / lo, k_step=0.05)
+    r_px, w = np.asarray(r_px, float), np.asarray(w, float)
+    r_px, w = r_px[r_px > 3.0], w[r_px > 3.0]                    # drop the direct beam
+    grid = np.linspace(lo, hi, int(n_grid))
+    match = np.array([_q_ring_match(r_px, w, rings, px, k_max, tol_rel) for px in grid])
+
+    # distinct local maxima of the grid score, best first
+    order = np.argsort(-match)
+    starts = []
+    for i in order:
+        if all(abs(grid[i] / s - 1.0) > Q_SEARCH_DISTINCT_REL for s in starts):
+            starts.append(float(grid[i]))
+        if len(starts) == int(n_starts):
+            break
+
+    def fit_from(start: float) -> dict:
+        pl._sync_q_pixel_to_objects(st, bragg_use, float(start))
+        try:
+            crystal.calibrate_pixel_size(
+                bragg_peaks=bragg_use, bragg_k_power=float(kpow), k_max=float(k_max),
+                set_calibration_in_place=True, verbose=False, plot_result=False)
+        except RuntimeError as exc:                # curve_fit did not converge
+            return {"start": start, "px_fit": None, "match": None, "error": str(exc)}
+        pxf = float(pl._get_q_pixel_size(bragg_use.calibration))
+        if not (0.0 < pxf < 1.0):
+            return {"start": start, "px_fit": None, "match": None,
+                    "error": f"implausible fit {pxf:.6g}"}
+        return {"start": start, "px_fit": pxf, "error": None,
+                "match": _q_ring_match(r_px, w, rings, pxf, k_max, tol_rel)}
+
+    # the grid maxima themselves are candidates too: on biased positions (disk detection)
+    # the py4DSTEM profile fit can walk away from the ring coincidence it started on
+    gm = {float(g): float(m) for g, m in zip(grid, match)}
+    cands = [{"start": s, "px_fit": s, "match": gm[s], "error": None, "source": "grid"}
+             for s in starts]
+    cands += [dict(fit_from(s), source="search") for s in starts]
+    from_guess = dict(fit_from(float(px_guess)), source="guess")
+    cands.append(from_guess)
+    ok = [c for c in cands if c["px_fit"] is not None]
+    if not ok:
+        pl._sync_q_pixel_to_objects(st, bragg_use, px_before)
+        raise RuntimeError("Q-pixel search: no local fit converged (check crystal, k_max, "
+                           "origin): " + "; ".join(str(c["error"]) for c in cands))
+    best = max(ok, key=lambda c: c["match"])
+    # The ring match (tol ~1 %) picks the BASIN, not the decimals. Inside the winning
+    # basin keep the fit seeded with the guess (the previous behaviour, so good cases are
+    # unchanged); otherwise polish the winner with one more local fit from its own value.
+    def same_basin(c) -> bool:
+        return (c["px_fit"] is not None
+                and abs(c["px_fit"] / best["px_fit"] - 1.0) <= Q_SEARCH_DISTINCT_REL / 2
+                and c["match"] >= Q_SEARCH_KEEP_FRAC * best["match"])
+
+    if same_basin(from_guess):
+        best = from_guess
+    else:
+        polished = dict(fit_from(float(best["px_fit"])), source="polish")
+        cands.append(polished)
+        if same_basin(polished):
+            best = polished                      # else keep the grid/search value
+    rivals =[c for c in ok if abs(c["px_fit"] / best["px_fit"] - 1.0) > Q_SEARCH_DISTINCT_REL
+              and c["match"] >= Q_SEARCH_AMBIGUOUS_FRAC * best["match"]]
+    if rivals:
+        r = max(rivals, key=lambda c: c["match"])
+        status = "ambiguous"
+        msg = (f"two different Q pixel solutions fit almost equally well: {best['px_fit']:.6g} "
+               f"(ring match {best['match']:.3f}) and {r['px_fit']:.6g} "
+               f"({r['match']:.3f}). Using {best['px_fit']:.6g}.")
+    elif (from_guess["px_fit"] is None
+          or abs(from_guess["px_fit"] / best["px_fit"] - 1.0) > Q_SEARCH_DISTINCT_REL / 2):
+        status = "differs"
+        g = ("did not converge" if from_guess["px_fit"] is None else
+             f"gave {from_guess['px_fit']:.6g} (ring match {from_guess['match']:.3f})")
+        msg = (f"the fit seeded with your guess {px_guess:.6g} {g}; the global search found "
+               f"{best['px_fit']:.6g} (ring match {best['match']:.3f}). Using "
+               f"{best['px_fit']:.6g}.")
+    else:
+        status, msg = "ok", (f"global search agrees with the fit from the guess "
+                             f"({best['px_fit']:.6g}, ring match {best['match']:.3f})")
+    pl._sync_q_pixel_to_objects(st, bragg_use, best["px_fit"] if apply else px_before)
+    _log(log, f"[{scan.name}] Q-pixel search ±{100 * span_rel:.0f} % (tol {100 * tol_rel:.1f} %): "
+              f"{msg}")
+    return {"grid": grid, "match": match, "candidates": cands, "best": best,
+            "from_guess": from_guess, "status": status, "message": msg,
+            "px_guess": float(px_guess), "span_rel": float(span_rel), "tol_rel": float(tol_rel)}
+
+
+def q_pixel_search_figure(res: dict, title: str = ""):
+    """Ring-match score vs px (grid) with the local-fit results; pyplot-free Figure."""
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(8.0, 4.2), facecolor="#fcfcfb")
+    ax = fig.add_subplot(111)
+    ax.set_facecolor("#fcfcfb")
+    ax.plot(res["grid"], res["match"], color="#2a78d6", lw=2, label="ring match (grid)")
+    ax.axvline(res["px_guess"], color="#898781", lw=1, ls=(0, (4, 3)), label="your guess")
+    for c in res["candidates"]:
+        if c["px_fit"] is None:
+            continue
+        is_best = c is res["best"]
+        ax.scatter([c["px_fit"]], [c["match"]], s=60 if is_best else 30, zorder=4,
+                   color="#eb6834" if is_best else "#fcfcfb", edgecolor="#eb6834", lw=1.5)
+    ax.scatter([], [], s=60, color="#eb6834", label=f"used: {res['best']['px_fit']:.6g}")
+    ax.scatter([], [], s=30, color="#fcfcfb", edgecolor="#eb6834", lw=1.5,
+               label="other local fits")
+    ax.set_xlabel("Q pixel (1/A per px)", color="#52514e")
+    ax.set_ylabel("fraction on theoretical rings", color="#52514e")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.grid(axis="y", color="#e1e0d9", lw=0.6)
+    ax.set_ylim(0, 1.02)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.set_title(title or f"Q-pixel global search: {res['status']}", fontsize=10, loc="left")
+    fig.tight_layout()
+    return fig
+
+
 def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                       make_figure: bool = True, log: Log = None) -> float:
     """Calibrate the Q pixel size (notebook cell 37).
@@ -3119,9 +3298,11 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                 ``crystal.calibrate_pixel_size`` over braggpeaks (masked to the
                 shared ROI when ``q_use_roi``), and store the fitted px in
                 ``scan.params.q_px_fitted`` (the guess ``q_px`` is left untouched).
-                NOTE: calibrate_pixel_size starts from the guess (it is pushed onto
-                the calibration first) and fits the structure factors; the fitted
-                value is what gets used. A fit far from the seed is warned about.
+                NOTE: calibrate_pixel_size is a LOCAL fit seeded with its start, so
+                ``q_pixel_global_search`` first scores the ring match over
+                guess*(1 +- q_search_span) and fits from the best grid points and from
+                the guess; the best-matching fit is used. ``params.q_px_check`` records
+                "differs" / "ambiguous" (logged as WARNING; driver asks the user).
                 Requires a calibrated origin (auto-runs Origin from center_guess
                 when missing).
     refit=False : use ``params.q_px`` (the GUESS) directly as the pixel size, no
@@ -3138,26 +3319,8 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
     except Exception:
         pass
 
-    def _fit_threadsafe() -> float:
-        """The proven fast-mode fit WITHOUT pyplot (sanity-checked). Returns px_fit."""
-        ensure_origin_for_qpixel(scan, log=log)
-        crystal = _build_crystal(scan)            # honours Si / Au / Custom
-        crystal.calculate_structure_factors(float(p.q_kmax))
-        bragg_use = pl._braggpeaks_for_roi(st, use_roi=bool(p.q_use_roi))
-        pl._sync_q_pixel_to_objects(st, bragg_use, float(p.q_px))   # seed the guess
-        crystal.calibrate_pixel_size(
-            bragg_peaks=bragg_use, bragg_k_power=float(p.q_kpow),
-            k_max=float(p.q_kmax), set_calibration_in_place=True,
-            verbose=False, plot_result=False)
-        pxf = float(pl._get_q_pixel_size(bragg_use.calibration))
-        if not (0.0 < pxf < 1.0):                 # fast-mode sanity-check
-            _log(log, f"[{scan.name}] implausible Q-pixel fit {pxf:.6g} — "
-                      f"reverting to the guess {p.q_px:.6g}")
-            pxf = float(p.q_px)
-        pl._sync_q_pixel_to_objects(st, bragg_use, pxf)
-        return pxf
-
     if not refit:
+        p.q_px_check = None                       # no search ran: nothing to report
         pl.set_q_pixel_size_step(st, float(p.q_px), log=log)
         if make_figure:                           # refit OFF → the guess overlay is correct
             try:
@@ -3172,16 +3335,26 @@ def calibrate_q_pixel(scan: Scan, *, refit: bool = True,
                 _log(log, f"[{scan.name}] q-pixel figure skipped: {exc}")
         return float(p.q_px)
 
-    # refit ON — fit thread-safely; FIT figure needs the GUI thread (pyplot).
-    px_fit = _fit_threadsafe()
+    # refit ON — global search + py4DSTEM local fits (thread-safe, no pyplot); the
+    # FIT figure needs the GUI thread (pyplot).
+    res = q_pixel_global_search(
+        scan, px_guess=float(p.q_px), span_rel=float(p.q_search_span),
+        tol_rel=float(p.q_search_tol), k_max=float(p.q_kmax), kpow=float(p.q_kpow),
+        use_roi=bool(p.q_use_roi), apply=True, log=log)
+    px_fit = float(res["best"]["px_fit"])
     p.q_px_fitted = px_fit
+    p.q_px_check = {"status": res["status"], "message": res["message"],
+                    "px_from_guess": res["from_guess"]["px_fit"],
+                    "match": res["best"]["match"]}
+    if res["status"] != "ok":
+        _log(log, f"WARNING [{scan.name}] Q pixel: {res['message']}")
     _log(log, f"[{scan.name}] Q-pixel refit ({p.cal_crystal}): guess={p.q_px:.6g} → "
               f"fitted={px_fit:.6g} A^-1/px (use_roi={p.q_use_roi})")
     n_roi = (int(np.asarray(st.roi_mask).sum())
              if getattr(st, "roi_mask", None) is not None else 0)
     for w in q_pixel_fit_warnings(px_guess=float(p.q_px), px_fit=px_fit,
                                   use_roi=bool(p.q_use_roi), n_patterns=n_roi):
-        _log(log, f"WARNING [{scan.name}] Q pixel: {w}")
+        _log(log, f"[{scan.name}] Q pixel (info): {w}")
     if make_figure:
         import threading
         if threading.current_thread() is threading.main_thread():
@@ -3639,6 +3812,8 @@ def compute_strain(scan: Scan, *, use_roi: bool = False,
     fit_mask = None
     if use_roi:
         sm = getattr(st, "strainmap_full", None)
+        if sm is not None and getattr(sm, "g1g2_map", None) is None:
+            sm = None                        # basis-step StrainMap: lattice not fitted yet
         if sm is None:                       # need the global map for the reference
             _log(log, f"[{scan.name}] with-ROI needs the global StrainMap first; "
                       f"computing without-ROI…")
@@ -4005,6 +4180,7 @@ def reset_bragg_calibration(scan: Scan, *, log: Log = None) -> None:
     p.ellipse_q_range = [40, 60]
     p.ellipse_sampling = 1
     p.q_px_fitted = None
+    p.q_px_check = None
     p.qr_rotation = 0.0
     p.qr_flip = False
     p.basis_manual_enabled = False
