@@ -1,4 +1,4 @@
-"""Q-pixel global search (benchmark findings 1, 2, 4, 5; docs/PLAN_CORRECCION_HALLAZGOS_BENCHMARK.md).
+"""Q-pixel global search (benchmark findings 1, 2, 4, 5; docs/BENCHMARK_FIX_PLAN.md).
 
 py4DSTEM calibrate_pixel_size is a local fit: from the guess 0.022 (true 0.020) it lands
 on 0.0343 (+71 %), and on an unstrained crystal it stays at 0.020938 (+4.7 %). The global

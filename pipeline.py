@@ -5166,7 +5166,7 @@ def _sanitize_strain_raw(
 
     Strain ROI is only for reference fitting (``gvects``); do not blank exterior pixels here.
 
-    Also zeros tensor strain ε where |ε|≥1 (100% artefacts from vacío/div0) and where
+    Also zeros tensor strain ε where |ε|≥1 (100% artefacts from vacuum/div0) and where
     py4DSTEM's lattice fit failed (fit mask, channel 4): that is what marks vacuum.
     No ADF-based "void" rule: a relative ADF threshold always cut the darkest part of
     the image and blanked real crystal in fields with no vacuum.

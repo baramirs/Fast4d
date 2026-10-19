@@ -1,7 +1,7 @@
 """fast4d.qt_params — the Excel-like calibration parameter table (PySide6).
 
 A ``QTabWidget`` with one tab per calibration step + ROI (the user's request:
-"tabla tipo Excel, con pestañas para cada calibración y ROI"). Each tab is a
+"an Excel-like table, with a tab for each calibration and the ROI"). Each tab is a
 ``QTableWidget`` whose rows are parameters and columns are the loaded files
 (single == one column). This is the single editable home of every scan's
 calibration values; ``engine.run_calibration_sequence`` reads them back.

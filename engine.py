@@ -3115,7 +3115,7 @@ def q_pixel_fit_warnings(*, px_guess: float, px_fit: float, use_roi: bool,
     return out
 
 
-# ── Q-pixel global search (benchmark findings 1, 2, 4; docs/PLAN_CORRECCION_...) ────
+# ── Q-pixel global search (benchmark findings 1, 2, 4; docs/BENCHMARK_FIX_PLAN.md) ────
 # py4DSTEM calibrate_pixel_size is a LOCAL curve_fit seeded with the guess: from a guess
 # 10-25 % off it lands in another ring family (+55..+92 %), and on an unstrained crystal
 # it barely moves (0.021 -> 0.020938 for a true 0.020). The search below scores every px
