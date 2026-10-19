@@ -1,0 +1,33 @@
+{
+  "_doc": "Level 1 error benchmark. Protocol: docs/PROTOCOLO_BENCHMARK_ERRORES.md. All base keys are required. Strain/error in fraction (e_max) and px; results in % strain.",
+  "reference": {
+    "py4dstem_version": "0.14.19",
+    "py4dstem_sha256": "de2defff32f2448a51724d5b26019633b3f7ad46eaa3eae44f3d8710d5f4b499",
+    "_source": "conda env py4dstem-01419 (GUI), py4DSTEM git dev 990d563d91315db59044d4ee0ac895b95e5a5c3a, hash taken 2026-10-18"
+  },
+  "output_dir": "benchmark_results",
+  "seed0": 0,
+  "n_seeds": 5,
+  "base": {
+    "n": 24,
+    "e_max": 0.02,
+    "jitter_px": 0.03,
+    "g_max": 1.7,
+    "q_guess": 0.021,
+    "frame_mode": "crystal",
+    "rot_err_deg": 0.0,
+    "center_err_px": 0.0,
+    "ellipse": null,
+    "vacuum_cols": 0,
+    "roi": null
+  },
+  "sweeps": [
+    {"name": "jitter_px", "set": {}, "vary": "jitter_px", "values": [0.0, 0.01, 0.05, 0.1, 0.2]},
+    {"name": "e_max", "set": {}, "vary": "e_max", "values": [0.001, 0.005, 0.05, 0.10]},
+    {"name": "rot_err_manual", "set": {"frame_mode": "manual"}, "vary": "rot_err_deg", "values": [0.0, 0.5, 1.0, 2.0, 5.0]},
+    {"name": "center_err_px", "set": {}, "vary": "center_err_px", "values": [2.0, 5.0, 10.0]},
+    {"name": "q_guess", "set": {}, "vary": "q_guess", "values": [0.019, 0.022, 0.025]},
+    {"name": "ellipse_uncorr", "set": {}, "vary": "ellipse", "values": [[1.002, 1.0, 25.0], [1.005, 1.0, 25.0], [1.01, 1.0, 25.0]]},
+    {"name": "roi_vacuum", "set": {"vacuum_cols": 6}, "vary": "roi", "values": [[8, 16, 8, 16], [2, 12, 8, 16]]}
+  ]
+}
