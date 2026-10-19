@@ -67,3 +67,10 @@ raw/
 *.npz
 *.tif
 *.tiff
+
+# local only (benchmark, work notes)
+tools/benchmark/
+run_benchmark*.bat
+benchmark_results/
+benchmark_work_l2*/
+Claude outputs/
